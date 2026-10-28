@@ -1,0 +1,394 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_http_sse_handler).
+-moduledoc """
+Cowboy handler for SSE transport HTTP POST endpoints.
+
+Handles three actions:
+- `open`  — POST /wamp/sse/open: creates a new transport session
+- `send`  — POST /wamp/sse/:transport_id/send: forwards a WAMP message
+- `close` — POST /wamp/sse/:transport_id/close: terminates the session
+""".
+
+-include_lib("kernel/include/logger.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("http_api.hrl").
+
+-behaviour(cowboy_loop).
+
+-export([init/2]).
+-export([info/3]).
+-export([terminate/3]).
+
+-define(SUPPORTED_PROTOCOLS, [?WAMP2_JSON_SSE]).
+
+%% =============================================================================
+%% COWBOY CALLBACKS
+%% =============================================================================
+
+init(Req0, State) ->
+    CorsConfig = bondy_http_cors:config_from_req(Req0),
+    Req1 = bondy_http_cors:set_headers(Req0, CorsConfig),
+    Req = bondy_http_utils:set_all_headers(Req1),
+    case cowboy_req:method(Req) of
+        <<"OPTIONS">> ->
+            Req1 = cowboy_req:reply(?HTTP_OK, #{}, <<>>, Req),
+
+            {ok, Req1, State};
+        _ ->
+            dispatch(Req, State)
+    end.
+
+info(_Msg, Req, State) ->
+    {ok, Req, State}.
+
+terminate(_Reason, _Req, _State) ->
+    ok.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+dispatch(Req0, #{action := open} = State) ->
+    handle_open(Req0, State);
+dispatch(Req0, #{action := send} = State) ->
+    handle_send(Req0, State);
+dispatch(Req0, #{action := close} = State) ->
+    handle_close(Req0, State).
+
+%% @private
+handle_open(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"POST">> ->
+            do_handle_open(Req0, State);
+        _ ->
+            Req1 = cowboy_req:reply(?HTTP_BAD_REQUEST, #{}, <<>>, Req0),
+            {ok, Req1, State}
+    end.
+
+%% @private
+do_handle_open(Req0, State) ->
+    case bondy_http_utils:validate_csrf(Req0) of
+        {error, forbidden} ->
+            Req1 = reply_error(
+                ?HTTP_FORBIDDEN, <<"csrf_validation_failed">>, Req0
+            ),
+            {ok, Req1, State};
+        ok ->
+            do_handle_open_body(Req0, State)
+    end.
+
+%% @private
+do_handle_open_body(Req0, State) ->
+    {ok, Body, Req1} = cowboy_req:read_body(Req0),
+
+    try json:decode(Body) of
+        NotAnObject when not is_map(NotAnObject) ->
+            reply_invalid_json(Req1, State);
+        Decoded ->
+            Protocols = maps:get(
+                <<"protocols">>, Decoded, []
+            ),
+            case select_protocol(Protocols) of
+                {ok, Protocol} ->
+                    open_session(Protocol, Req1, State);
+                {error, no_supported_protocol} ->
+                    ReplyBody = json:encode(#{
+                        <<"error">> => <<"no_supported_protocol">>,
+                        <<"supported">> => ?SUPPORTED_PROTOCOLS
+                    }),
+                    Req2 = cowboy_req:reply(
+                        ?HTTP_BAD_REQUEST,
+                        #{<<"content-type">> => <<"application/json">>},
+                        ReplyBody,
+                        Req1
+                    ),
+                    {ok, Req2, State}
+            end
+    catch
+        %% The three reasons `json:decode/1` raises on malformed input.
+        error:unexpected_end ->
+            reply_invalid_json(Req1, State);
+        error:{invalid_byte, _} ->
+            reply_invalid_json(Req1, State);
+        error:{unexpected_sequence, _} ->
+            reply_invalid_json(Req1, State)
+    end.
+
+%% @private
+reply_invalid_json(Req0, State) ->
+    ReplyBody = json:encode(#{<<"error">> => <<"invalid_json">>}),
+    Req = cowboy_req:reply(
+        ?HTTP_BAD_REQUEST,
+        #{<<"content-type">> => <<"application/json">>},
+        ReplyBody,
+        Req0
+    ),
+    {ok, Req, State}.
+
+%% @private
+open_session(Protocol, Req0, State) ->
+    TransportId = bondy_router_utils:uuid(),
+    SessionId = bondy_session_id:new(),
+    Peer = bondy_http_utils:peer(Req0),
+
+    %% RealmUri is unknown at open time; it comes from the WAMP HELLO message.
+    RealmUri = <<>>,
+
+    case
+        bondy_http_transport_session_sup:start_child(
+            TransportId, RealmUri, SessionId
+        )
+    of
+        {ok, Pid} ->
+            {ok, Subprotocol} = bondy_wamp_protocol:validate_subprotocol(
+                Protocol
+            ),
+            case
+                bondy_http_transport_session:init_protocol(
+                    Pid, Subprotocol, Peer, #{
+                        listener => maps:get(listener, State, undefined)
+                    }
+                )
+            of
+                ok ->
+                    ok = maybe_set_auth_ticket(Pid, Req0),
+                    ReplyBody = json:encode(#{
+                        <<"protocol">> => Protocol,
+                        <<"transport">> => TransportId
+                    }),
+                    Req1 = cowboy_req:reply(
+                        ?HTTP_OK,
+                        #{<<"content-type">> => <<"application/json">>},
+                        ReplyBody,
+                        Req0
+                    ),
+                    {ok, Req1, State};
+                {error, Reason} ->
+                    bondy_http_transport_session:close(Pid, init_failed),
+                    ?LOG_ERROR(#{
+                        description => "Failed to init protocol",
+                        transport_id => TransportId,
+                        reason => Reason
+                    }),
+                    Req1 = reply_error(
+                        ?HTTP_BAD_REQUEST,
+                        <<"protocol_init_failed">>,
+                        Req0
+                    ),
+                    {ok, Req1, State}
+            end;
+        {error, Reason} ->
+            ?LOG_ERROR(#{
+                description => "Failed to start transport session",
+                reason => Reason
+            }),
+            Req1 = reply_error(
+                ?HTTP_BAD_REQUEST,
+                <<"session_start_failed">>,
+                Req0
+            ),
+            {ok, Req1, State}
+    end.
+
+%% @private
+handle_send(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"POST">> ->
+            do_handle_send(Req0, State);
+        _ ->
+            Req1 = cowboy_req:reply(?HTTP_BAD_REQUEST, #{}, <<>>, Req0),
+            {ok, Req1, State}
+    end.
+
+%% @private
+do_handle_send(Req0, State) ->
+    case bondy_http_utils:validate_csrf(Req0) of
+        {error, forbidden} ->
+            Req1 = reply_error(
+                ?HTTP_FORBIDDEN, <<"csrf_validation_failed">>, Req0
+            ),
+            {ok, Req1, State};
+        ok ->
+            do_handle_send_body(Req0, State)
+    end.
+
+%% @private
+do_handle_send_body(Req0, State) ->
+    TransportId = cowboy_req:binding(transport_id, Req0),
+
+    case bondy_http_transport_session:whereis(TransportId) of
+        undefined ->
+            Req1 = reply_error(
+                ?HTTP_NOT_FOUND, <<"transport_not_found">>, Req0
+            ),
+            {ok, Req1, State};
+        Pid ->
+            case validate_auth_ticket(Pid, Req0) of
+                {error, unauthorized} ->
+                    Req1 = reply_error(
+                        ?HTTP_UNAUTHORIZED, <<"unauthorized">>, Req0
+                    ),
+                    {ok, Req1, State};
+                ok ->
+                    {ok, Body, Req1} = cowboy_req:read_body(Req0),
+                    bondy_http_transport_session:touch(Pid),
+
+                    case
+                        bondy_http_transport_session:handle_client_message(
+                            Pid, Body
+                        )
+                    of
+                        ok ->
+                            Req2 = cowboy_req:reply(
+                                ?HTTP_ACCEPTED, #{}, <<>>, Req1
+                            ),
+                            {ok, Req2, State};
+                        {error, Reason} ->
+                            ?LOG_WARNING(#{
+                                description =>
+                                    "Error handling client message",
+                                transport_id => TransportId,
+                                reason => Reason
+                            }),
+                            Req2 = reply_error(
+                                ?HTTP_BAD_REQUEST,
+                                <<"message_error">>,
+                                Req1
+                            ),
+                            {ok, Req2, State}
+                    end
+            end
+    end.
+
+%% @private
+handle_close(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"POST">> ->
+            do_handle_close(Req0, State);
+        _ ->
+            Req1 = cowboy_req:reply(?HTTP_BAD_REQUEST, #{}, <<>>, Req0),
+            {ok, Req1, State}
+    end.
+
+%% @private
+do_handle_close(Req0, State) ->
+    case bondy_http_utils:validate_csrf(Req0) of
+        {error, forbidden} ->
+            Req1 = reply_error(
+                ?HTTP_FORBIDDEN, <<"csrf_validation_failed">>, Req0
+            ),
+            {ok, Req1, State};
+        ok ->
+            do_handle_close_body(Req0, State)
+    end.
+
+%% @private
+do_handle_close_body(Req0, State) ->
+    TransportId = cowboy_req:binding(transport_id, Req0),
+
+    case bondy_http_transport_session:whereis(TransportId) of
+        undefined ->
+            Req1 = cowboy_req:reply(?HTTP_ACCEPTED, #{}, <<>>, Req0),
+            {ok, Req1, State};
+        Pid ->
+            case validate_auth_ticket(Pid, Req0) of
+                {error, unauthorized} ->
+                    Req1 = reply_error(
+                        ?HTTP_UNAUTHORIZED, <<"unauthorized">>, Req0
+                    ),
+                    {ok, Req1, State};
+                ok ->
+                    bondy_http_transport_session:close(Pid),
+                    Req1 = cowboy_req:reply(
+                        ?HTTP_ACCEPTED, #{}, <<>>, Req0
+                    ),
+                    {ok, Req1, State}
+            end
+    end.
+
+%% @private
+select_protocol(ClientProtocols) when is_list(ClientProtocols) ->
+    case [P || P <- ClientProtocols, lists:member(P, ?SUPPORTED_PROTOCOLS)] of
+        [Protocol | _] ->
+            {ok, Protocol};
+        [] ->
+            {error, no_supported_protocol}
+    end;
+select_protocol(_) ->
+    {error, no_supported_protocol}.
+
+%% @private
+maybe_set_auth_ticket(Pid, Req) ->
+    Cookies = bondy_http_utils:parse_cookies(Req),
+    case bondy_http_utils:find_ticket_cookie(Cookies) of
+        {value, {_, Ticket}} when Ticket =/= <<>> ->
+            case bondy_ticket:verify(Ticket) of
+                {ok, Claims} ->
+                    bondy_http_transport_session:set_auth_claims(Pid, Claims);
+                {error, Reason} ->
+                    ?LOG_WARNING(#{
+                        description =>
+                            "Invalid bondy_ticket cookie at /open",
+                        reason => Reason
+                    }),
+                    ok
+            end;
+        _ ->
+            ok
+    end.
+
+%% @private
+validate_auth_ticket(Pid, Req) ->
+    case bondy_http_transport_session:auth_claims(Pid) of
+        undefined ->
+            %% No OIDC claims — non-cookie flow, skip validation
+            ok;
+        #{authrealm := Authrealm} = StoredClaims ->
+            Cookies = bondy_http_utils:parse_cookies(Req),
+            CookieName = bondy_http_utils:ticket_cookie_name(Authrealm),
+            case lists:keyfind(CookieName, 1, Cookies) of
+                false ->
+                    {error, unauthorized};
+                {_, Ticket} ->
+                    case bondy_ticket:verify(Ticket) of
+                        {ok, #{
+                            authid := Authid, authrealm := Authrealm2
+                        }} ->
+                            #{
+                                authid := ExpAuthid,
+                                authrealm := ExpAuthrealm
+                            } = StoredClaims,
+                            case
+                                Authid =:= ExpAuthid andalso
+                                    Authrealm2 =:= ExpAuthrealm
+                            of
+                                true -> ok;
+                                false -> {error, unauthorized}
+                            end;
+                        {error, _} ->
+                            {error, unauthorized}
+                    end
+            end
+    end.
+
+%% @private
+reply_error(StatusCode, ErrorBin, Req) ->
+    %% `error' is retained for existing clients; the standard error payload is
+    %% added alongside it.
+    Body = maps:put(
+        ~"error",
+        ErrorBin,
+        bondy_connect_error:to_map(bondy_connect_error:from_term(ErrorBin))
+    ),
+    ReplyBody = json:encode(Body),
+    cowboy_req:reply(
+        StatusCode,
+        #{<<"content-type">> => <<"application/json">>},
+        ReplyBody,
+        Req
+    ).

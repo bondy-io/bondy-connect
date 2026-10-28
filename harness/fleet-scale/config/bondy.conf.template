@@ -1,0 +1,130 @@
+## =============================================================================
+## Bondy config -- fleet-scale cluster (harness/fleet-scale)
+## Derived from harness/perf-cluster's tuned profile (all keys verified
+## against schema/bondy.schema), sized for hundreds of thousands of
+## publisher-only connections + a smaller set of heavy (2K-subscription)
+## subscriber connections, single realm (com.leapsight.fleet).
+##
+## KNOWN LIMITATION: bondy_registry_partition:pick/1 shards purely by realm
+## URI, so a single-realm workload (this one) always funnels registry writes
+## through ONE partition process regardless of db.registry.shard_count --
+## raising that knob would not help here. Watch for it via partition mailbox
+## depth if throughput stalls.
+##
+## ASCII ONLY, and no stray dollar-brace references anywhere. bin/replace-env-vars
+## expands every dollar-brace NAME token in the whole file (comments included)
+## before cuttlefish parses it; an undefined NAME aborts the node boot.
+## =============================================================================
+
+## --- node identity / cluster (Fly 6PN DNS discovery, no seed node) ------------
+cluster.overlay.topology                    = fullmesh
+cluster.automatic_leave                     = off
+## Private 6PN mesh, no cluster mTLS provisioned -> allow the insecure peer plane
+## (guard_peer_plane would otherwise refuse to boot). Production uses real mTLS.
+cluster.tls.allow_insecure                  = on
+cluster.peer_ip                             = ${FLY_PRIVATE_IP}
+cluster.peer_port                           = 18086
+## Disterl (kept ON for `bondy remote_console` / `eval`; Partisan does NOT use
+## it for peer traffic -- see connect_disterl=false). This MUST match
+## ERL_DIST_PORT in fly.toml: the shell variable is what relx turns into the
+## VM's `-erl_epmd_port`, while this key is what the schema emits as
+## `-env ERL_DIST_PORT` into vm.generated.args. Left unset they disagree --
+## the schema default is 27780, so the beam ran with `-erl_epmd_port 27784`
+## while its own environment claimed 27780 (observed 2026-08-21; nothing in
+## Bondy reads the variable, so it misleads a debugger rather than breaking).
+vm.distribution.port                        = 27784
+cluster.peer_discovery.enabled              = on
+cluster.peer_discovery.type                 = dns
+cluster.peer_discovery.initial_delay        = 10s
+cluster.peer_discovery.polling_interval     = 10s
+cluster.peer_discovery.timeout              = 5s
+cluster.peer_discovery.config.record_type   = aaaa
+cluster.peer_discovery.config.query         = ${FLY_APP_NAME}.internal
+## node_basename is the part BEFORE @ in the Erlang node name (setup.sh sets
+## BONDY_ERL_NODENAME=bondy@<ip>), so it MUST be `bondy`, not the app name.
+cluster.peer_discovery.config.node_basename = bondy
+cluster.peer_discovery.config.nameservers.1 = fdaa::3
+cluster.channels.wamp_relay.parallelism     = 8
+
+## --- anti-entropy: MUST be on -- 500ms sync tick ------------------------------
+db.aae                                   = on
+db.aae.interval                          = 500ms
+
+## --- routing / ordering (flow lanes enforce per-pair FIFO) --------------------
+router.forward.ack                          = off
+router.forward.retransmission               = off
+load_regulation.router.flow_pool.capacity   = 100000
+
+## --- registry RIB: write-only architecture ------------------------------------
+registry.rib.check_interval                 = 5m
+
+## --- AAE reactor pool ---------------------------------------------------------
+load_regulation.aae_reactor.pool.size       = 16
+
+## --- Partisan max message size ------------------------------------------------
+cluster.max_message_size                    = 64MB
+
+## --- rpc ----------------------------------------------------------------------
+wamp.call_timeout                           = 30s
+
+## --- listeners: WebSocket only (WAMP-TCP/TLS disabled) ------------------------
+## /ws for clients on 18080 (Fly edge terminates TLS -> cleartext WS internally).
+## Admin API (18081) carries /metrics, /ping, /ready.
+##
+## Declared under `listeners.*`. A listener that is not declared does not exist,
+## so WAMP-TCP/TLS and the HTTPS variants are absent rather than switched off.
+## `admin` is the reserved name for the administrable listener. Every option is
+## stated here because a listener's options are read under its CURRENT name.
+##
+## `http.idle_timeout` and `http.active_n` are restated because the legacy
+## mappings supplied them as schema defaults and Cowboy's own differ: 60s rather
+## than 15s, and `active_n` 1 rather than 100 (`cowboy_http.erl:214,336`).
+listeners.admin.transport                    = tcp
+listeners.admin.protocol                     = http
+listeners.admin.port                         = 18081
+listeners.admin.ip                           = 0.0.0.0
+listeners.admin.start_phase                  = early
+listeners.admin.services                     = admin_api, wamp_ws, admin, metrics
+listeners.admin.acceptors_pool_size          = 50
+listeners.admin.http.idle_timeout            = 15s
+listeners.admin.http.active_n                = 100
+
+listeners.api_gateway_http.transport                    = tcp
+listeners.api_gateway_http.protocol                     = http
+listeners.api_gateway_http.port                         = 18080
+listeners.api_gateway_http.ip                           = 0.0.0.0
+listeners.api_gateway_http.services                     = api_gateway, wamp_ws, wamp_sse, wamp_longpoll
+listeners.api_gateway_http.acceptors_pool_size          = 500
+listeners.api_gateway_http.max_connections              = 300000
+listeners.api_gateway_http.backlog                      = 8192
+listeners.api_gateway_http.nodelay                      = on
+listeners.api_gateway_http.http.idle_timeout            = 15s
+listeners.api_gateway_http.http.active_n                = 100
+listeners.api_gateway_http.websocket.idle_timeout = 8h
+
+## The acceptor pools and connection limits are stated with each listener above:
+## sized for a much larger connection target than the perf-cluster profile, and
+## `admin` kept small since it carries metrics/health only.
+
+## --- worker pools -------------------------------------------------------------
+## Process pools multiplex over schedulers (= vCPUs), so size ~ to cores, NOT the
+## session count.
+load_regulation.router.pool.type            = transient  ## avoids per-job spawn overhead
+load_regulation.router.pool.size            = 16         ## routing workers (ingress flow-pool jobs)
+load_regulation.router.pool.capacity        = 100000     ## max concurrent router procs
+## load_regulation.router.flow_pool.capacity + aae_reactor.pool.size set above.
+load_regulation.session_manager.pool.size   = 32         ## session-lifecycle workers
+load_regulation.job_manager.pool.size       = 16
+
+## --- security: the fleet realm (anonymous pub/sub) ----------------------------
+security.config_file                        = ${BONDY_ETC_DIR}/security_config.json
+## Anonymous auth defaults to `local` (loopback only, like RabbitMQ's guest);
+## remote k6 clients need `on` (still gated by the realm's own anonymous sources).
+security.allow_anonymous_user               = on
+
+## --- data (durable core DB; ephemeral machine storage) ------------------------
+platform_data_dir                           = ${BONDY_DATA_DIR}
+
+## --- logging ------------------------------------------------------------------
+log.level                                   = info
+log.handlers.default.level                  = info

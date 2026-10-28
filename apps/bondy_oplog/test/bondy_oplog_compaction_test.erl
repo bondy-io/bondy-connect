@@ -1,0 +1,258 @@
+-module(bondy_oplog_compaction_test).
+
+-include_lib("eunit/include/eunit.hrl").
+-include("bondy_oplog.hrl").
+
+setup() ->
+    {ok, _} = application:ensure_all_started(bondy_db),
+    %% Tests want full control: clear the default schedulers.
+    bondy_oplog_sync_scheduler:set_dispatch(undefined),
+    bondy_oplog_gc_scheduler:set_trigger(undefined),
+    ok.
+
+cleanup(_) ->
+    [
+        bondy_oplog:stop_instance(I)
+     || I <- bondy_oplog:list_instances()
+    ],
+    ok.
+
+compaction_test_() ->
+    %% Each test gets a 30s per-test timeout. The eunit default is 5s,
+    %% which is too tight for tests that call `await_apply/1`, which
+    %% waits for the applier to drain the WAL
+    %% and under whole-suite load that occasionally takes longer than
+    %% 5s, racing the eunit watchdog into a `*timed out*` cancellation
+    %% even though the substrate is functioning correctly.
+    {setup, fun setup/0, fun cleanup/1, [
+        {timeout, 30, fun no_other_member_compacts_on_own_frontier/0},
+        {timeout, 30, fun no_other_member_with_clustering_is_held/0},
+        {timeout, 30, fun compact_after_sync_advances_watermark/0},
+        {timeout, 30, fun compaction_truncates_mst/0},
+        {timeout, 30, fun watermark_filter_drops_old_remote_events/0},
+        {timeout, 30, fun deterministic_watermark_across_replicas/0},
+        {timeout, 30, fun idempotent_compact/0},
+        {timeout, 30, fun unconfirmed_member_is_reported/0},
+        {timeout, 30, fun unreadable_membership_is_reported/0},
+        {timeout, 30, fun held_compaction_reaches_the_scheduler/0}
+    ]}.
+
+%% Clustering disabled: no other replica exists, so this replica's own durable
+%% frontier licenses the truncation.
+no_other_member_compacts_on_own_frontier() ->
+    Id = mk_id(),
+    {ok, _} = bondy_oplog_test_projection:start_instance(Id),
+    ok = append_cells(Id, 1, 5),
+    {ok, {compacted, _, N}} = bondy_oplog:compact(Id),
+    ?assert(N > 0),
+    ?assertNotEqual(undefined, bondy_oplog:current_watermark(Id)),
+    ?assertEqual(5 - N, bondy_oplog:size(Id)),
+    ok = bondy_oplog:stop_instance(Id).
+
+%% Clustering enabled with no other member listed, which is also a member
+%% that has just restarted: nothing is truncated.
+no_other_member_with_clustering_is_held() ->
+    Id = mk_id(),
+    {ok, _} = bondy_oplog_test_projection:start_instance(Id),
+    ok = append_cells(Id, 1, 5),
+    bondy_oplog_test_helpers:with_members(
+        fun() -> [partisan:node()] end,
+        fun() ->
+            ?assertEqual({error, no_members}, bondy_oplog:compact(Id))
+        end
+    ),
+    ?assertEqual(undefined, bondy_oplog:current_watermark(Id)),
+    ?assertEqual(5, bondy_oplog:size(Id)),
+    ok = bondy_oplog:stop_instance(Id).
+
+compact_after_sync_advances_watermark() ->
+    {A, B} = mk_pair(),
+    ok = append_cells(A, 1, 10),
+    ok = append_cells(B, 11, 20),
+    ok = converge(A, B),
+    ?assertMatch(
+        {ok, {compacted, _, 20}},
+        bondy_oplog_test_helpers:compact_among(A, [A, B])
+    ),
+    ?assertNotEqual(undefined, bondy_oplog:current_watermark(A)),
+    ok.
+
+compaction_truncates_mst() ->
+    {A, B} = mk_pair(),
+    ok = append_cells(A, 1, 5),
+    ok = append_cells(B, 6, 10),
+    ok = converge(A, B),
+    SizeBefore = bondy_oplog:size(A),
+    ?assertEqual(10, SizeBefore),
+    ?assertMatch(
+        {ok, {compacted, _, _}},
+        bondy_oplog_test_helpers:compact_among(A, [A, B])
+    ),
+    ?assertEqual(0, bondy_oplog:size(A)).
+
+%% After A compacts and B re-sends the same (now-stable) events to A
+%% via sync, A's MST should NOT regrow — the watermark filter drops
+%% them on receipt and on post-merge re-truncation.
+watermark_filter_drops_old_remote_events() ->
+    {A, B} = mk_pair(),
+    ok = append_cells(A, 1, 5),
+    ok = append_cells(B, 6, 10),
+    ok = converge(A, B),
+    {ok, {compacted, _, _}} = bondy_oplog_test_helpers:compact_among(A, [A, B]),
+    ?assertEqual(0, bondy_oplog:size(A)),
+    Cells = bondy_oplog_test_projection:cells(A),
+    ?assertEqual(10, length(Cells)),
+    %% B has not compacted, so it still has all 10 events. A pulls from B
+    %% again; B confirmed them, so the door drops them.
+    bondy_oplog_test_helpers:with_cluster([A, B], fun() ->
+        {ok, _} = bondy_oplog:sync(A, B)
+    end),
+    ?assertEqual(0, bondy_oplog:size(A)),
+    ?assertEqual(Cells, bondy_oplog_test_projection:cells(A)).
+
+deterministic_watermark_across_replicas() ->
+    {A, B} = mk_pair(),
+    ok = append_cells(A, 1, 8),
+    ok = append_cells(B, 9, 16),
+    ok = converge(A, B),
+    {ok, {compacted, WA, _}} = bondy_oplog_test_helpers:compact_among(A, [A, B]),
+    {ok, {compacted, WB, _}} = bondy_oplog_test_helpers:compact_among(B, [A, B]),
+    ?assertEqual(WA, WB),
+    ?assertEqual(
+        bondy_oplog_test_projection:cells(A),
+        bondy_oplog_test_projection:cells(B)
+    ).
+
+idempotent_compact() ->
+    {A, B} = mk_pair(),
+    ok = append_cells(A, 1, 4),
+    ok = append_cells(B, 5, 8),
+    ok = converge(A, B),
+    {ok, {compacted, W1, _}} = bondy_oplog_test_helpers:compact_among(A, [A, B]),
+    ?assertEqual(
+        {ok, no_change}, bondy_oplog_test_helpers:compact_among(A, [A, B])
+    ),
+    ?assertEqual(W1, bondy_oplog:current_watermark(A)).
+
+%% A member that never confirmed holds the peer-confirmed truncation; the
+%% caller is told which member, and nothing is truncated.
+unconfirmed_member_is_reported() ->
+    {A, B} = mk_pair(),
+    ok = append_cells(A, 1, 5),
+    ok = converge(A, B),
+    Ghost = 'ghost@nowhere',
+    ?assertEqual(
+        {error, {unconfirmed, [Ghost]}},
+        bondy_oplog_test_helpers:compact_among(A, [A, B, Ghost])
+    ),
+    ?assertEqual(undefined, bondy_oplog:current_watermark(A)),
+    ?assertEqual(5, bondy_oplog:size(A)).
+
+%% An unreadable membership truncates nothing.
+unreadable_membership_is_reported() ->
+    {A, B} = mk_pair(),
+    ok = append_cells(A, 1, 5),
+    ok = converge(A, B),
+    bondy_oplog_test_helpers:with_members(
+        fun() -> error(membership_unavailable) end,
+        fun() ->
+            ?assertEqual(
+                {error, membership_unavailable}, bondy_oplog:compact(A)
+            )
+        end
+    ),
+    ?assertEqual(5, bondy_oplog:size(A)).
+
+%% Compaction waiting on a member with no confirmed row reaches a scheduler
+%% running the default trigger as the outcome `unconfirmed`.
+held_compaction_reaches_the_scheduler() ->
+    Id = mk_id(),
+    {ok, _} = bondy_oplog_test_projection:start_instance(Id),
+    ok = append_cells(Id, 1, 5),
+    Ghost = 'ghost@nowhere',
+    Self = self(),
+    HandlerId = {?MODULE, held_probe},
+    ok = telemetry:attach(
+        HandlerId,
+        [bondy_oplog, scheduler, gc, trigger_outcome],
+        fun(_, _, Meta, _) -> Self ! {outcome, Meta} end,
+        undefined
+    ),
+    try
+        bondy_oplog_test_helpers:with_members(
+            fun() -> lists:usort([partisan:node(), Ghost]) end,
+            fun() ->
+                {ok, Sched} = bondy_oplog_gc_scheduler:start_link(#{
+                    name => compaction_sched_probe,
+                    enabled => true,
+                    interval_ms => 100
+                }),
+                try
+                    ?assertEqual(unconfirmed, await_outcome(Id, 2000))
+                after
+                    gen_server:stop(Sched)
+                end
+            end
+        )
+    after
+        telemetry:detach(HandlerId)
+    end.
+
+%% Helpers
+
+await_outcome(Id, Timeout) ->
+    receive
+        {outcome, #{
+            scheduler := compaction_sched_probe,
+            instance_id := Id,
+            outcome := Outcome
+        }} ->
+            Outcome;
+        {outcome, _} ->
+            await_outcome(Id, Timeout)
+    after Timeout ->
+        error(no_outcome)
+    end.
+
+mk_id() ->
+    list_to_binary(
+        "comp_" ++
+            integer_to_list(
+                erlang:unique_integer([positive, monotonic])
+            )
+    ).
+
+%% Two replicas with distinct origins, so the sync layer doesn't reject one as
+%% "remote with local origin".
+mk_pair() ->
+    A = mk_id(),
+    B = mk_id(),
+    {ok, _} = bondy_oplog_test_projection:start_instance(A, #{
+        origin => bondy_oplog_origin:new()
+    }),
+    {ok, _} = bondy_oplog_test_projection:start_instance(B, #{
+        origin => bondy_oplog_origin:new()
+    }),
+    {A, B}.
+
+append_cells(Id, From, To) ->
+    _ = [
+        bondy_oplog:append(Id, bondy_oplog_test_projection:cell_op(N))
+     || N <- lists:seq(From, To)
+    ],
+    ok.
+
+%% @private
+%% Converges A and B and leaves BOTH with a checkpointed peer root covering the
+%% converged state.
+%%
+%% Two rounds suffice because each session ends with a swap confirmation: the
+%% initiator tells the peer it now holds the advertised root, so BOTH sides
+%% checkpoint the same root. Without that confirmation each side would hold
+%% only what it unilaterally observed, and a third round would be needed for
+%% the frontier to catch up.
+converge(A, B) ->
+    {ok, _} = bondy_oplog:sync(A, B),
+    {ok, _} = bondy_oplog:sync(B, A),
+    bondy_oplog_peer_state:sync(),
+    ok.

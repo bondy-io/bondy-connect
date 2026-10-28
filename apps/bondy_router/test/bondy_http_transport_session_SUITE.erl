@@ -1,0 +1,437 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_http_transport_session_SUITE).
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("bondy.hrl").
+
+-compile([nowarn_export_all, export_all]).
+
+all() ->
+    [
+        start_and_stop,
+        whereis_lookup,
+        inactivity_timeout,
+        touch_extends_lifetime,
+        queue_integration,
+        maybe_enqueue_http_transport,
+        maybe_enqueue_websocket,
+        session_record_transport_fields,
+        lifecycle_event_contract
+    ].
+
+init_per_suite(Config) ->
+    bondy_ct:start_bondy(),
+    Config.
+
+end_per_suite(Config) ->
+    {save_config, Config}.
+
+init_per_testcase(_TestCase, Config) ->
+    bondy_config:set([http_transport, queue, max_messages], 1000),
+    bondy_config:set([http_transport, queue, max_bytes], 10485760),
+    bondy_config:set([http_transport, queue, message_ttl], 300000),
+    bondy_config:set([http_transport, idle_timeout], 3600000),
+    Config.
+
+end_per_testcase(_TestCase, _Config) ->
+    ok.
+
+%% =============================================================================
+%% TEST CASES
+%% =============================================================================
+
+start_and_stop(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<"com.test.realm">>,
+    SessionId = bondy_session_id:new(),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+    ?assert(is_pid(Pid)),
+    ?assert(erlang:is_process_alive(Pid)),
+
+    ?assertEqual(Pid, bondy_http_transport_session:whereis(TransportId)),
+
+    %% Verify queue was initialised (count returns 0, not from error path)
+    ?assertEqual(0, bondy_http_transport_queue:count(TransportId)),
+
+    ok = bondy_http_transport_session:close(Pid),
+
+    timer:sleep(100),
+
+    ?assertEqual(undefined, bondy_http_transport_session:whereis(TransportId)),
+
+    ?assertNot(erlang:is_process_alive(Pid)),
+
+    ?assertEqual(
+        {error, transport_not_found},
+        bondy_http_transport_queue:enqueue(TransportId, make_event(1), #{})
+    ).
+
+whereis_lookup(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<"com.test.realm">>,
+    SessionId = bondy_session_id:new(),
+
+    ?assertEqual(
+        undefined, bondy_http_transport_session:whereis(TransportId)
+    ),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+    ?assertEqual(Pid, bondy_http_transport_session:whereis(TransportId)),
+
+    ok = bondy_http_transport_session:close(TransportId),
+    timer:sleep(100),
+    ?assertEqual(
+        undefined, bondy_http_transport_session:whereis(TransportId)
+    ).
+
+inactivity_timeout(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<"com.test.realm">>,
+    SessionId = bondy_session_id:new(),
+
+    bondy_config:set([http_transport, idle_timeout], 100),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+    ?assert(erlang:is_process_alive(Pid)),
+
+    %% The inactivity check runs at max(5000, TTL/2) = 5000ms minimum.
+    %% For testing, we wait for the check interval + margin.
+    %% Since MIN_CHECK_INTERVAL is 5000ms, we need to wait at least that long.
+    MonRef = monitor(process, Pid),
+    receive
+        {'DOWN', MonRef, process, Pid, {shutdown, idle_timeout}} ->
+            ok
+    after 10000 ->
+        demonitor(MonRef, [flush]),
+        ct:fail("Transport session did not auto-close within timeout")
+    end,
+
+    ?assertEqual(
+        undefined, bondy_http_transport_session:whereis(TransportId)
+    ).
+
+touch_extends_lifetime(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<"com.test.realm">>,
+    SessionId = bondy_session_id:new(),
+
+    %% Set a short TTL (200ms) — the check interval will be 5000ms minimum
+    bondy_config:set([http_transport, idle_timeout], 200),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+
+    lists:foreach(
+        fun(_) ->
+            timer:sleep(100),
+            bondy_http_transport_session:touch(Pid)
+        end,
+        lists:seq(1, 6)
+    ),
+
+    ?assert(erlang:is_process_alive(Pid)),
+    ?assertEqual(Pid, bondy_http_transport_session:whereis(TransportId)),
+
+    MonRef = monitor(process, Pid),
+    receive
+        {'DOWN', MonRef, process, Pid, {shutdown, idle_timeout}} ->
+            ok
+    after 10000 ->
+        demonitor(MonRef, [flush]),
+        ct:fail("Transport session did not auto-close after touch stopped")
+    end.
+
+queue_integration(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<"com.test.realm">>,
+    SessionId = bondy_session_id:new(),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+
+    Msgs = [make_event(I) || I <- lists:seq(1, 5)],
+    lists:foreach(
+        fun(Msg) ->
+            ok = bondy_http_transport_queue:enqueue(TransportId, Msg, #{})
+        end,
+        Msgs
+    ),
+
+    ?assertEqual(5, bondy_http_transport_queue:count(TransportId)),
+
+    Dequeued = bondy_http_transport_queue:dequeue_batch(TransportId, 100),
+    ?assertEqual(5, length(Dequeued)),
+    ?assertEqual(Msgs, Dequeued),
+
+    ?assertEqual(0, bondy_http_transport_queue:count(TransportId)),
+
+    ok = bondy_http_transport_session:close(Pid).
+
+maybe_enqueue_http_transport(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<"com.leapsight.test.maybe_enqueue">>,
+    SessionId = bondy_session_id:new(),
+
+    _ = bondy_realm:create(RealmUri),
+    ok = bondy_realm:disable_security(RealmUri),
+
+    {ok, _Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+
+    Session = bondy_session:new(SessionId, RealmUri, #{
+        peer => {{127, 0, 0, 1}, 10000},
+        authid => <<"test_user">>,
+        authmethod => <<"anonymous">>,
+        is_anonymous => true,
+        security_enabled => false,
+        authroles => [<<"anonymous">>],
+        roles => #{caller => #{}, subscriber => #{}},
+        transport_type => http_longpoll,
+        transport_id => TransportId
+    }),
+    {ok, StoredSession} = bondy_session:store(Session),
+
+    ?assertEqual(TransportId, bondy_session:transport_id(StoredSession)),
+    ?assertEqual(http_longpoll, bondy_session:transport_type(StoredSession)),
+
+    Msg = make_event(42),
+    SId = bondy_session:id(StoredSession),
+
+    {ok, LookedUp} = bondy_session:lookup(SId),
+    case bondy_session:transport_id(LookedUp) of
+        undefined ->
+            ct:fail("Expected transport_id to be set");
+        TId ->
+            ok = bondy_http_transport_queue:enqueue(TId, Msg, #{}),
+            ?assertEqual(1, bondy_http_transport_queue:count(TId)),
+            Dequeued = bondy_http_transport_queue:dequeue_batch(TId, 10),
+            ?assertEqual([Msg], Dequeued)
+    end,
+
+    bondy_session:close(StoredSession, undefined),
+    ok = bondy_http_transport_session:close(TransportId).
+
+maybe_enqueue_websocket(_Config) ->
+    RealmUri = <<"com.leapsight.test.ws_session">>,
+    SessionId = bondy_session_id:new(),
+
+    _ = bondy_realm:create(RealmUri),
+    ok = bondy_realm:disable_security(RealmUri),
+
+    Session = bondy_session:new(SessionId, RealmUri, #{
+        peer => {{127, 0, 0, 1}, 10001},
+        authid => <<"ws_user">>,
+        authmethod => <<"anonymous">>,
+        is_anonymous => true,
+        security_enabled => false,
+        authroles => [<<"anonymous">>],
+        roles => #{caller => #{}, subscriber => #{}},
+        transport_type => websocket
+    }),
+    {ok, StoredSession} = bondy_session:store(Session),
+
+    ?assertEqual(undefined, bondy_session:transport_id(StoredSession)),
+    ?assertEqual(websocket, bondy_session:transport_type(StoredSession)),
+
+    SId = bondy_session:id(StoredSession),
+    {ok, LookedUp} = bondy_session:lookup(SId),
+    ?assertEqual(undefined, bondy_session:transport_id(LookedUp)),
+
+    bondy_session:close(StoredSession, undefined).
+
+session_record_transport_fields(_Config) ->
+    RealmUri = <<"com.leapsight.test.transport_fields">>,
+    _ = bondy_realm:create(RealmUri),
+    ok = bondy_realm:disable_security(RealmUri),
+
+    Session1 = bondy_session:new(RealmUri, #{
+        peer => {{127, 0, 0, 1}, 10002},
+        authid => <<"user1">>,
+        authmethod => <<"anonymous">>,
+        is_anonymous => true,
+        security_enabled => false,
+        authroles => [<<"anonymous">>],
+        roles => #{caller => #{}},
+        transport_type => http_sse,
+        transport_id => <<"sse-transport-1">>
+    }),
+    ?assertEqual(http_sse, bondy_session:transport_type(Session1)),
+    ?assertEqual(<<"sse-transport-1">>, bondy_session:transport_id(Session1)),
+
+    Session2 = bondy_session:new(RealmUri, #{
+        peer => {{127, 0, 0, 1}, 10003},
+        authid => <<"user2">>,
+        authmethod => <<"anonymous">>,
+        is_anonymous => true,
+        security_enabled => false,
+        authroles => [<<"anonymous">>],
+        roles => #{caller => #{}},
+        transport_type => http_longpoll,
+        transport_id => <<"longpoll-transport-1">>
+    }),
+    ?assertEqual(http_longpoll, bondy_session:transport_type(Session2)),
+    ?assertEqual(
+        <<"longpoll-transport-1">>, bondy_session:transport_id(Session2)
+    ),
+
+    Session3 = bondy_session:new(RealmUri, #{
+        peer => {{127, 0, 0, 1}, 10004},
+        authid => <<"user3">>,
+        authmethod => <<"anonymous">>,
+        is_anonymous => true,
+        security_enabled => false,
+        authroles => [<<"anonymous">>],
+        roles => #{caller => #{}},
+        transport_type => tcp
+    }),
+    ?assertEqual(tcp, bondy_session:transport_type(Session3)),
+    ?assertEqual(undefined, bondy_session:transport_id(Session3)),
+
+    Session4 = bondy_session:new(RealmUri, #{
+        peer => {{127, 0, 0, 1}, 10005},
+        authid => <<"user4">>,
+        authmethod => <<"anonymous">>,
+        is_anonymous => true,
+        security_enabled => false,
+        authroles => [<<"anonymous">>],
+        roles => #{caller => #{}},
+        transport_type => websocket
+    }),
+    ?assertEqual(websocket, bondy_session:transport_type(Session4)),
+    ?assertEqual(undefined, bondy_session:transport_id(Session4)),
+
+    Session5 = bondy_session:new(RealmUri, #{
+        peer => {{127, 0, 0, 1}, 10006},
+        authid => <<"user5">>,
+        authmethod => <<"anonymous">>,
+        is_anonymous => true,
+        security_enabled => false,
+        authroles => [<<"anonymous">>],
+        roles => #{caller => #{}}
+    }),
+    ?assertEqual(undefined, bondy_session:transport_type(Session5)),
+    ?assertEqual(undefined, bondy_session:transport_id(Session5)).
+
+%% The `[bondy, http_transport, session, closed]` lifecycle event fires
+%% for every termination, with the stop reason classified and any
+%% registered metadata carried verbatim. Covers: a `close/2` reason tag,
+%% the metadata round-trip through `set_telemetry_metadata/2`, the
+%% `metadata => undefined` shape when none was registered, and crash
+%% classification. Does NOT cover the idle-timeout tag (the MCP
+%% handshake suite pins it through the full stack).
+lifecycle_event_contract(_Config) ->
+    HandlerId = {?MODULE, self()},
+    Self = self(),
+    ok = telemetry:attach(
+        HandlerId,
+        [bondy, http_transport, session, closed],
+        fun(_Event, Meas, Meta, _) -> Self ! {closed, Meas, Meta} end,
+        undefined
+    ),
+    try
+        RealmUri = <<"com.test.realm">>,
+
+        %% With metadata: the map rides the event; the close/2 tag is
+        %% the reason.
+        T1 = make_transport_id(),
+        {ok, P1} = bondy_http_transport_session_sup:start_child(
+            T1, RealmUri, bondy_session_id:new()
+        ),
+        Metadata = #{mcp => #{realm => RealmUri, listener => test}},
+        ok = bondy_http_transport_session:set_telemetry_metadata(
+            P1, Metadata
+        ),
+        ok = bondy_http_transport_session:close(P1, stored_session_closed),
+        receive
+            {closed, #{count := 1, duration := D1}, Meta1} ->
+                ?assert(is_integer(D1) andalso D1 >= 0),
+                ?assertMatch(
+                    #{
+                        transport_id := T1,
+                        realm := RealmUri,
+                        reason := stored_session_closed,
+                        metadata := Metadata
+                    },
+                    Meta1
+                )
+        after 5000 ->
+            ct:fail(no_closed_event_with_metadata)
+        end,
+
+        %% Without metadata: default close/1 reason is client_close and
+        %% `metadata` is undefined.
+        T2 = make_transport_id(),
+        {ok, P2} = bondy_http_transport_session_sup:start_child(
+            T2, RealmUri, bondy_session_id:new()
+        ),
+        ok = bondy_http_transport_session:close(P2),
+        receive
+            {closed, _, Meta2} ->
+                ?assertMatch(
+                    #{
+                        transport_id := T2,
+                        reason := client_close,
+                        metadata := undefined
+                    },
+                    Meta2
+                )
+        after 5000 ->
+            ct:fail(no_closed_event_default_reason)
+        end,
+
+        %% A non-shutdown termination reason is classified `crash`.
+        T3 = make_transport_id(),
+        {ok, P3} = bondy_http_transport_session_sup:start_child(
+            T3, RealmUri, bondy_session_id:new()
+        ),
+        MRef3 = erlang:monitor(process, P3),
+        ok = sys:terminate(P3, boom),
+        receive
+            {'DOWN', MRef3, process, P3, boom} -> ok
+        after 5000 ->
+            ct:fail(no_crash_exit)
+        end,
+        receive
+            {closed, _, Meta3} ->
+                ?assertMatch(#{transport_id := T3, reason := crash}, Meta3)
+        after 5000 ->
+            ct:fail(no_closed_event_crash)
+        end
+    after
+        telemetry:detach(HandlerId)
+    end.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+make_transport_id() ->
+    Bin = integer_to_binary(erlang:unique_integer([positive])),
+    <<"test-http-transport-", Bin/binary>>.
+
+%% @private
+make_event(N) ->
+    #event{
+        subscription_id = 1,
+        publication_id = N,
+        details = #{},
+        args = [<<"payload-", (integer_to_binary(N))/binary>>],
+        kwargs = undefined
+    }.

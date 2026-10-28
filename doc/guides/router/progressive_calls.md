@@ -1,0 +1,227 @@
+# Progressive Call Invocations
+
+Bondy implements the WAMP Advanced Profile feature **Progressive Call
+Invocations**: a caller can stream the **arguments** of a single call to the
+callee in any number of chunks, reusing one request id, before the callee
+produces its result. Typical uses are uploading a large payload in pieces,
+feeding a long-running computation incrementally, and forwarding a client-side
+stream into an RPC without buffering it whole.
+
+This is the mirror image of **Progressive Call Results** (streaming the
+*result* from callee to caller), documented in
+[`progressive_call_results.md`](progressive_call_results.md). The two features
+are independent and can be combined.
+
+## Message flow
+
+```
+Caller                Dealer                 Callee
+  |  CALL id=7           |                      |
+  |  progress=T          |                      |
+  |--------------------->|  INVOCATION id=100   |
+  |                      |  progress=T          |
+  |                      |--------------------->|
+  |  CALL id=7           |                      |
+  |  progress=T          |  INVOCATION id=100   |
+  |--------------------->|  progress=T          |
+  |                      |--------------------->|
+  |  CALL id=7 (final)   |                      |
+  |  (no progress)       |  INVOCATION id=100   |
+  |--------------------->|  (no progress)       |
+  |                      |--------------------->|
+  |                      |            YIELD/final|
+  |    RESULT (final)    |<---------------------|
+  |<---------------------|                      |
+```
+
+- The caller opens the stream with `CALL.Options.progress = true` and keeps
+  the **same** `CALL.Request` id for every chunk.
+- The dealer forwards each chunk as an `INVOCATION` with the **same**
+  `INVOCATION.Request` id and `Details.progress = true`, so the callee sees
+  one invocation receiving successive argument chunks.
+- The final chunk is a `CALL` for the same request id **without** `progress`;
+  the dealer forwards it as an `INVOCATION` without `progress`, so the callee
+  learns the input is complete and computes its result.
+- The callee replies once, with a single terminal `RESULT`/`ERROR` (or, if it
+  also streams results, a progressive result sequence — see the results
+  guide).
+
+This holds in a cluster as well: when caller and callee are connected to
+different nodes, the chunks are relayed between nodes and arrive at the callee
+in send order (Bondy pins each caller/callee pair to a single ordered pipeline
+across the cluster connection). The call promise lives on the caller's node
+and the invocation promise on the callee's node; each further chunk is
+re-forwarded to the callee's node against the open invocation rather than
+re-routed. If the first chunk finds no callee on that node, the call fails with
+`wamp.error.no_eligible_callee` instead of moving to another node. A chunk that
+reaches the callee's node after the call has completed there is discarded
+(`bondy_rpc_retry_SUITE`).
+
+A callee behind a bridge relay that ends on the caller's router receives every
+chunk the same way, and a cancellation or the caller leaving interrupts it
+(`bondy_connect_bridge_progressive_SUITE`).
+
+## Enabling the feature
+
+Progressive Call Invocations is a capability of the build, not a setting: Bondy
+advertises `progressive_call_invocations` as a dealer feature in every
+`WELCOME`, and there is no `bondy.conf` key to turn it off. See
+[WAMP features](wamp_features.md).
+
+A session obtains the feature only when its `HELLO` announces it. The feature is
+strict opt-in: a client role that omits `progressive_call_invocations` is given
+`false`, rather than inheriting the router's advertised value.
+
+## Semantics and guarantees
+
+- **Strict opt-in, no silent degrade.** Unlike progressive *results* — a callee
+  that does not support them simply replies once — a progressive *call* cannot
+  be silently downgraded, because the caller has already begun streaming. The
+  caller is checked on its own node for every chunk, and a remote callee is
+  checked at the node that hosts it on the first chunk. A `CALL` with
+  `progress` set is a protocol error when the caller or the dealer did not
+  announce `progressive_call_invocations`: Bondy aborts the session with
+  `wamp.error.protocol_violation` and routes nothing the caller sent after that
+  `CALL` (`bondy_connect_progressive_call_invocations_SUITE`). If the callee does
+  not support the feature, the call fails with
+  `wamp.error.feature_not_supported`. Neither call is reinterpreted as a plain
+  call. Both `progressive_call_invocations` and
+  `progressive_call_results` are **strict opt-in**: a peer must announce the
+  feature explicitly in `HELLO` to obtain it. Unlike ordinary capabilities —
+  which a peer inherits from the router's advertised set unless it opts out — a
+  peer that simply *omits* a progressive feature does **not** get it.
+  A callee behind a bridge relay is gated the same way, at the edge router that
+  hosts it (`bondy_connect_bridge_progressive_SUITE`).
+- **Callee support needs `call_canceling`.** Per the WAMP specification, a
+  callee supports the feature only if its role announces both
+  `progressive_call_invocations` and `call_canceling`. Bondy accepts a `HELLO`
+  that announces the feature without `call_canceling` and treats that callee
+  as not supporting it. A caller needs no `call_canceling`
+  (`bondy_connect_progressive_call_invocations_SUITE`).
+- **Reserved procedures.** Bondy serves the `wamp.*` and `bondy.*` procedures
+  itself and reads no progressive input there, so a progressive call to one
+  fails with `wamp.error.feature_not_supported`.
+- **One request id.** Every chunk of a stream reuses the caller's original
+  `CALL.Request` id. A session that announced the feature is held to the WAMP
+  request id sequence, which SUBSCRIBE, UNSUBSCRIBE, PUBLISH, REGISTER,
+  UNREGISTER and CALL share. A `CALL` with the next id starts a call. A `CALL`
+  whose id skips ahead, or reuses the id of a live call to the same procedure
+  that is not a progressive stream, aborts the session with
+  `wamp.error.protocol_violation`.
+  A chunk for a call that has completed is discarded without a reply, since the
+  caller may send it before it learns of the completion. So is a chunk that
+  names a procedure other than the stream's, since WAMP matches a chunk to its
+  call by both the request id and the procedure
+  (`bondy_connect_progressive_call_invocations_SUITE`). A session that did not
+  announce the feature is not checked.
+- **Set by the first chunk.** The options of the first chunk apply to the whole
+  stream. On a later chunk the dealer reads only `progress`, and every
+  `INVOCATION` carries the first chunk's details apart from `progress`. The
+  first chunk is also the only one authorized: a permission revoked during a
+  stream refuses the caller's next call, not the open stream
+  (`bondy_connect_progressive_call_invocations_SUITE`).
+- **Callee leaving.** A callee that leaves during a stream cancels the call:
+  the caller gets `wamp.error.canceled`, as the WAMP specification requires for
+  a callee leaving any call
+  (`bondy_connect_progressive_call_invocations_SUITE`). Chunks the caller sends
+  afterwards are discarded.
+- **Ordering.** All chunks for one call reach the callee in send order,
+  including across cluster nodes. The final (non-`progress`) chunk never
+  overtakes an earlier one.
+- **Timeout = inactivity window.** As with progressive results,
+  `CALL.Options.timeout` is the limit between chunks — each chunk **restarts**
+  it, so a stream that keeps flowing can run for longer than the timeout while
+  a stream that goes quiet is terminated with `wamp.error.timeout`.
+- **`_deadline` = total budget (Bondy extension).** `CALL.Options._deadline`
+  (milliseconds) caps the **whole** call, bounding a slowly-dripping stream
+  that never stalls long enough to trip the inactivity timeout.
+- **Cancellation.** A progressive call can be cancelled like any other call
+  (`CANCEL` with mode `skip`, `kill` or `killnowait`), including when the
+  callee is on another cluster node — the dealer relays the cancellation to
+  the callee's node, which interrupts the callee mid-stream.
+- **Caller departure.** If the caller's session ends mid-stream, the dealer
+  sends the callee an `INTERRUPT` (mode `killnowait`) so it stops waiting on
+  input that will never arrive — for local callees directly, and for callees
+  on other nodes by relaying the cancellation to their node
+  (`bondy_connect_cluster_rpc_SUITE:progressive_input_remote_caller_death_interrupts_callee`).
+  On caller departure the `INTERRUPT` goes only to a callee that announced
+  `call_canceling`.
+
+## Using it from bondy_connect_sdk (Erlang client)
+
+Both RPC roles of the built-in `bondy_connect_sdk` client announce
+`progressive_call_invocations`.
+
+**Caller** — open the stream with `call_stream/5`, send further argument
+chunks with `send_input/4`, and close it with `finish_input/4`. The reply is
+delivered against the returned `Token` exactly like `call_async/5`:
+
+```erlang
+{ok, Token} = bondy_connect_client:call_stream(
+    Conn, <<"com.example.upload">>, [<<"part-1">>], #{}, #{
+        %% inactivity window between chunks (WAMP timeout)
+        timeout => 30000,
+        %% optional total budget for the whole stream (Bondy extension)
+        '_deadline' => 300000
+    }
+),
+ok = bondy_connect_client:send_input(Conn, Token, [<<"part-2">>], #{}),
+ok = bondy_connect_client:finish_input(Conn, Token, [<<"part-3">>], #{}),
+receive
+    {bondy_connect_client, Token, {ok, Final}} -> {done, Final};
+    {bondy_connect_client, Token, {error, Reason}} -> {error, Reason}
+end.
+```
+
+`call_stream/5` sends the first chunk and returns immediately; `send_input/4`
+sends a non-final chunk; `finish_input/4` sends the final chunk and closes the
+input stream. The result arrives as the single terminal
+`{bondy_connect_client, Token, {ok, _} | {error, _}}` message.
+After `finish_input/4`, `send_input/4` and `finish_input/4` on the same token
+send nothing and return `{error, input_finished}`
+(`bondy_connect_progressive_call_invocations_SUITE:no_chunk_follows_the_final_chunk`).
+If the router did not announce `progressive_call_invocations`, `call_stream/5`
+sends nothing and returns
+`{error, #{kind := client, reason := feature_not_supported}}`
+(`bondy_connect_progressive_call_invocations_SUITE:call_stream_refuses_a_dealer_without_the_feature`).
+
+**Callee** — when the caller opened a progressive call, the handler receives
+an `input` fun in its details. The invocation's own arguments are the first
+chunk; calling `input()` **pulls** the next chunk, blocking until it arrives
+and returning `{more, Args, KWArgs}` while the stream continues or
+`{last, Args, KWArgs}` for the final chunk:
+
+```erlang
+Handler = fun(FirstChunk, _KWArgs, Details) ->
+    case maps:find(input, Details) of
+        {ok, Input} ->
+            All = collect([FirstChunk], Input),
+            {ok, #{args => [process(All)]}};
+        error ->
+            %% Not a progressive call — a single set of arguments.
+            {ok, #{args => [process([FirstChunk])]}}
+    end
+end,
+
+collect(Acc, Input) ->
+    case Input() of
+        {more, Args, _KWArgs} -> collect([Args | Acc], Input);
+        {last, Args, _KWArgs} -> lists:reverse([Args | Acc])
+    end.
+
+{ok, _} = bondy_connect_client:register(Conn, <<"com.example.upload">>, Handler).
+```
+
+The `input` fun is only present when `INVOCATION.Details.progress` is `true`,
+so handlers must not assume it exists. The handler's details do not carry that
+flag: the `input` fun stands for it, and `progress` names only the fun for
+progressive results. A handler can therefore pull input and emit progressive
+results in the same call
+(`bondy_connect_progressive_call_invocations_SUITE:a_handler_streams_both_ways`).
+
+A chunk that reaches the callee after its handler replied is discarded, as the
+WAMP specification requires, instead of starting the handler again
+(`bondy_connect_progressive_call_invocations_SUITE:a_chunk_after_the_callee_replied_is_discarded`).
+The connection remembers a stream until its final chunk arrives, or for the
+invocation's timeout (60 seconds without one) after its last chunk; a chunk
+later than that would start the handler again.

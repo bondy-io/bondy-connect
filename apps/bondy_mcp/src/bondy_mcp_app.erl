@@ -1,0 +1,50 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_mcp_app).
+
+-moduledoc """
+OTP application behaviour for `bondy_mcp`.
+
+Started by `bondy_router_app:start/2` after the early-phase listeners and before the
+normal-phase ones bind, so an MCP socket never accepts a request while the
+application that answers it is down.
+""".
+
+-behaviour(application).
+
+-export([start/2]).
+-export([stop/1]).
+
+start(_Type, _Args) ->
+    %% Declare the metric families and attach the Prometheus sink
+    %% before any emitter can run. `bondy_metrics` is up: its gen_server
+    %% is a `bondy_oplog_sup` child and `bondy_oplog` precedes
+    %% `bondy_router`, which starts this application mid-boot.
+    ok = bondy_mcp_metrics:setup(),
+    %% The bondy.mcp.* Meta API. Registered here — not a static clause in
+    %% bondy_wamp_api's table — because this application sits above
+    %% bondy_router; bondy_router_app completes this start before the normal
+    %% listeners bind, so the registration precedes any client call.
+    ok = bondy_wamp_api:register_handler(~"bondy.mcp.", bondy_mcp_wamp_api),
+    case bondy_mcp_sup:start_link() of
+        {ok, _} = OK ->
+            case application:get_env(bondy_mcp, upstreams, []) of
+                [] ->
+                    OK;
+                [_ | _] ->
+                    %% The client direction. An invalid declaration
+                    %% set fails the application start deliberately.
+                    case bondy_mcp_sup:start_upstreams() of
+                        {ok, _} -> OK;
+                        {error, _} = Error -> Error
+                    end
+            end;
+        Other ->
+            Other
+    end.
+
+stop(_State) ->
+    ok.

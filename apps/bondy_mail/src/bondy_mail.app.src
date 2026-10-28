@@ -1,0 +1,44 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+{application, bondy_mail, [
+    {description,
+        "Outbound email for Bondy. Owns relay configuration, worker pooling, "
+        "MIME construction, retry, rate limiting and telemetry. Knows nothing "
+        "about WAMP: the broker bridge and the bondy.mail.* API are thin "
+        "surfaces over this one send path. Dormant unless a relay is "
+        "configured."
+    },
+    {vsn, "0.1.0"},
+    {registered, [
+        bondy_mail_sup,
+        bondy_mail_relay_sup,
+        bondy_mail_status
+    ]},
+    {mod, {bondy_mail_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        %% Relay, worker and worker-supervisor names are registered via
+        %% gproc. Queues are this application's own -- held in the worker that
+        %% will deliver them -- so nothing on the send path calls into a
+        %% process shared with anything else. See bondy_mail_worker.
+        gproc,
+        %% Rendezvous hashing, used to pick the node that owns an idempotency
+        %% key among the connected peers. The chosen node is reached through
+        %% `bondy_cluster`. See bondy_mail_status.
+        lrw,
+        telemetry,
+        gen_smtp,
+        bondy_metrics,
+        bondy_regulator,
+        bondy_connect_lib,
+        bondy_cluster
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+]}.

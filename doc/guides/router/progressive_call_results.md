@@ -1,0 +1,162 @@
+# Progressive Call Results
+
+Bondy implements the WAMP Advanced Profile feature **Progressive Call
+Results**: a callee can stream any number of partial results for a single
+call before delivering the final result, and the caller receives them in
+order as they are produced. Typical uses are paging large result sets,
+streaming file chunks, and long-running computations that report partial
+output.
+
+The related feature *Progressive Call Invocations* (streaming call **arguments**
+from caller to callee) is the mirror image and is documented separately in
+[`progressive_calls.md`](progressive_calls.md).
+
+## Message flow
+
+```
+Caller                Dealer                 Callee
+  |  CALL                |                      |
+  |  receive_progress=T  |                      |
+  |--------------------->|  INVOCATION          |
+  |                      |  receive_progress=T  |
+  |                      |--------------------->|
+  |                      |     YIELD progress=T |
+  |    RESULT progress=T |<---------------------|
+  |<---------------------|     YIELD progress=T |
+  |    RESULT progress=T |<---------------------|
+  |<---------------------|     YIELD (final)    |
+  |    RESULT (final)    |<---------------------|
+  |<---------------------|                      |
+```
+
+- The caller opts in per call with `CALL.Options.receive_progress = true`.
+- The dealer forwards the request to the callee as
+  `INVOCATION.Details.receive_progress = true`.
+- Each partial result is a `YIELD` with `Options.progress = true`, which
+  the dealer forwards as a `RESULT` with `Details.progress = true` without
+  settling the call.
+- The first `YIELD` without the flag (or an `ERROR`) is the **terminal**
+  message: it settles the call, and the caller receives exactly one
+  terminal `RESULT`/`ERROR` after all progressive results.
+
+This holds in a cluster as well: when caller and callee are connected to
+different nodes, progressive results are relayed between nodes and arrive
+at the caller in yield order (Bondy pins each caller/callee pair to a
+single ordered pipeline across the cluster connection).
+
+## Enabling the feature
+
+Progressive Call Results is a capability of the build, not a setting: Bondy
+advertises `progressive_call_results` as a dealer feature in every `WELCOME`,
+and there is no `bondy.conf` key to turn it off. See
+[WAMP features](wamp_features.md).
+
+A session obtains the feature only when its `HELLO` announces it. The feature
+is strict opt-in: a client role that omits `progressive_call_results` is given
+`false`, rather than inheriting the router's advertised value.
+
+## Semantics and guarantees
+
+- **Opt-in end to end.** `receive_progress` is honoured only when the
+  caller announced `progressive_call_results` in `HELLO` and the callee
+  announced it too. If either did not, the option is removed: the callee sees
+  a plain invocation, replies once, and the caller receives a single final
+  result. The call still succeeds.
+- **`call_canceling` pairing.** WAMP requires a callee that supports
+  progressive results to support call canceling, so that the dealer can
+  interrupt it when its caller leaves. Bondy gives progressive results only to
+  a callee that announced both `progressive_call_results` and
+  `call_canceling`. Any other callee sees a plain invocation and replies once
+  (`bondy_connect_conformance_SUITE:progressive_results_need_callee_canceling`).
+  A caller needs only `progressive_call_results`.
+- **Ordering.** All progressive results for one call arrive in yield
+  order, before the terminal result. Nothing is delivered for a call after
+  its terminal message.
+- **Timeout = inactivity window.** Per the WAMP specification, for a
+  progressive call `CALL.Options.timeout` is "the time limit between the
+  initial call and the first result, and between results thereafter" —
+  each progressive result **restarts** it. A stream that goes quiet for
+  longer than the timeout is terminated with `wamp.error.timeout`; a
+  stream that keeps producing results can run for longer than the timeout.
+- **`_deadline` = total budget (Bondy extension).** Because the timeout
+  only bounds gaps, a slowly-dripping stream is otherwise unbounded.
+  `CALL.Options._deadline` (milliseconds) caps the **whole** call: the
+  stream is terminated with `wamp.error.timeout` when the deadline is
+  reached, no matter how healthy it is.
+- **Cancellation.** A progressive call can be cancelled like any other
+  call (`CANCEL` with mode `skip`, `kill` or `killnowait`), including when
+  the callee is on another cluster node — the dealer relays the
+  cancellation to the callee's node, which interrupts the callee.
+- **Caller departure.** If the caller's session ends mid-stream, the
+  dealer sends the callee an `INTERRUPT` (mode `killnowait`) so it stops
+  producing results nobody will consume — for local callees directly, and
+  for callees on other nodes by relaying the cancellation to their node
+  (`bondy_connect_cluster_rpc_SUITE:progressive_remote_caller_death_interrupts_callee`).
+  On caller departure the `INTERRUPT` goes only to a callee that announced
+  `call_canceling`.
+- **Protocol violations.** A progressive `YIELD` for a call that did not
+  request progressive results is a protocol violation: the callee's
+  session is closed with `wamp.error.protocol_violation` and the caller's
+  call fails fast with `wamp.error.canceled`, as for any callee that leaves.
+
+## Using it from bondy_connect_sdk (Erlang client)
+
+Both RPC roles of the built-in `bondy_connect_sdk` client announce
+`progressive_call_results`.
+
+**Caller** — progressive results require `call_async/5` (a synchronous
+`call/5` cannot represent a stream and rejects the option):
+
+```erlang
+{ok, Token} = bondy_connect_client:call_async(
+    Conn, <<"com.example.stream">>, [], #{}, #{
+        receive_progress => true,
+        %% inactivity window between results (WAMP timeout)
+        timeout => 30000,
+        %% optional total budget for the whole stream (Bondy extension)
+        '_deadline' => 300000
+    }
+),
+receive_loop(Token).
+
+receive_loop(Token) ->
+    receive
+        {bondy_connect_client, Token, {progress, #{args := Chunk}}} ->
+            handle_chunk(Chunk),
+            receive_loop(Token);
+        {bondy_connect_client, Token, {ok, Final}} ->
+            {done, Final};
+        {bondy_connect_client, Token, {error, Reason}} ->
+            {error, Reason}
+    end.
+```
+
+Each progressive result is delivered as
+`{bondy_connect_client, Token, {progress, Result}}`; the `{ok, _}` or
+`{error, _}` delivery remains the single terminal message. Every result,
+progressive or final, is a map with the keys `args`, `kwargs` and `details`;
+`details` holds the `RESULT.Details` the router sent, or `#{}` when it sent
+none.
+
+**Callee** — when the caller requested progressive results, the handler
+receives a `progress` fun in its details; each call emits one progressive
+`YIELD`, and the handler's return value is the final result:
+
+```erlang
+Handler = fun(_Args, _KWArgs, Details) ->
+    case maps:find(progress, Details) of
+        {ok, Progress} ->
+            ok = Progress([<<"chunk-1">>], #{}),
+            ok = Progress([<<"chunk-2">>], #{}),
+            {ok, #{args => [<<"final">>]}};
+        error ->
+            %% Caller did not ask for progressive results.
+            {ok, #{args => [<<"final">>]}}
+    end
+end,
+{ok, _} = bondy_connect_client:register(Conn, <<"com.example.stream">>, Handler).
+```
+
+The `progress` fun is only present when
+`INVOCATION.Details.receive_progress` is `true`, so handlers must not
+assume it exists.

@@ -1,2 +1,3 @@
 security.config_file = ${BONDY_ETC_DIR}/security_config.json
 platform_data_dir=${BONDY_DATA_DIR}
+cluster.enabled = off

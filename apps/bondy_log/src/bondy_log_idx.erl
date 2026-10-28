@@ -1,0 +1,571 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_log_idx).
+
+-include("bondy_log.hrl").
+
+-moduledoc """
+Sparse key index (`.qidx`).
+
+One `.qidx` per `.qdata` segment maps each indexed batch frame's
+**key range** to its byte offset, at sparse intervals (default 64 KB).
+The index lets `open_reader(_, {key, T}, _)` jump directly to the
+batch that contains a target key in O(log N), instead of linearly
+scanning a segment from offset 48.
+
+The index is a **best-effort accelerator**, not load-bearing for
+correctness. A missing or stale `.qidx` only makes key-seek slower:
+the reader falls back to scanning from the start of the candidate
+segment. Recovery rebuilds the file from a segment scan if it's
+missing or shorter than expected.
+
+Entries are recorded in **append order**, one per indexed frame. The
+binary search in `seek/2` reads them as sorted by key, which they are
+exactly when the adapter's keys are globally monotonic in append order
+(`bondy_log_record`). The writer enforces key order only within a frame,
+so for an adapter whose concurrent appenders can land frames out of key
+order the seek is a lower bound that may start *after* a frame holding
+keys above the target; the oplog is such an adapter and does not seek a
+disk log by key.
+
+This module has three concerns:
+
+1. **Accumulator** (writer-side, in-memory): `new/1`, `note_frame/5`,
+   `entries/1` build up the list of `{FirstKey, LastKey, ByteOffset}`
+   entries to persist for a segment. The writer holds one accumulator
+   at a time, for the current head segment.
+
+2. **File I/O** (writer flush, reader load): `write_file/2` persists
+   an entry list as a v2 file via `bondy_log_io:write_atomic/2`
+   (tmp+datasync+rename+dir-fsync);
+   `read_file/1` parses it back. The reader accepts both v1 and v2
+   files: v1 entries `(Key, Off)` are lifted to v2 shape
+   `(Key, Key, Off)` (degenerate single-key range). The next rebuild
+   produces a v2 file.
+
+3. **Seek** (reader-side): `open/1` loads a file and returns an
+   opaque handle; `seek/2` does an O(log N) binary search for the
+   entry whose range contains the target key, falling back to the
+   largest entry whose range ends ≤ the target (mirrors v1's
+   semantics for any T that misses every range). `from_entries/1`
+   builds the same handle from in-memory entries (used for the head
+   segment, whose `.qidx` is not yet on disk while the writer is
+   alive).
+
+### File format (v2)
+
+Header (16 bytes) — unchanged from v1; the `Version` byte selects
+the entry layout below:
+
+```
+Offset  Size  Field
+   0     4    Magic           0x42444958  ("BDIX")
+   4     1    Version         1 or 2
+   5     3    Flags
+   8     4    EntryCount
+  12     4    Reserved
+```
+
+v2 entry (24 bytes):
+
+```
+Offset  Size  Field
+   0     8    FirstKey         first event's key in the indexed batch
+   8     8    LastKey          last event's key in the indexed batch
+  16     8    ByteOffset       offset of the frame start within .qdata
+```
+
+v1 entry (16 bytes, read-only fallback):
+
+```
+Offset  Size  Field
+   0     8    Key              first key of the indexed batch frame
+   8     8    ByteOffset       offset of the frame start within .qdata
+```
+
+For a 64 MB segment with 64 KB entry spacing: 1024 entries × 24 B =
+24 KB. ~0.04 % storage overhead.
+
+### Accumulator semantics
+
+The accumulator gates on `bytes_since_last_emit + frame_len >=
+interval_bytes`. The **first frame of a segment is always indexed**
+(invariant: every non-empty segment has at least one entry whose
+range bounds every key in the segment). After each emit,
+`bytes_since_last` resets to zero. Indexed entries always satisfy
+`FirstKey =< LastKey`; a single-event batch produces an entry where
+`FirstKey == LastKey`.
+""".
+
+-define(MAGIC, ?BONDY_LOG_IDX_MAGIC).
+-define(HEADER_BYTES, ?BONDY_LOG_IDX_HEADER_BYTES).
+-define(ENTRY_BYTES_V1, ?BONDY_LOG_IDX_ENTRY_BYTES_V1).
+-define(ENTRY_BYTES_V2, ?BONDY_LOG_IDX_ENTRY_BYTES_V2).
+-define(VERSION_V1, ?BONDY_LOG_IDX_VERSION_V1).
+-define(VERSION_V2, ?BONDY_LOG_IDX_VERSION_V2).
+-define(VERSION_CURRENT, ?BONDY_LOG_IDX_VERSION).
+
+-type key() :: bondy_log_record:key().
+-type offset() :: non_neg_integer().
+-type entry() :: {key(), key(), offset()}.
+
+%% Writer-side accumulator: a running list of entries plus the bookkeeping
+%% needed to decide when to emit the next one.
+-record(acc, {
+    interval_bytes :: pos_integer(),
+    bytes_since_last :: non_neg_integer(),
+    %% Entries are stored newest-first while building so `note_frame/5`
+    %% is O(1); `entries/1` reverses to ascending key order on emission.
+    entries_rev :: [entry()],
+    entry_count :: non_neg_integer()
+}).
+
+%% Reader-side index handle: a 1-based tuple of
+%% `{FirstKey, LastKey, Offset}` entries in `Offset` ascending order —
+%% `FirstKey` ascending too when the adapter's keys follow append order
+%% (moduledoc). Tuple-backed so `seek/2` is O(log N) via `element/2`
+%% (constant-time random access).
+-record(idx, {
+    entries :: tuple()
+}).
+
+-type accumulator() :: #acc{}.
+-type t() :: #idx{}.
+-type entries() :: [entry()].
+
+-export_type([entry/0]).
+-export_type([accumulator/0]).
+-export_type([t/0]).
+-export_type([entries/0]).
+
+-export([filename/1]).
+-export([header_bytes/0]).
+-export([entry_bytes/0]).
+
+-export([new/0]).
+-export([new/1]).
+-export([note_frame/5]).
+-export([would_index/2]).
+-export([note_indexed_frame/4]).
+-export([note_skipped_frame/2]).
+-export([entries/1]).
+-export([entry_count/1]).
+-export([interval_bytes/1]).
+
+-export([write_file/2]).
+-export([read_file/1]).
+
+-export([open/1]).
+-export([from_entries/1]).
+-export([seek/2]).
+-export([handle_entries/1]).
+
+%% =============================================================================
+%% CONSTANTS
+%% =============================================================================
+
+-doc """
+Returns the canonical filename for the `.qidx` of the given segment id.
+The id is rendered as a 9-digit zero-padded decimal so that
+lexicographic order matches numeric order on directory listings.
+
+Returns a binary to match the in-tree convention.
+""".
+-spec filename(non_neg_integer()) -> binary().
+
+filename(Id) when is_integer(Id), Id >= 0 ->
+    iolist_to_binary(io_lib:format("~9..0B.qidx", [Id])).
+
+-doc "Returns the `.qidx` header size in bytes (16).".
+-spec header_bytes() -> pos_integer().
+
+header_bytes() ->
+    ?HEADER_BYTES.
+
+-doc """
+Returns the `.qidx` entry size in bytes for the **current** writer
+version (v2 = 24). v1 files use 16-byte entries; the read path
+handles both.
+""".
+-spec entry_bytes() -> pos_integer().
+
+entry_bytes() ->
+    ?ENTRY_BYTES_V2.
+
+%% =============================================================================
+%% ACCUMULATOR
+%% =============================================================================
+
+-doc """
+Creates a fresh accumulator with the default interval
+(`?BONDY_LOG_IDX_DEFAULT_INTERVAL_BYTES`, 64 KiB).
+""".
+-spec new() -> accumulator().
+
+new() ->
+    new(?BONDY_LOG_IDX_DEFAULT_INTERVAL_BYTES).
+
+-doc """
+Creates a fresh accumulator with a custom emit interval.
+
+`IntervalBytes` controls the index density: smaller values produce more
+entries (faster seek, larger `.qidx`); larger values produce fewer
+entries (slower seek, smaller `.qidx`). The default is 64 KiB.
+""".
+-spec new(pos_integer()) -> accumulator().
+
+new(IntervalBytes) when is_integer(IntervalBytes), IntervalBytes > 0 ->
+    #acc{
+        interval_bytes = IntervalBytes,
+        bytes_since_last = 0,
+        entries_rev = [],
+        entry_count = 0
+    }.
+
+-doc """
+Records a freshly-written frame.
+
+`FirstKey` and `LastKey` are the keys of the first and last events in
+the frame's batch (`FirstKey =< LastKey`; equal for a single-event
+batch). `Offset` is the byte offset of the frame's start within the
+segment. `FrameLen` is the total frame length on disk (header + body).
+
+The accumulator emits a new entry when:
+
+1. The accumulator is empty (i.e., this is the first frame of the
+   segment). The first frame is **always** indexed so every non-empty
+   segment has at least one entry usable for seek.
+2. The accumulator has emitted at least one entry **and** the running
+   `bytes_since_last_emit + FrameLen >= interval_bytes`. The new entry
+   is `(FirstKey, LastKey, Offset)` and `bytes_since_last` resets to
+   zero.
+
+Otherwise `bytes_since_last` is incremented by `FrameLen` and the
+entry list is unchanged.
+""".
+-spec note_frame(accumulator(), key(), key(), offset(), pos_integer()) ->
+    accumulator().
+
+note_frame(Acc, FirstKey, LastKey, Offset, FrameLen) ->
+    case would_index(Acc, FrameLen) of
+        true -> note_indexed_frame(Acc, FirstKey, LastKey, Offset);
+        false -> note_skipped_frame(Acc, FrameLen)
+    end.
+
+-doc """
+Returns `true` when a frame of size `FrameLen` should be indexed
+according to the accumulator's interval. Used by the sealed-segment
+`.qidx` rebuild path in recovery to avoid body-decoding frames that
+will not produce an index entry.
+""".
+-spec would_index(accumulator(), pos_integer()) -> boolean().
+
+would_index(#acc{entries_rev = []}, _FrameLen) ->
+    true;
+would_index(#acc{bytes_since_last = B, interval_bytes = I}, FrameLen) when
+    is_integer(FrameLen), FrameLen > 0
+->
+    B + FrameLen >= I.
+
+-doc """
+Records a frame that the caller has decided to index. Appends an
+entry, bumps `entry_count`, and resets `bytes_since_last` to zero.
+
+This is the lower-level companion of `note_frame/5`. Use this when
+the caller has already determined the frame should be indexed (e.g.,
+via `would_index/2` followed by a body decode to extract the first
+and last keys).
+""".
+-spec note_indexed_frame(accumulator(), key(), key(), offset()) ->
+    accumulator().
+
+note_indexed_frame(
+    #acc{entries_rev = Rev, entry_count = N} = Acc,
+    FirstKey,
+    LastKey,
+    Offset
+) when
+    is_integer(FirstKey),
+    FirstKey >= 0,
+    is_integer(LastKey),
+    LastKey >= FirstKey,
+    is_integer(Offset),
+    Offset >= 0
+->
+    Acc#acc{
+        entries_rev = [{FirstKey, LastKey, Offset} | Rev],
+        entry_count = N + 1,
+        bytes_since_last = 0
+    }.
+
+-doc """
+Records a frame the caller is **not** indexing. Just adds `FrameLen`
+bytes to `bytes_since_last`; no entry is appended.
+
+Used by the sealed-segment `.qidx` rebuild path to advance the
+accumulator's interval bookkeeping without paying for a body decode.
+""".
+-spec note_skipped_frame(accumulator(), pos_integer()) -> accumulator().
+
+note_skipped_frame(#acc{bytes_since_last = B} = Acc, FrameLen) when
+    is_integer(FrameLen), FrameLen > 0
+->
+    Acc#acc{bytes_since_last = B + FrameLen}.
+
+-doc """
+Returns the accumulator's entries in key-ascending order, suitable for
+passing to `write_file/2` or `from_entries/1`.
+""".
+-spec entries(accumulator()) -> entries().
+
+entries(#acc{entries_rev = Rev}) ->
+    lists:reverse(Rev).
+
+-doc "Returns the number of entries currently in the accumulator.".
+-spec entry_count(accumulator()) -> non_neg_integer().
+
+entry_count(#acc{entry_count = N}) -> N.
+
+-doc "Returns the accumulator's configured emit interval in bytes.".
+-spec interval_bytes(accumulator()) -> pos_integer().
+
+interval_bytes(#acc{interval_bytes = I}) -> I.
+
+%% =============================================================================
+%% FILE I/O
+%% =============================================================================
+
+-doc """
+Atomically writes `Entries` to a `.qidx` file at `Path`. An empty entry
+list is valid — it writes a header with `EntryCount = 0`.
+
+A failed directory fsync is returned as `{error, {dir_fsync_failed, Dir,
+Reason}}` rather than raised: recovery rebuilds a sealed segment's `.qidx`
+that is missing or does not load (`bondy_log_recovery`), so a writer
+may carry on without it.
+
+Caller is responsible for choosing the path; typically:
+`filename:join(Dir, bondy_log_idx:filename(SegId))`.
+""".
+-spec write_file(file:filename_all(), entries()) -> ok | {error, term()}.
+
+write_file(Path, Entries) when is_list(Entries) ->
+    Header = encode_header(length(Entries)),
+    Body = encode_entries(Entries),
+    try
+        bondy_log_io:write_atomic(Path, [Header | Body])
+    catch
+        error:{dir_fsync_failed, _, _} = Reason -> {error, Reason}
+    end.
+
+-doc """
+Reads and parses a `.qidx` file at `Path`.
+
+Returns `{ok, Entries}` where `Entries` is in key-ascending order
+(each `{FirstKey, LastKey, Offset}`), or `{error, Reason}` for:
+
+- `enoent` — file missing.
+- `truncated_header` — file shorter than 16 bytes.
+- `bad_magic` — header magic is not `BDIX`.
+- `unsupported_version` — header version is neither v1 nor v2.
+- `truncated_entries` — `EntryCount` declares more bytes than the file
+  contains.
+- `trailing_bytes` — file contains bytes past the declared entry count.
+
+A file with `EntryCount = 0` is valid and returns `{ok, []}`.
+
+v1 files are read transparently: each 16-byte v1 entry `(Key, Offset)`
+is lifted to the v2 shape `(Key, Key, Offset)` so callers always see a
+single representation. The seek semantics on a lifted v1 file reduce
+to the original v1 behaviour (single-point ranges).
+""".
+-spec read_file(file:filename_all()) ->
+    {ok, entries()} | {error, term()}.
+
+read_file(Path) ->
+    case prim_file:read_file(Path) of
+        {ok, Bin} ->
+            decode_file(Bin);
+        {error, _} = E ->
+            E
+    end.
+
+%% =============================================================================
+%% READER HANDLE
+%% =============================================================================
+
+-doc """
+Opens a `.qidx` file and returns a seek-ready handle.
+
+Equivalent to `read_file/1` followed by `from_entries/1`, but combined
+so callers don't have to handle two error sites.
+
+Returns `{ok, t()}` or `{error, Reason}` with the same error space as
+`read_file/1`.
+""".
+-spec open(file:filename_all()) -> {ok, t()} | {error, term()}.
+
+open(Path) ->
+    case read_file(Path) of
+        {ok, Entries} ->
+            {ok, from_entries(Entries)};
+        {error, _} = E ->
+            E
+    end.
+
+-doc """
+Builds a seek-ready handle directly from an in-memory entry list.
+
+Used for the head segment whose `.qidx` is not yet on disk while the
+writer is alive: the writer hands the reader its current accumulator
+entries via `bondy_log_wal:reader_view/1`, and the reader wraps them
+with this function to seek without a file round-trip.
+
+`Entries` are in append order, as the accumulator's `entries/1` emits
+them; the seek is exact when that is also key order (see the moduledoc). An empty list is valid; the resulting handle returns
+`none` for every `seek/2`.
+""".
+-spec from_entries(entries()) -> t().
+
+from_entries(Entries) when is_list(Entries) ->
+    #idx{entries = list_to_tuple(Entries)}.
+
+-doc """
+Returns the byte offset of the indexed batch frame the reader should
+start at to find `TargetKey`. `none` if every entry's range is strictly
+> `TargetKey` (or the handle is empty).
+
+Search rules:
+
+1. If some entry's range contains `TargetKey`
+   (`FirstKey =< TargetKey =< LastKey`), return that entry's offset —
+   the target is inside the indexed batch.
+2. Otherwise, return the offset of the largest entry whose `LastKey`
+   is `=< TargetKey` — the v1-style fallback. The reader scans
+   forward from there into the un-indexed gap.
+
+Binary search over the entry tuple; O(log N) time, no allocations.
+The search reads the entries as sorted ascending by `FirstKey` and by
+`LastKey`, which holds when the adapter's keys are globally monotonic
+in append order (moduledoc); otherwise the result is a lower bound.
+
+The returned offset is **a frame boundary** — the first byte of a
+frame header inside the indexed segment.
+""".
+-spec seek(t(), key()) -> {ok, offset()} | none.
+
+seek(#idx{entries = E}, TargetKey) when
+    is_integer(TargetKey), TargetKey >= 0
+->
+    N = tuple_size(E),
+    case N of
+        0 ->
+            none;
+        _ ->
+            {FirstKey1, _, _} = element(1, E),
+            case FirstKey1 > TargetKey of
+                true -> none;
+                false -> bsearch(E, TargetKey, 1, N, undefined)
+            end
+    end.
+
+-doc "Returns the entries embedded in a handle, in key-ascending order.".
+-spec handle_entries(t()) -> entries().
+
+handle_entries(#idx{entries = E}) ->
+    tuple_to_list(E).
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+encode_header(EntryCount) when
+    is_integer(EntryCount), EntryCount >= 0, EntryCount =< 16#FFFFFFFF
+->
+    <<?MAGIC:32/big-unsigned, ?VERSION_CURRENT:8/unsigned, 0:24/big-unsigned,
+        EntryCount:32/big-unsigned, 0:32/big-unsigned>>.
+
+%% @private
+%% v2-only encode. v1 files exist on-disk from prior writers; the
+%% reader handles them via the decode path, but writers never produce
+%% v1 again.
+encode_entries(Entries) ->
+    [
+        <<F:64/big-unsigned, L:64/big-unsigned, O:64/big-unsigned>>
+     || {F, L, O} <- Entries
+    ].
+
+%% @private
+decode_file(Bin) when is_binary(Bin), byte_size(Bin) < ?HEADER_BYTES ->
+    {error, truncated_header};
+decode_file(
+    <<?MAGIC:32/big-unsigned, Version:8/unsigned, _Flags:24/big-unsigned,
+        EntryCount:32/big-unsigned, _Reserved:32/big-unsigned,
+        EntriesBin/binary>>
+) ->
+    case Version of
+        ?VERSION_V1 ->
+            decode_entries_bin(?ENTRY_BYTES_V1, EntriesBin, EntryCount);
+        ?VERSION_V2 ->
+            decode_entries_bin(?ENTRY_BYTES_V2, EntriesBin, EntryCount);
+        _ ->
+            {error, unsupported_version}
+    end;
+decode_file(<<Magic:32/big-unsigned, _/binary>>) when Magic =/= ?MAGIC ->
+    {error, bad_magic}.
+
+%% @private
+decode_entries_bin(EntryBytes, Bin, EntryCount) ->
+    Expected = EntryCount * EntryBytes,
+    Have = byte_size(Bin),
+    if
+        Have < Expected -> {error, truncated_entries};
+        Have > Expected -> {error, trailing_bytes};
+        true -> {ok, decode_entries_loop(EntryBytes, Bin, [])}
+    end.
+
+%% @private
+decode_entries_loop(_EntryBytes, <<>>, Acc) ->
+    lists:reverse(Acc);
+decode_entries_loop(
+    ?ENTRY_BYTES_V1,
+    <<H:64/big-unsigned, O:64/big-unsigned, Rest/binary>>,
+    Acc
+) ->
+    %% v1 fallback: lift the single key to a degenerate single-point
+    %% range so callers see a uniform 3-tuple shape.
+    decode_entries_loop(?ENTRY_BYTES_V1, Rest, [{H, H, O} | Acc]);
+decode_entries_loop(
+    ?ENTRY_BYTES_V2,
+    <<F:64/big-unsigned, L:64/big-unsigned, O:64/big-unsigned, Rest/binary>>,
+    Acc
+) ->
+    decode_entries_loop(?ENTRY_BYTES_V2, Rest, [{F, L, O} | Acc]).
+
+%% @private
+%% Binary search for the entry whose range contains `T`, falling back
+%% to the largest entry whose `LastKey =< T`. Reads the entries as
+%% sorted ascending by `FirstKey` and `LastKey`, which holds iff the
+%% adapter's keys follow append order (moduledoc). Walking towards higher indices while
+%% `LastKey =< T` tracks the fallback "best so far"; a hit on an
+%% entry's range short-circuits with that entry's offset.
+bsearch(_E, _T, Lo, Hi, Best) when Lo > Hi ->
+    case Best of
+        undefined -> none;
+        _ -> {ok, Best}
+    end;
+bsearch(E, T, Lo, Hi, Best) ->
+    Mid = (Lo + Hi) div 2,
+    {F, L, O} = element(Mid, E),
+    if
+        T < F ->
+            bsearch(E, T, Lo, Mid - 1, Best);
+        T =< L ->
+            {ok, O};
+        true ->
+            bsearch(E, T, Mid + 1, Hi, O)
+    end.

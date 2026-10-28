@@ -1,0 +1,175 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_oplog_cache_ets).
+
+-moduledoc #{format => "text/markdown"}.
+-moduledoc """
+Reference `bondy_oplog_cache_adapter` implementation backed by a single
+`public set` ETS table per `(NS, Index, Shard)` triple.
+
+This adapter is bundled with the substrate primarily as a **contract
+validator**: the PropEr suite for `bondy_oplog_core` runs against this
+implementation and any consumer-supplied adapter, and both must produce
+identical results.
+
+It is also suitable for production use when a simple unbounded-by-default
+in-RAM cache is acceptable. Two opts gate memory growth:
+
+- `max_entries` (default `infinity`) — evict the first row on overflow.
+  Eviction order is unspecified (ETS `first/1`); good adapters use LRU /
+  LFU / TTL instead.
+- `read_concurrency` (default `true`) — passed to `ets:new/2`.
+- `write_concurrency` (default `true`) — passed to `ets:new/2`. Set
+  `false` only when single-writer semantics are guaranteed; concurrent
+  `write_through/4` callers and the applier touch the cache, so the
+  default is required to avoid cache-line contention starving readers.
+
+For LRU/LFU/TTL/ARC semantics, supply a richer adapter.
+
+## Handle shape
+
+The adapter's handle is the ETS tid. The table reserves one row,
+`{'$meta', MaxEntries, Generation}`; `delete/3` and `invalidate_all/1`
+advance `Generation` before they remove rows, and a ticket is the
+`Generation` it was taken at. All callbacks are wait-free except
+`invalidate_all/1`, which scans the table.
+""".
+
+-behaviour(bondy_oplog_cache_adapter).
+
+-export([
+    init/4,
+    close/1,
+    get/3,
+    ticket/1,
+    fill/5,
+    delete/3,
+    invalidate_all/1,
+    info/1
+]).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-spec init(
+    Namespace :: atom(),
+    Index :: atom(),
+    Shard :: non_neg_integer(),
+    Opts :: map()
+) -> {ok, ets:tid()}.
+
+init(_NS, _Index, _Shard, Opts) ->
+    ReadConc = maps:get(read_concurrency, Opts, true),
+    WriteConc = maps:get(write_concurrency, Opts, true),
+    Tab = ets:new(?MODULE, [
+        set,
+        public,
+        {read_concurrency, ReadConc},
+        {write_concurrency, WriteConc},
+        {decentralized_counters, true}
+    ]),
+    true = ets:insert(Tab, {'$meta', max_entries(Opts), 0}),
+    {ok, Tab}.
+
+-spec close(ets:tid()) -> ok.
+
+close(Tab) ->
+    true = ets:delete(Tab),
+    ok.
+
+-spec get(ets:tid(), Bucket :: term(), Key :: term()) ->
+    {ok, {Value :: term(), Hlc :: bondy_connect_hlc:hlc()}} | not_found.
+
+get(Tab, Bucket, Key) ->
+    case ets:lookup(Tab, {Bucket, Key}) of
+        [] -> not_found;
+        [{_, Value, Hlc}] -> {ok, {Value, Hlc}}
+    end.
+
+-spec ticket(ets:tid()) -> non_neg_integer().
+
+ticket(Tab) ->
+    ets:lookup_element(Tab, '$meta', 3).
+
+-spec fill(
+    ets:tid(),
+    Bucket :: term(),
+    Key :: term(),
+    {Value :: term(), Hlc :: bondy_connect_hlc:hlc()},
+    Ticket :: non_neg_integer()
+) -> ok.
+
+fill(Tab, Bucket, Key, {Value, Hlc}, Ticket) ->
+    Row = {{Bucket, Key}, Value, Hlc},
+    true = ets:insert(Tab, Row),
+    case ticket(Tab) of
+        Ticket ->
+            maybe_evict(Tab);
+        _ ->
+            true = ets:delete_object(Tab, Row),
+            ok
+    end.
+
+-spec delete(ets:tid(), Bucket :: term(), Key :: term()) -> ok.
+
+delete(Tab, Bucket, Key) ->
+    _ = ets:update_counter(Tab, '$meta', {3, 1}),
+    true = ets:delete(Tab, {Bucket, Key}),
+    ok.
+
+-spec invalidate_all(ets:tid()) -> ok.
+
+invalidate_all(Tab) ->
+    _ = ets:update_counter(Tab, '$meta', {3, 1}),
+    _ = ets:select_delete(Tab, [{{{'_', '_'}, '_', '_'}, [], [true]}]),
+    ok.
+
+-spec info(ets:tid()) -> #{atom() => term()}.
+
+info(Tab) ->
+    #{
+        size => ets:info(Tab, size) - 1,
+        memory => ets:info(Tab, memory),
+        max_entries => ets:lookup_element(Tab, '$meta', 2)
+    }.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+max_entries(#{max_entries := N}) when is_integer(N), N > 0 ->
+    N;
+max_entries(_) ->
+    infinity.
+
+maybe_evict(Tab) ->
+    case ets:lookup_element(Tab, '$meta', 2) of
+        infinity -> ok;
+        N -> evict_until(Tab, N)
+    end.
+
+evict_until(Tab, N) ->
+    case ets:info(Tab, size) of
+        Size when Size =< N + 1 ->
+            ok;
+        _ ->
+            case ets:first(Tab) of
+                '$end_of_table' ->
+                    ok;
+                '$meta' ->
+                    case ets:next(Tab, '$meta') of
+                        '$end_of_table' ->
+                            ok;
+                        Next ->
+                            true = ets:delete(Tab, Next),
+                            evict_until(Tab, N)
+                    end;
+                Key ->
+                    true = ets:delete(Tab, Key),
+                    evict_until(Tab, N)
+            end
+    end.

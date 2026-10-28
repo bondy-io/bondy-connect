@@ -1,0 +1,492 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+%%
+%% Unit tests for the durable-DB topology manifest: the on-disk freeze
+%% of the keying configuration and the boot-time reconciliation that protects
+%% an existing data dir from a silently-changed (re-key-on-change) topology.
+%%
+%% Pure file/term logic — no bondy_db stack, no Partisan, no disterl. Each test
+%% gets its own temp data dir.
+%% =============================================================================
+
+-module(bondy_db_manifest_test).
+
+-include_lib("eunit/include/eunit.hrl").
+
+%% A representative configured frozen topology (the catalogue assembles the
+%% real one). Omits hash_algo / key_encoding_version on purpose — those are
+%% stamped by the module itself.
+configured() ->
+    #{
+        db => main,
+        topology_module => bondy_db_topology_shared_shards,
+        partition_strategy => aggregate,
+        shard_count => 16,
+        realm_prefix_depth => 1,
+        tables => #{
+            security_users => #{aggregate_root => identity},
+            security_user_grants => #{aggregate_root => leading_col},
+            bondy_realm => #{aggregate_root => identity}
+        }
+    }.
+
+%% =============================================================================
+%% Fixtures
+%% =============================================================================
+
+manifest_test_() ->
+    {foreach, fun setup/0, fun cleanup/1, [
+        fun genesis_writes_and_freezes/1,
+        fun match_on_identical_config/1,
+        fun stamps_substrate_invariants/1,
+        fun warn_mismatch_returns_on_disk_effective/1,
+        fun stop_mismatch_errors/1,
+        fun corrupt_manifest_is_rejected/1,
+        fun checksum_tamper_is_rejected/1,
+        fun read_absent_is_not_found/1,
+        fun diff_identical/1,
+        fun diff_scalar_change/1,
+        fun diff_table_attr_change/1,
+        fun diff_table_added_removed/1,
+        fun hash_probe_skipped_when_absent_on_disk/1,
+        fun hash_probe_divergence_detected/1,
+        fun write_is_durable_before_it_is_visible/1,
+        fun failed_sync_keeps_the_prior_manifest/1,
+        fun failed_dir_sync_reports_a_visible_manifest/1,
+        fun reconcile_refuses_an_unsyncable_directory/1
+    ]}.
+
+setup() ->
+    Dir = filename:join(
+        [
+            "/tmp/" ++ os:getpid(),
+            "bondy_db_manifest_test",
+            integer_to_list(erlang:unique_integer([positive]))
+        ]
+    ),
+    ok = filelib:ensure_path(Dir),
+    Dir.
+
+cleanup(Dir) ->
+    _ = file_delete_recursive(Dir),
+    ok.
+
+%% =============================================================================
+%% Tests
+%% =============================================================================
+
+%% `write/2` produces a `file:consult/1` file, which `read/1` decodes as
+%% UTF-8. The frozen map's `db`, `topology_module` and `partition_strategy`
+%% are caller-supplied atoms, and a table name is any atom, so a non-ASCII
+%% character can reach the rendering; a byte-per-character conversion of that
+%% rendering (`iolist_to_binary/1`) writes bytes that are not valid UTF-8 and
+%% `read/1` fails with `{unreadable_manifest, {_, file_io_server,
+%% invalid_unicode}}`. Through the real write/read pair, byte-for-byte.
+write_read_survives_non_ascii_atoms_test_() ->
+    Cases = [
+        {"latin-1 db name", #{db => 'café'}},
+        {"wide db name", #{db => '日本'}},
+        {"latin-1 partition strategy", #{partition_strategy => 'agrégat'}},
+        {"latin-1 table name", #{
+            tables => #{'usuários' => #{aggregate_root => identity}}
+        }}
+    ],
+    [
+        {Label, fun() ->
+            Dir = setup(),
+            try
+                Manifest = bondy_db_manifest:build(
+                    maps:merge(configured(), Override)
+                ),
+                ?assertEqual(ok, bondy_db_manifest:write(Dir, Manifest)),
+                ?assertEqual({ok, Manifest}, bondy_db_manifest:read(Dir))
+            after
+                cleanup(Dir)
+            end
+        end}
+     || {Label, Override} <- Cases
+    ].
+
+%% The order a power loss after `write/2` depends on: bytes synced, then the
+%% rename, then the directory synced. Checks only the calls on the seams.
+write_is_durable_before_it_is_visible(Dir) ->
+    fun() ->
+        Manifest = bondy_db_manifest:build(configured()),
+        Path = bondy_db_manifest:path(Dir),
+        Calls = with_io_fault_lock(fun() ->
+            ok = bondy_db_manifest:write(Dir, Manifest),
+            [
+                {F, A}
+             || {_, {bondy_mst_io, F, A}, _} <- meck:history(bondy_mst_io)
+            ]
+        end),
+        ?assertMatch(
+            [{datasync, [_]}, {rename, [_, Path]}, {fsync_dir, [Dir]}],
+            [
+                C
+             || {F, _} = C <- Calls,
+                lists:member(F, [datasync, rename, fsync_dir])
+            ]
+        ),
+        ?assertEqual({ok, Manifest}, bondy_db_manifest:read(Dir))
+    end.
+
+failed_sync_keeps_the_prior_manifest(Dir) ->
+    fun() ->
+        Old = bondy_db_manifest:build(configured()),
+        ok = bondy_db_manifest:write(Dir, Old),
+        New = bondy_db_manifest:build((configured())#{shard_count => 32}),
+        Result = with_io_fault_lock(fun() ->
+            ok = meck:expect(bondy_mst_io, datasync, fun(_) -> {error, eio} end),
+            bondy_db_manifest:write(Dir, New)
+        end),
+        ?assertEqual({error, eio}, Result),
+        ?assertEqual({ok, Old}, bondy_db_manifest:read(Dir)),
+        ?assertEqual([], filelib:wildcard(filename:join(Dir, "*.tmp")))
+    end.
+
+%% The directory fsync comes after the rename, so its failure is reported while
+%% the new manifest is already the one on disk.
+failed_dir_sync_reports_a_visible_manifest(Dir) ->
+    fun() ->
+        Old = bondy_db_manifest:build(configured()),
+        ok = bondy_db_manifest:write(Dir, Old),
+        New = bondy_db_manifest:build((configured())#{shard_count => 32}),
+        Result = with_io_fault_lock(fun() ->
+            ok = meck:expect(bondy_mst_io, fsync_dir, fun(_) -> {error, eio} end),
+            bondy_db_manifest:write(Dir, New)
+        end),
+        ?assertEqual({error, {dir_fsync_failed, Dir, eio}}, Result),
+        ?assertEqual({ok, New}, bondy_db_manifest:read(Dir)),
+        ?assertEqual([], filelib:wildcard(filename:join(Dir, "*.tmp")))
+    end.
+
+%% The node keys its data by the manifest it reads, so an existing manifest
+%% is read only once its directory has been synced.
+reconcile_refuses_an_unsyncable_directory(Dir) ->
+    fun() ->
+        ok = bondy_db_manifest:write(
+            Dir, bondy_db_manifest:build(configured())
+        ),
+        Result = with_io_fault_lock(fun() ->
+            ok = meck:expect(bondy_mst_io, fsync_dir, fun(_) -> {error, eio} end),
+            bondy_db_manifest:reconcile(Dir, configured(), warn)
+        end),
+        ?assertMatch({error, {dir_fsync_failed, _, eio}}, Result)
+    end.
+
+genesis_writes_and_freezes(Dir) ->
+    fun() ->
+        Cfg = configured(),
+        ?assertEqual({error, not_found}, bondy_db_manifest:read(Dir)),
+        Res = bondy_db_manifest:reconcile(Dir, Cfg, warn),
+        ?assertMatch({ok, genesis, _}, Res),
+        {ok, genesis, Effective} = Res,
+        %% The effective topology is the configured one (+ stamped invariants).
+        ?assertEqual(aggregate, maps:get(partition_strategy, Effective)),
+        ?assert(filelib:is_regular(bondy_db_manifest:path(Dir))),
+        ?assertMatch({ok, #{frozen := _}}, bondy_db_manifest:read(Dir))
+    end.
+
+match_on_identical_config(Dir) ->
+    fun() ->
+        Cfg = configured(),
+        {ok, genesis, _} = bondy_db_manifest:reconcile(Dir, Cfg, warn),
+        %% Re-reconciling with the same config (warn or stop) matches.
+        ?assertMatch(
+            {ok, match, _}, bondy_db_manifest:reconcile(Dir, Cfg, warn)
+        ),
+        ?assertMatch(
+            {ok, match, _}, bondy_db_manifest:reconcile(Dir, Cfg, stop)
+        )
+    end.
+
+stamps_substrate_invariants(Dir) ->
+    fun() ->
+        {ok, genesis, _} = bondy_db_manifest:reconcile(Dir, configured(), warn),
+        {ok, #{frozen := Frozen}} = bondy_db_manifest:read(Dir),
+        %% hash_algo, key_encoding_version, and instances_strategy are added by
+        %% the module even though the caller never supplied them.
+        ?assert(maps:is_key(hash_algo, Frozen)),
+        ?assert(maps:is_key(key_encoding_version, Frozen)),
+        ?assertEqual(phash2, maps:get(hash_algo, Frozen)),
+        %% instances_strategy is derived from the topology module
+        %% (shared_shards ⇒ per_shard, the one-log-per-shard collapse).
+        ?assertEqual(per_shard, maps:get(instances_strategy, Frozen)),
+        %% hash_probe records what phash2 actually computes over a fixed
+        %% sentinel, so an OTP change to phash2 shows up as a divergence.
+        ?assertEqual(
+            erlang:phash2({bondy_db_hash_probe, 42}, 1 bsl 27),
+            maps:get(hash_probe, Frozen)
+        )
+    end.
+
+warn_mismatch_returns_on_disk_effective(Dir) ->
+    fun() ->
+        %% Genesis with shard_count = 16.
+        {ok, genesis, _} = bondy_db_manifest:reconcile(Dir, configured(), warn),
+        %% Boot with a DIFFERENT shard_count and a changed per-table key.
+        Changed = (configured())#{
+            shard_count => 32,
+            tables => maps:put(
+                bondy_realm,
+                #{aggregate_root => leading_col},
+                maps:get(tables, configured())
+            )
+        },
+        Res = bondy_db_manifest:reconcile(Dir, Changed, warn),
+        ?assertMatch({ok, {mismatch, _}, _}, Res),
+        {ok, {mismatch, Divs}, Effective} = Res,
+        %% Effective is the ON-DISK topology (16), not the new config (32).
+        ?assertEqual(16, maps:get(shard_count, Effective)),
+        Keys = [K || {K, _, _} <- Divs],
+        ?assert(lists:member(shard_count, Keys)),
+        ?assert(lists:member({table, bondy_realm, aggregate_root}, Keys)),
+        %% The manifest on disk is unchanged (still the genesis one).
+        {ok, #{frozen := Frozen}} = bondy_db_manifest:read(Dir),
+        ?assertEqual(16, maps:get(shard_count, Frozen))
+    end.
+
+stop_mismatch_errors(Dir) ->
+    fun() ->
+        {ok, genesis, _} = bondy_db_manifest:reconcile(Dir, configured(), warn),
+        Changed = (configured())#{partition_strategy => entity},
+        ?assertEqual(
+            {error, topology_mismatch},
+            bondy_db_manifest:reconcile(Dir, Changed, stop)
+        )
+    end.
+
+corrupt_manifest_is_rejected(Dir) ->
+    fun() ->
+        ok = file:write_file(
+            bondy_db_manifest:path(Dir), <<"not an erlang term">>
+        ),
+        ?assertMatch({error, _}, bondy_db_manifest:read(Dir)),
+        %% reconcile surfaces the read error (does not silently genesis-write).
+        ?assertMatch(
+            {error, _}, bondy_db_manifest:reconcile(Dir, configured(), warn)
+        )
+    end.
+
+checksum_tamper_is_rejected(Dir) ->
+    fun() ->
+        {ok, genesis, _} = bondy_db_manifest:reconcile(Dir, configured(), warn),
+        {ok, Manifest} = bondy_db_manifest:read(Dir),
+        %% Tamper the frozen map WITHOUT updating the checksum.
+        Tampered = Manifest#{
+            frozen := maps:put(shard_count, 999, maps:get(frozen, Manifest))
+        },
+        ok = file:write_file(
+            bondy_db_manifest:path(Dir),
+            io_lib:format("~p.~n", [Tampered])
+        ),
+        ?assertMatch(
+            {error, {corrupt_manifest, {checksum, _, _}}},
+            bondy_db_manifest:read(Dir)
+        )
+    end.
+
+read_absent_is_not_found(Dir) ->
+    fun() ->
+        ?assertEqual({error, not_found}, bondy_db_manifest:read(Dir))
+    end.
+
+%% =============================================================================
+%% diff/2
+%%
+%% `diff/2` finalizes only its first (configured) arg; the second is the
+%% on-disk frozen, which already carries the stamped substrate invariants. So
+%% the baseline is taken from a real written + read-back manifest, exactly as
+%% reconcile/3 does it.
+%% =============================================================================
+
+diff_identical(Dir) ->
+    fun() ->
+        OnDisk = baseline(Dir),
+        ?assertEqual([], bondy_db_manifest:diff(configured(), OnDisk))
+    end.
+
+diff_scalar_change(Dir) ->
+    fun() ->
+        OnDisk = baseline(Dir),
+        Changed = (configured())#{shard_count => 8},
+        ?assertEqual(
+            [{shard_count, 8, 16}], bondy_db_manifest:diff(Changed, OnDisk)
+        )
+    end.
+
+diff_table_attr_change(Dir) ->
+    fun() ->
+        OnDisk = baseline(Dir),
+        Changed = (configured())#{
+            tables => maps:put(
+                security_users,
+                #{aggregate_root => leading_col},
+                maps:get(tables, configured())
+            )
+        },
+        ?assertEqual(
+            [{{table, security_users, aggregate_root}, leading_col, identity}],
+            bondy_db_manifest:diff(Changed, OnDisk)
+        )
+    end.
+
+diff_table_added_removed(Dir) ->
+    fun() ->
+        OnDisk = baseline(Dir),
+        Changed = (configured())#{
+            tables => maps:remove(bondy_realm, maps:get(tables, configured()))
+        },
+        ?assertMatch(
+            [{{table, bondy_realm}, '$absent', _}],
+            bondy_db_manifest:diff(Changed, OnDisk)
+        )
+    end.
+
+hash_probe_skipped_when_absent_on_disk(Dir) ->
+    fun() ->
+        %% A manifest written before the probe existed has no baseline to
+        %% compare against — it must reconcile as a match, not a mismatch.
+        OnDisk = maps:remove(hash_probe, baseline(Dir)),
+        ?assertEqual([], bondy_db_manifest:diff(configured(), OnDisk))
+    end.
+
+hash_probe_divergence_detected(Dir) ->
+    fun() ->
+        %% Simulate a phash2 behaviour change: the on-disk manifest recorded a
+        %% different probe value than the running VM computes.
+        OnDisk0 = baseline(Dir),
+        Recorded = maps:get(hash_probe, OnDisk0),
+        OnDisk = OnDisk0#{hash_probe => Recorded + 1},
+        ?assertEqual(
+            [{hash_probe, Recorded, Recorded + 1}],
+            bondy_db_manifest:diff(configured(), OnDisk)
+        )
+    end.
+
+%% =============================================================================
+%% Helpers
+%% =============================================================================
+
+%% Genesis-write the baseline config and read back its (finalized) frozen map.
+baseline(Dir) ->
+    {ok, genesis, _} = bondy_db_manifest:reconcile(Dir, configured(), warn),
+    {ok, #{frozen := Frozen}} = bondy_db_manifest:read(Dir),
+    Frozen.
+
+file_delete_recursive(Path) ->
+    case filelib:is_dir(Path) of
+        true ->
+            {ok, Names} = file:list_dir(Path),
+            _ = [file_delete_recursive(filename:join(Path, N)) || N <- Names],
+            file:del_dir(Path);
+        false ->
+            file:delete(Path)
+    end.
+
+%% =============================================================================
+%% Manifest extension (additive table evolution)
+%% =============================================================================
+
+extension_test_() ->
+    {foreach, fun setup/0, fun cleanup/1, [
+        fun diff_manifest_extension_is_adopted/1,
+        fun diff_extension_mixed_with_divergence_is_not/1,
+        fun table_removal_is_never_adopted/1
+    ]}.
+
+diff_manifest_extension_is_adopted(Dir) ->
+    fun() ->
+        {ok, genesis, _} = bondy_db_manifest:reconcile(Dir, configured(), warn),
+        %% A release adds a table; nothing else changes. The addition moves no
+        %% existing bytes, so it must be ADOPTED: manifest rewritten, new
+        %% config effective, and — decisively — the next boot is a `match`,
+        %% not a mismatch warning forever.
+        Extended = (configured())#{
+            tables => maps:put(
+                bondy_interface,
+                #{aggregate_root => identity},
+                maps:get(tables, configured())
+            )
+        },
+        Res = bondy_db_manifest:reconcile(Dir, Extended, warn),
+        ?assertMatch({ok, {extended, [bondy_interface]}, _}, Res),
+        {ok, _, Effective} = Res,
+        ?assert(maps:is_key(bondy_interface, maps:get(tables, Effective))),
+        %% The manifest on disk now freezes the added table...
+        {ok, #{frozen := Frozen}} = bondy_db_manifest:read(Dir),
+        ?assert(maps:is_key(bondy_interface, maps:get(tables, Frozen))),
+        %% ...so the same boot tomorrow is a match, under both policies.
+        ?assertMatch(
+            {ok, match, _}, bondy_db_manifest:reconcile(Dir, Extended, warn)
+        ),
+        ?assertMatch(
+            {ok, match, _}, bondy_db_manifest:reconcile(Dir, Extended, stop)
+        ),
+        %% And the fingerprint now equals a fresh node's genesis fingerprint
+        %% for the same config — the property the adoption exists for: two
+        %% nodes that key data identically must be able to AAE-sync.
+        ?assertEqual(
+            bondy_db_manifest:fingerprint(Extended),
+            bondy_db_manifest:fingerprint(Frozen)
+        )
+    end.
+
+diff_extension_mixed_with_divergence_is_not(Dir) ->
+    fun() ->
+        {ok, genesis, _} = bondy_db_manifest:reconcile(Dir, configured(), warn),
+        %% An added table riding along with a REAL divergence (a changed
+        %% shard_count) must not be adopted: the whole set falls through to
+        %% the mismatch policy and the manifest stays untouched.
+        Changed = (configured())#{
+            shard_count => 32,
+            tables => maps:put(
+                bondy_interface,
+                #{aggregate_root => identity},
+                maps:get(tables, configured())
+            )
+        },
+        ?assertMatch(
+            {ok, {mismatch, _}, _},
+            bondy_db_manifest:reconcile(Dir, Changed, warn)
+        ),
+        {ok, #{frozen := Frozen}} = bondy_db_manifest:read(Dir),
+        ?assertNot(maps:is_key(bondy_interface, maps:get(tables, Frozen))),
+        ?assertEqual(16, maps:get(shard_count, Frozen))
+    end.
+
+table_removal_is_never_adopted(Dir) ->
+    fun() ->
+        {ok, genesis, _} = bondy_db_manifest:reconcile(Dir, configured(), warn),
+        %% A table on disk and absent from config is a DOWNGRADE, not an
+        %% extension: the on-disk data must stay frozen (dormant), so this is
+        %% a mismatch, and the manifest keeps the table.
+        Removed = (configured())#{
+            tables => maps:remove(bondy_realm, maps:get(tables, configured()))
+        },
+        ?assertMatch(
+            {ok, {mismatch, [{{table, bondy_realm}, '$absent', _}]}, _},
+            bondy_db_manifest:reconcile(Dir, Removed, warn)
+        ),
+        {ok, #{frozen := Frozen}} = bondy_db_manifest:read(Dir),
+        ?assert(maps:is_key(bondy_realm, maps:get(tables, Frozen)))
+    end.
+
+%% The node-wide lock every suite that mocks `bondy_mst_io` takes.
+with_io_fault_lock(Body) ->
+    global:trans(
+        {{meck_vm_lock, bondy_mst_io}, self()},
+        fun() ->
+            ok = meck:new(bondy_mst_io, [passthrough]),
+            try
+                Body()
+            after
+                _ = meck:unload(bondy_mst_io)
+            end
+        end,
+        [node()],
+        infinity
+    ).

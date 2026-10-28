@@ -1,0 +1,1398 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_oplog_sync_session).
+
+-include_lib("kernel/include/logger.hrl").
+-include("bondy_oplog.hrl").
+
+-moduledoc #{format => "text/markdown"}.
+-moduledoc """
+A single anti-entropy sync session.
+
+Implements the **pull-direction** of the MST reconciliation protocol:
+the *initiator* (this side) repeatedly
+asks the *peer* for pages it is missing until its local copy of the
+peer's tree is complete. Two such sessions — A pulling from B *and* B
+pulling from A — converge both replicas to the same root.
+
+## Algorithm
+
+```
+1. PeerRoot ← transport:request(Peer, Instance, get_root)
+2. if PeerRoot == LocalRoot, done
+3. loop:
+     Missing ← instance:missing_set(Instance, PeerRoot)
+     if Missing is empty, break
+     Batch ← take(Missing, aae_pages_per_round)   %% BOUNDED per round
+     Pages ← transport:request(Peer, Instance, {get_pages, Batch})
+     if Pages unavailable:                        %% peer truncated+GC'd
+         PeerRoot ← get_root again; continue if it moved
+         %% (chase_refreshed_root/7); if it did NOT move, the peer's
+         %% applied-frontier VV decides: no deficit ⇒ end benign
+         %% (record nothing), deficit ⇒ {peer_pages_unavailable, _}
+     instance:merge_pages(Instance, Pages)
+     %% the round pulls only a bounded slice; the next missing_set picks
+     %% up the rest (and any deeper pages a merged page now references)
+4. record_sync_complete(Peer, Instance, PeerDurable)
+   %% PeerDurable = the durable frontier the peer reported before the round
+5. transport:request(Peer, Instance, {confirm_frontier, Self, OwnDurable})
+```
+
+Step 4 records the **peer's** durable frontier, which makes
+`bondy_oplog_instance:compute_frontier_for/2` a statement about what peers
+have folded and checkpointed. Step 5 hands the peer ours, since sync is
+pull-only and the peer would otherwise learn it only when it pulls from us.
+
+Each round pulls at most `bondy_oplog_config:aae_pages_per_round/0` pages, so a
+session's peak memory is bounded regardless of how divergent the trees are — a
+small divergence still converges in a round or two; a bulk initial sync simply
+takes more rounds rather than materialising the whole tree at once.
+
+## Trust domain
+
+A cluster is a **single atom trust domain**. Sync pages carry cell
+events as Erlang *terms* (`bondy_oplog_event`'s `op` is opaque to this
+layer) over `partisan_gen_server:call`, so the transport's message
+decode interns any atom a peer's cells carry on the reading node before
+any oplog code runs (measured: `bondy_aae_cluster_SUITE:
+runtime_atom_value_sync_measured`). This is deliberate and matches the
+posture of Erlang distribution itself: a node admitted to the cluster is
+trusted, and admission control belongs at the membership boundary, not
+per-message. Wire paths that cross the cluster boundary (e.g. the bridge
+relay) enforce their own atom admission on their own decode seats.
+
+## API shapes
+
+- `run/3` — synchronous; returns `{ok, FinalRoot}` or `{error, Reason}`.
+  Used by tests and consumers that want to await completion.
+- `start/3` — asynchronous spawn; the session reports completion via
+  `bondy_oplog_peer_state:record_sync_complete/3` and exits.
+  Used by the default sync scheduler.
+
+## Bounded iterations
+
+The round ceiling is **adaptive**: it scales with the initial missing-set size
+(bounded batches mean a bulk sync legitimately needs many rounds), and only
+backstops a non-converging loop. A peer that returns nothing for a non-empty
+request is caught immediately by the empty-pages guard. `max_iterations` may
+still be set explicitly in `opts()` to pin a fixed cap (tests, special cases);
+the default (`undefined`) selects the adaptive budget.
+
+## Adopting a peer's frontier
+
+A peer's applied frontier is captured before a round and read only to compare
+against; it is never merged into this replica's own. A frontier states what
+THIS replica folded, and a peer's maxima say nothing about which of its events
+reached us — a peer that compacted a prefix ships a tree whose history starts
+above our applied seq. A replica that ends up holding all of a compacted
+peer's data takes its frontier from the paths that also deliver that data: the
+catalogue bootstrap and, across a restart, the compaction checkpoint.
+
+The bootstrap is the one path that adopts: its rederive takes the frontier
+read before the stream as the applied frontier, only over an install that
+claimed everything (`bondy_oplog_applier:commit_stage/4`). Two conditions must both hold for
+that to be sound, and they are enforced in different places. The peer must
+ship everything it holds, which is why its responder refuses to serve until
+its own tables have registered: the snapshot producer enumerates the peer's
+OWN registry, so a partially registered peer under-ships while still answering
+`get_frontier` in full. And this replica must route everything it received.
+Neither condition subsumes the other —
+`MuxBucketSkip_Minus_ServeGate` and `MuxBucketSkip_Minus_AdoptIfComplete` in
+`proofs/quint/configs/MuxBucketSkip.configs.qnt` each violate `noOverClaim`.
+""".
+
+-type opts() :: #{
+    transport => module(),
+    transport_opts => map(),
+    max_iterations => pos_integer(),
+    record_in_peer_state => boolean()
+}.
+
+-export_type([opts/0]).
+
+-export([run/3]).
+-export([run/4]).
+-export([maybe_bump_ae_isolated/1]).
+-export([start/3]).
+-export([start/4]).
+-export([bootstrap_catalogue/3]).
+-export([start_bootstrap_catalogue/3]).
+
+-ifdef(TEST).
+%% Exposed so the classification and the level it selects can be unit tested
+%% against the exit shapes Partisan produces, without standing up a cluster.
+-export([is_peer_unreachable/1]).
+-export([log_failure/3]).
+-export([absorb_chunks/2]).
+-endif.
+
+%% Bounded-batch pull needs many rounds for a bulk sync, so the round ceiling
+%% scales with the initial missing set (`(missing / per_round) * SLACK + FLOOR`).
+%% SLACK covers deeper pages revealed while descending the tree; FLOOR keeps a
+%% small/quiescent sync from a degenerate ceiling. This is only a non-progress
+%% backstop — a stuck peer is caught immediately by the empty-pages guard.
+-define(AAE_ROUND_BUDGET_SLACK, 8).
+-define(AAE_ROUND_BUDGET_FLOOR, 64).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-doc """
+Synchronously runs a pull-direction sync session. Returns `{ok, Root}`
+on success, where `Root` is the local root hash after merging.
+""".
+-spec run(instance_id(), peer_id(), opts()) ->
+    {ok, bondy_mst:hash() | undefined} | {error, term()}.
+
+run(Instance, Peer, Opts) ->
+    run(Instance, Peer, Opts, default_max_iterations(Opts)).
+
+-spec run(instance_id(), peer_id(), opts(), non_neg_integer() | undefined) ->
+    {ok, bondy_mst:hash() | undefined} | {error, term()}.
+
+run(Instance, Peer, Opts, Iterations) when is_binary(Instance) ->
+    Transport = maps:get(
+        transport,
+        Opts,
+        bondy_oplog_transport_inline
+    ),
+    TransportOpts = maps:get(transport_opts, Opts, #{}),
+    Record = maps:get(record_in_peer_state, Opts, true),
+    Start = erlang:monotonic_time(),
+    %% Capture the peer's applied frontier BEFORE the round. It is read ONLY
+    %% to compare against (`maybe_unservable_behind/3`,
+    %% `maybe_frontier_gap/5`), never merged into ours; the module doc has
+    %% why. Best-effort (`#{}` on transport error).
+    {PeerFrontier, PeerDurable} = request_peer_frontiers(
+        Instance, Peer, Transport, TransportOpts
+    ),
+    %% `do_run/5` yields the peer root alongside the local one; only the local
+    %% root is part of this function's contract, so split them here.
+    {Result0, PeerRoot} =
+        case do_run(Instance, Peer, Transport, TransportOpts, Iterations) of
+            {ok, LocalRoot, PR} -> {{ok, LocalRoot}, PR};
+            {error, _} = Error -> {Error, undefined}
+        end,
+    Result1 = maybe_unservable_behind(Result0, Instance, PeerFrontier),
+    Result = maybe_frontier_gap(
+        Result1, Instance, Peer, PeerFrontier, PeerRoot
+    ),
+    maybe_record(Result, Instance, Peer, Record, PeerRoot, PeerDurable),
+    ok = maybe_report_frontier(
+        Result, Instance, Peer, Transport, TransportOpts, Record, PeerRoot
+    ),
+    Duration = erlang:monotonic_time() - Start,
+    Outcome =
+        case Result of
+            {ok, _} -> ok;
+            {error, _} -> error
+        end,
+    telemetry:execute(
+        [bondy_oplog, sync, Outcome],
+        #{duration => Duration},
+        #{instance_id => Instance, peer => Peer}
+    ),
+    Result.
+
+-doc """
+Spawns the session in a separate process and returns immediately.
+Completion is reported via `peer_state` and via telemetry. The spawned
+process exits normally on success and with an error reason on failure.
+""".
+-spec start(instance_id(), peer_id(), opts()) -> {ok, pid()}.
+
+start(Instance, Peer, Opts) ->
+    start(Instance, Peer, Opts, default_max_iterations(Opts)).
+
+-spec start(instance_id(), peer_id(), opts(), non_neg_integer() | undefined) ->
+    {ok, pid()}.
+
+start(Instance, Peer, Opts, Iterations) ->
+    Pid = spawn(fun() ->
+        case run(Instance, Peer, Opts, Iterations) of
+            {ok, _} ->
+                ok;
+            {error, Reason} ->
+                ok = log_failure(Instance, Peer, Reason),
+                exit({sync_failed, Reason})
+        end
+    end),
+    {ok, Pid}.
+
+%% @private
+%% A session against a peer this node cannot reach is an expected outcome in a
+%% cluster: the scheduler offers one session per instance per tick, so a
+%% single absent node would otherwise produce a warning per instance per tick
+%% for as long as it is away. Those go to debug and are counted through the
+%% `[bondy_oplog, sync, error]` telemetry event. Every other failure — a
+%% protocol error, a timeout, a wrong answer — stays a warning. The exit
+%% reason is unchanged either way; the scheduler reads it for backoff.
+log_failure(Instance, Peer, Reason) ->
+    case is_peer_unreachable(Reason) of
+        true ->
+            ?LOG_DEBUG(#{
+                description => "sync session skipped, peer unreachable",
+                instance => Instance,
+                peer => Peer,
+                reason => Reason
+            });
+        false ->
+            ?LOG_WARNING(#{
+                description => "sync session failed",
+                instance => Instance,
+                peer => Peer,
+                reason => Reason
+            })
+    end,
+    ok.
+
+-doc false.
+-spec is_peer_unreachable(term()) -> boolean().
+
+%% A `partisan_gen_server:call` to an absent node exits with `nodedown`; to a
+%% node that is up but whose responder has not started yet — a peer still
+%% booting — with `noproc`. Both mean "nothing to talk to", and both resolve on
+%% their own when the peer returns.
+is_peer_unreachable({partisan_call_failed, {{nodedown, _}, _}}) ->
+    true;
+is_peer_unreachable({partisan_call_failed, {nodedown, _}}) ->
+    true;
+is_peer_unreachable({partisan_call_failed, {noproc, _}}) ->
+    true;
+is_peer_unreachable(_) ->
+    false.
+
+-doc """
+Catalogue-mode bootstrap session. The peer streams its projection
+cells in chunks (`get_catalogue_snapshot_init` +
+`{get_catalogue_snapshot_next, Cursor}`); the initiator installs each
+batch into its own projection. After the stream ends, the lifecycle is
+marked `live` (for a fresh caller) and the regular pull-direction sync
+runs to catch up on any events newer than the peer's session-start
+watermark.
+
+If the peer reports `no_snapshot` (no process serves its projection, or its
+projection shard is not registered) the call falls through to plain `run/3`.
+
+`WasLive` is captured at session start so `finalize_catalogue_bootstrap`
+can decide whether to mark live (fresh) or skip the lifecycle update
+(recovering).
+""".
+-spec bootstrap_catalogue(instance_id(), peer_id(), opts()) ->
+    {ok, bondy_mst:hash() | undefined}
+    | {error, cursor_expired}
+    | {error, term()}.
+
+bootstrap_catalogue(Instance, Peer, Opts) when is_binary(Instance) ->
+    Transport = maps:get(
+        transport,
+        Opts,
+        bondy_oplog_transport_inline
+    ),
+    TransportOpts = maps:get(transport_opts, Opts, #{}),
+    WasLive = is_live(Instance),
+    Start = erlang:monotonic_time(),
+    Result = do_bootstrap_snapshot(
+        Instance, Peer, Opts, Transport, TransportOpts, WasLive
+    ),
+    Duration = erlang:monotonic_time() - Start,
+    Outcome =
+        case Result of
+            {ok, _} -> ok;
+            {error, _} -> error
+        end,
+    telemetry:execute(
+        [bondy_oplog, sync, catalogue_bootstrap, Outcome],
+        #{duration => Duration},
+        #{instance_id => Instance, peer => Peer, was_live => WasLive}
+    ),
+    Result.
+
+%% @private
+%% Catalogue-snapshot bootstrap: replace the local projection's cells with the
+%% peer's, adopt the peer's frontier read before the stream and re-fold the
+%% local MST events it does not claim, mark live (a `pre_bootstrap` caller) and hand the
+%% instance the peer's frontier read after it as the target that ends the
+%% re-fold mark, then run an anti-entropy round. The order and the mark are
+%% checked in `proofs/quint/specs/LiveRebootstrapRefold.qnt`; the adoption and
+%% the target in `proofs/quint/specs/JoinInstall.qnt` (`rederive`, `Session`).
+do_bootstrap_snapshot(Instance, Peer, Opts, Transport, TransportOpts, WasLive) ->
+    case
+        Transport:request(
+            Peer, Instance, get_catalogue_snapshot_init, TransportOpts
+        )
+    of
+        {ok, no_snapshot} ->
+            %% Peer has nothing to ship. Run the regular pull and let the
+            %% lifecycle stay where it was — the caller seeded the replica
+            %% as `live` (genesis) or expects a future bootstrap against a
+            %% non-empty peer.
+            run(Instance, Peer, Opts);
+        {ok, {init, {Watermark, Cursor, Buckets}}} ->
+            %% Captured at init, before streaming: a lower bound for what the
+            %% live scan ships, and best-effort (`#{}` on error) so the
+            %% oracle heals via the normal sync path rather than falsely
+            %% reporting converged. Adopted at the rederive, on the install's
+            %% `unclaimable` (`bondy_oplog_applier:commit_stage/4`).
+            PeerFrontier = request_peer_frontier(
+                Instance, Peer, Transport, TransportOpts
+            ),
+            case
+                bondy_oplog_instance:begin_install(
+                    Instance, Buckets, PeerFrontier
+                )
+            of
+                {ok, Token} ->
+                    install_snapshot(
+                        Instance,
+                        Peer,
+                        Opts,
+                        Transport,
+                        TransportOpts,
+                        WasLive,
+                        {Watermark, Cursor, PeerFrontier, Token}
+                    );
+                {error, _} = E ->
+                    _ = Transport:request(
+                        Peer,
+                        Instance,
+                        {release_catalogue_snapshot, Cursor},
+                        TransportOpts
+                    ),
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+%% @private
+%% A stream that fails drops what it staged; the mark stays until a later
+%% session settles, which the scheduler dispatches
+%% (`bondy_oplog_instance:owes_install/1`).
+install_snapshot(
+    Instance,
+    Peer,
+    Opts,
+    Transport,
+    TransportOpts,
+    WasLive,
+    {Watermark, Cursor, PeerFrontier, Token}
+) ->
+    case
+        pull_install_loop(
+            Instance, Peer, Transport, TransportOpts, Cursor, Token, #{}
+        )
+    of
+        ok ->
+            maybe
+                {ok, Counts} ?=
+                    bondy_oplog_instance:rederive_projection(Instance, Token),
+                finish_install(
+                    Instance,
+                    Peer,
+                    Opts,
+                    Transport,
+                    TransportOpts,
+                    WasLive,
+                    {Watermark, Counts}
+                )
+            end;
+        {error, _} = E ->
+            _ = bondy_oplog_instance:abort_install(Instance, Token),
+            E
+    end.
+
+%% @private
+finish_install(
+    Instance,
+    Peer,
+    Opts,
+    Transport,
+    TransportOpts,
+    WasLive,
+    {Watermark, Counts}
+) ->
+    #{
+        installed := Installed,
+        pruned := Pruned,
+        skipped := Skipped,
+        unclaimable := Unclaimable,
+        max_hlc := MaxInstalledHlc
+    } = Counts,
+    ok = report_unroutable(Unclaimable, Instance),
+    %% `MaxInstalledHlc` is absorbed into the local clock at finalize, BEFORE
+    %% the instance can be marked live: the session-start `Watermark` is only a
+    %% lower bound for what the live scan ships.
+    Finalized =
+        maybe
+            {ok, {Target, _}} ?=
+                fetch_peer_frontiers(Instance, Peer, Transport, TransportOpts),
+            ok ?=
+                bondy_oplog_instance:finalize_catalogue_bootstrap(
+                    Instance, Watermark, MaxInstalledHlc, WasLive
+                ),
+            bondy_oplog_instance:install_target(Instance, Target)
+        end,
+    telemetry:execute(
+        [bondy_oplog, sync, catalogue_bootstrap, complete],
+        #{
+            installed => Installed,
+            pruned => Pruned,
+            skipped => Skipped,
+            unclaimable => length(Unclaimable),
+            watermark => Watermark
+        },
+        #{
+            instance_id => Instance,
+            peer => Peer,
+            was_live => WasLive,
+            frontier_adopted => Unclaimable =:= [],
+            %% The names, next to the peer that shipped them: the alarm
+            %% carries only what is stable across cycles, so this is where
+            %% the two join.
+            unclaimable_buckets => Unclaimable
+        }
+    ),
+    finish_bootstrap(Finalized, Instance, Peer, Opts).
+
+%% @private
+%% Run anti-entropy (MST page union + diff-replay) for the events past the
+%% peer's session-start watermark. The rederive already ran, so a failed round
+%% loses nothing: what it would have pulled arrives on a later round
+%% (`bondy_oplog_bootstrap_rederive_test`, the trailing-round-failure case).
+finish_bootstrap(ok, Instance, Peer, Opts) ->
+    case run(Instance, Peer, Opts) of
+        {ok, _} = Ok ->
+            Ok;
+        {error, {root_unservable, _}} ->
+            %% The catalogue install + rederive already supplied the data
+            %% and the frontier; this trailing AE round only covers events
+            %% past the new watermark, which an UNSERVABLE peer cannot
+            %% serve by definition — it is exactly the peer this bootstrap
+            %% was escalated against. Failing the whole bootstrap here
+            %% would discard a successful recovery (and re-strike
+            %% forever); complete it and leave the residual tail to the
+            %% peer's rebuild.
+            {ok, bootstrapped_unservable_tail};
+        {error, _} = E ->
+            E
+    end;
+finish_bootstrap({error, _} = Error, _Instance, _Peer, _Opts) ->
+    Error.
+
+%% @private
+%% The peer's applied-frontier VV (`#{Origin => Seq}`), used to seed a fresh
+%% replica's frontier on catalogue bootstrap. The catalogue install writes the
+%% projection cells, but those cells carry only HLC + value — not the per-origin
+%% `{Origin, Seq}` the frontier needs — so the frontier cannot be derived from
+%% the install and must be adopted from the peer. Best-effort: `#{}` on any
+%% transport error, the convergence oracle then healing on the normal sync path.
+request_peer_frontier(Instance, Peer, Transport, TransportOpts) ->
+    element(
+        1, request_peer_frontiers(Instance, Peer, Transport, TransportOpts)
+    ).
+
+%% @private
+%% As `fetch_peer_frontiers/4`, best-effort: `{#{}, undefined}` on any error.
+request_peer_frontiers(Instance, Peer, Transport, TransportOpts) ->
+    case fetch_peer_frontiers(Instance, Peer, Transport, TransportOpts) of
+        {ok, Frontiers} -> Frontiers;
+        {error, _} -> {#{}, undefined}
+    end.
+
+%% @private
+%% The peer's applied frontier and its durable frontier
+%% (`bondy_oplog_instance:durable_frontier/1`), in the answer shapes
+%% `bondy_oplog_transport` allows. The durable one is `undefined` when unknown.
+fetch_peer_frontiers(Instance, Peer, Transport, TransportOpts) ->
+    case Transport:request(Peer, Instance, get_frontier, TransportOpts) of
+        {ok, Frontier, _Fp, Durable} when is_map(Frontier), is_map(Durable) ->
+            {ok, {Frontier, Durable}};
+        {ok, Frontier} when is_map(Frontier) ->
+            {ok, {Frontier, undefined}};
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @private
+pull_install_loop(
+    Instance,
+    Peer,
+    Transport,
+    TransportOpts,
+    Cursor,
+    Token,
+    Pending
+) ->
+    %% The rederive in `do_bootstrap_snapshot/6` restores the local events
+    %% the install replaces. `Pending` holds the parts of cells too large to
+    %% frame whole, keyed by `{Bucket, Key}`, until every part has arrived.
+    Req = {get_catalogue_snapshot_next, Cursor},
+    case Transport:request(Peer, Instance, Req, TransportOpts) of
+        {ok, {done, []}} when map_size(Pending) =:= 0 ->
+            ok;
+        {ok, {done, []}} ->
+            %% The stream ended mid-cell: an ok here would let the rederive
+            %% adopt the peer's frontier over a projection missing those
+            %% cells. The bootstrap retries from `get_catalogue_snapshot_init`.
+            {error, {incomplete_chunked_cells, maps:keys(Pending)}};
+        {ok, {batch, {NextCursor, Cells}}} ->
+            install_and_continue(
+                Instance,
+                Peer,
+                Transport,
+                TransportOpts,
+                NextCursor,
+                Token,
+                Cells,
+                Pending
+            );
+        {ok, {chunked_batch, {NextCursor, Cells, Chunks}}} ->
+            {Completed, Pending1} = absorb_chunks(Chunks, Pending),
+            install_and_continue(
+                Instance,
+                Peer,
+                Transport,
+                TransportOpts,
+                NextCursor,
+                Token,
+                Cells ++ Completed,
+                Pending1
+            );
+        {error, _} = E ->
+            E
+    end.
+
+%% @private
+install_and_continue(
+    Instance,
+    Peer,
+    Transport,
+    TransportOpts,
+    NextCursor,
+    Token,
+    Cells,
+    Pending
+) ->
+    case install_batch(Instance, Token, Cells) of
+        ok ->
+            pull_install_loop(
+                Instance,
+                Peer,
+                Transport,
+                TransportOpts,
+                NextCursor,
+                Token,
+                Pending
+            );
+        {error, _} = E ->
+            E
+    end.
+
+%% @private
+%% A round that carried only parts has nothing to stage yet.
+install_batch(_Instance, _Token, []) ->
+    ok;
+install_batch(Instance, Token, Cells) ->
+    bondy_oplog_instance:install_catalogue_batch(Instance, Token, Cells).
+
+%% @private
+%% A bucket with no table here keeps the rederive from adopting the peer's
+%% frontier (`bondy_oplog_applier:commit_stage/4`), which provokes a
+%% frontier-gap verdict and a re-bootstrap every cycle. That cycle is the
+%% DELIVERY PATH, not waste: suppressing the verdict violates `Live`
+%% (`MuxBucketSkip_Minus_GapVerdict`). An operator ends it, hence the alarm,
+%% restated each cycle and not logged here, since `bondy_alarm_handler` logs only
+%% the transition.
+report_unroutable([], InstanceId) ->
+    alarm_handler:clear_alarm({bondy_oplog_bucket_unroutable, InstanceId});
+report_unroutable(Buckets, InstanceId) ->
+    Info = #{instance_id => InstanceId, buckets => Buckets},
+    Desc =
+        <<
+            "A catalogue bootstrap shipped cells for buckets this instance "
+            "has no table for. They were dropped, and the peer's applied "
+            "frontier was NOT adopted - claiming it would assert history "
+            "this replica does not hold. The instance reports DIVERGED and "
+            "re-bootstraps until the cause is resolved. The usual cause is a "
+            "peer running a build that declares a table this node does not; "
+            "the remedy is to declare it here, after which the next "
+            "bootstrap installs completely and clears this alarm."
+        >>,
+    alarm_handler:set_alarm(
+        {{bondy_oplog_bucket_unroutable, InstanceId}, Desc, #{details => Info}}
+    ).
+
+%% @private
+%% Fold this round's parts into the reassembly map and extract every cell
+%% whose parts are now all present. Parts of one cell arrive in ascending
+%% index order, but several cells may be in flight across rounds, so the
+%% accumulator is keyed by `{Bucket, Key}`.
+absorb_chunks(Chunks, Pending0) ->
+    Pending1 = lists:foldl(
+        fun({Bucket, Key, Idx, Total, Part}, Acc) ->
+            maps:update_with(
+                {Bucket, Key},
+                fun({T, Parts}) -> {T, Parts#{Idx => Part}} end,
+                {Total, #{Idx => Part}},
+                Acc
+            )
+        end,
+        Pending0,
+        Chunks
+    ),
+    maps:fold(
+        fun({Bucket, Key}, {Total, Parts}, {CellsAcc, PendAcc}) ->
+            case map_size(Parts) =:= Total of
+                true ->
+                    Frame = iolist_to_binary(
+                        [maps:get(I, Parts) || I <- lists:seq(1, Total)]
+                    ),
+                    {[{Bucket, Key, Frame} | CellsAcc], PendAcc};
+                false ->
+                    {CellsAcc, PendAcc#{{Bucket, Key} => {Total, Parts}}}
+            end
+        end,
+        {[], #{}},
+        Pending1
+    ).
+
+-doc """
+Spawns a `bootstrap_catalogue/3` session in a separate process and
+returns immediately. Failures are logged and the process exits with
+`{bootstrap_catalogue_failed, Reason}`. Used by the sync scheduler for
+auto-bootstrap of catalogue-mode pre_bootstrap instances.
+""".
+-spec start_bootstrap_catalogue(instance_id(), peer_id(), opts()) ->
+    {ok, pid()}.
+
+start_bootstrap_catalogue(Instance, Peer, Opts) ->
+    Pid = spawn(fun() ->
+        case bootstrap_catalogue(Instance, Peer, Opts) of
+            {ok, _} ->
+                ok;
+            {error, Reason} ->
+                ?LOG_WARNING(#{
+                    description => bootstrap_failure_description(Reason),
+                    instance => Instance,
+                    peer => Peer,
+                    reason => Reason
+                }),
+                exit({bootstrap_catalogue_failed, Reason})
+        end
+    end),
+    {ok, Pid}.
+
+%% @private
+bootstrap_failure_description({source_behind_truncation, _}) ->
+    "Refused to install the peer's snapshot: the peer has not seen events "
+    "this node truncated. If this persists, the two nodes truncated history "
+    "separately before they were joined (for example, each ran with "
+    "cluster.enabled = off). Empty one of them and rejoin it.";
+bootstrap_failure_description(_) ->
+    "bootstrap_catalogue session failed".
+
+%% @private
+is_live(Instance) ->
+    case bondy_oplog_instance:lifecycle_state(Instance) of
+        live -> true;
+        _ -> false
+    end.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+do_run(Instance, Peer, Transport, TransportOpts, MaxIterations) ->
+    case Transport:request(Peer, Instance, get_root, TransportOpts) of
+        {ok, PeerRoot, PeerFp} ->
+            pull_if_compatible(
+                Instance,
+                Peer,
+                Transport,
+                TransportOpts,
+                MaxIterations,
+                PeerRoot,
+                PeerFp
+            );
+        {ok, PeerRoot} ->
+            %% A reply without a fingerprint gets no topology check.
+            pull_if_compatible(
+                Instance,
+                Peer,
+                Transport,
+                TransportOpts,
+                MaxIterations,
+                PeerRoot,
+                undefined
+            );
+        {error, _} = E ->
+            E
+    end.
+
+%% @private
+%% Per-shard MST roots are only comparable when both nodes key data the same
+%% way, so we verify the peer's keying-topology fingerprint matches ours before
+%% pulling. A mismatch is refused loudly rather than diverging silently;
+%% `undefined` on either side (an ephemeral DB, or a peer that predates the
+%% fingerprint) skips the check.
+pull_if_compatible(
+    Instance, Peer, Transport, TransportOpts, MaxIterations, PeerRoot, PeerFp
+) ->
+    LocalFp = bondy_oplog:topology_fingerprint(bondy_oplog:db_of(Instance)),
+    case topology_compatible(LocalFp, PeerFp) of
+        true ->
+            %% The pull carries out the peer root the session actually
+            %% COMPLETED against — which, after a mid-session root refresh
+            %% (`chase_refreshed_root/7`), is not necessarily the one this
+            %% function was handed. Only that root may be checkpointed as
+            %% held-in-full (`maybe_record/5`); `skip` marks a benign
+            %% incomplete round that must checkpoint nothing.
+            pull_from_root(
+                Instance,
+                Peer,
+                Transport,
+                TransportOpts,
+                MaxIterations,
+                PeerRoot
+            );
+        false ->
+            ?LOG_ERROR(#{
+                description =>
+                    "Refusing AAE sync: the peer's bondy_db keying topology "
+                    "differs from ours, so per-shard MST roots are not "
+                    "comparable. The nodes must agree on partition_strategy, "
+                    "shard_count and per-table routing (compare the topology "
+                    "MANIFEST on each node).",
+                instance => Instance,
+                peer => Peer,
+                local_fingerprint => hexfp(LocalFp),
+                peer_fingerprint => hexfp(PeerFp)
+            }),
+            {error, {topology_mismatch, LocalFp, PeerFp}}
+    end.
+
+%% @private
+pull_from_root(
+    Instance, _Peer, _Transport, _TransportOpts, _MaxIterations, undefined
+) ->
+    {ok, bondy_oplog_instance:root_hash(Instance), undefined};
+pull_from_root(
+    Instance, Peer, Transport, TransportOpts, MaxIterations, PeerRoot
+) ->
+    LocalRoot = bondy_oplog_instance:root_hash(Instance),
+    case PeerRoot =:= LocalRoot of
+        true ->
+            {ok, LocalRoot, PeerRoot};
+        false ->
+            pull_until_complete(
+                Instance,
+                Peer,
+                Transport,
+                TransportOpts,
+                PeerRoot,
+                MaxIterations
+            )
+    end.
+
+%% @private
+topology_compatible(undefined, _) -> true;
+topology_compatible(_, undefined) -> true;
+topology_compatible(Fp, Fp) -> true;
+topology_compatible(_, _) -> false.
+
+%% @private
+hexfp(undefined) -> undefined;
+hexfp(Fp) when is_binary(Fp) -> binary:encode_hex(Fp).
+
+%% @private
+%% Backstop: the adaptive round budget is exhausted. With bounded page batches a
+%% legitimate bulk sync needs many rounds, so the budget scales with the initial
+%% missing set; reaching `0` means the missing set is not converging (e.g. a
+%% peer that keeps returning pages which do not reduce it). Surface and let the
+%% scheduler retry on the next tick.
+pull_until_complete(
+    Instance,
+    Peer,
+    _Transport,
+    _TransportOpts,
+    _PeerRoot,
+    0
+) ->
+    ?LOG_WARNING(#{
+        description => "sync session exhausted its adaptive round budget",
+        instance => Instance,
+        peer => Peer
+    }),
+    {error, sync_round_budget_exhausted};
+pull_until_complete(
+    Instance,
+    Peer,
+    Transport,
+    TransportOpts,
+    PeerRoot,
+    Budget0
+) ->
+    %% Pin the root we are about to pull so the instance's page GC does not
+    %% sweep pulled-but-not-yet-merged pages between our rounds: during a
+    %% multi-round pull the earlier rounds' pages are unreachable from the LOCAL
+    %% root until the final integrate, and a concurrent compaction cycle would
+    %% collect them, after which the merge silently treats the missing subtrees
+    %% as empty. The pin is consumed by a successful integrate and TTL-expires
+    %% if this session dies. First entry only; chase re-pins its refreshed root.
+    _ =
+        Budget0 =:= undefined andalso
+            bondy_oplog_instance:pin_peer_root(Instance, PeerRoot),
+    case bondy_oplog_instance:missing_set(Instance, PeerRoot) of
+        [] ->
+            %% Every page reachable from PeerRoot is now in our store.
+            %% Integrate at the item level: walk PeerRoot's tree using the
+            %% local store and fold its items into ours. `PeerRoot` rides
+            %% along as the root this session demonstrably completed against,
+            %% the ONLY root `maybe_record/5` may checkpoint — a mid-session
+            %% refresh means the session-start root was never fully held. The
+            %% integrate re-checks the missing set ATOMICALLY with the merge;
+            %% `peer_pages_missing` means a sweep raced us, so re-pull.
+            case bondy_oplog_instance:integrate_peer_root(Instance, PeerRoot) of
+                ok ->
+                    {ok, bondy_oplog_instance:root_hash(Instance), PeerRoot};
+                {error, {peer_pages_missing, _}} ->
+                    NextBudget =
+                        case Budget0 of
+                            undefined -> 4;
+                            _ -> Budget0 - 1
+                        end,
+                    pull_until_complete(
+                        Instance,
+                        Peer,
+                        Transport,
+                        TransportOpts,
+                        PeerRoot,
+                        NextBudget
+                    )
+            end;
+        Missing ->
+            PerRound = bondy_oplog_config:aae_pages_per_round(),
+            %% On the first round (`Budget0 == undefined`) size the round
+            %% ceiling to the work; thereafter count it down.
+            Budget =
+                case Budget0 of
+                    undefined ->
+                        initial_round_budget(length(Missing), PerRound);
+                    _ ->
+                        Budget0
+                end,
+            %% Bounded page batch: pull at most `PerRound` of the missing pages
+            %% this round, NOT the whole set. `PerRound` is the node-wide page
+            %% budget (`aae_max_pages_in_flight`) divided by the concurrency cap
+            %% (`aae_max_concurrency`), so AAE's peak memory is bounded
+            %% independent of dataset size AND of how many sessions run — more
+            %% concurrency means smaller batches, not more RAM. The next round's
+            %% `missing_set` recomputes the remainder, including any deeper pages
+            %% a just-merged page now references.
+            Batch = lists:sublist(Missing, PerRound),
+            %% Reciprocal form: announce our own root while asking for pages,
+            %% so the peer learns for free whether it is behind us and can
+            %% schedule an exchange in the other direction. Without this a
+            %% pair converges mutually only when both schedulers happen to
+            %% tick toward each other.
+            Req = get_pages_request(Instance, Transport, Batch),
+            case Transport:request(Peer, Instance, Req, TransportOpts) of
+                {ok, {unavailable, _}} ->
+                    %% The peer cannot serve these pages — its compaction and
+                    %% page GC reclaimed them mid-session, so the root we pinned
+                    %% at session start went stale under us. CHASE the refreshed
+                    %% root, whose pages are the peer's live tree and so always
+                    %% servable, rather than aborting: treating every miss as
+                    %% terminal re-bootstraps on every truncation round, and
+                    %% each live re-bootstrap is a clobber-and-rederive cycle
+                    %% not to be entered gratuitously.
+                    chase_refreshed_root(
+                        Instance,
+                        Peer,
+                        Transport,
+                        TransportOpts,
+                        PeerRoot,
+                        Budget,
+                        Batch
+                    );
+                {ok, Pages} when map_size(Pages) =:= 0 ->
+                    {error, {peer_returned_empty_pages, Batch}};
+                {ok, Pages} ->
+                    ok = merge_pages(Instance, Pages),
+                    pull_until_complete(
+                        Instance,
+                        Peer,
+                        Transport,
+                        TransportOpts,
+                        PeerRoot,
+                        Budget - 1
+                    );
+                {error, _} = E ->
+                    E
+            end
+    end.
+
+%% @private
+%% The peer could not serve pages of `OldRoot`: re-request its current root and
+%% continue the round against that, budget-decremented, so a peer truncating
+%% faster than this node can chase ends in `sync_round_budget_exhausted`. Only
+%% when the peer has not moved, or the refresh fails, does the applied-frontier
+%% deficit decide: no deficit means the unpullable pages cover only events this
+%% replica already applied, so the round ends `skip` (nothing checkpointed);
+%% a strict deficit is the terminal error that flags a catalogue re-bootstrap.
+chase_refreshed_root(
+    Instance, Peer, Transport, TransportOpts, OldRoot, Budget, Batch
+) ->
+    %% A failed root re-request (transport error, or the peer's
+    %% dangling-root guard answering `{error, {root_unservable, _}}`
+    %% mid-GC) ends the round as a plain session error — retried on the
+    %% next tick. Falling back to the old root here would read as "root
+    %% unmoved" below and, with a fresh-events deficit, manufacture a
+    %% false `peer_pages_unavailable` verdict (an immediate rebootstrap
+    %% flag) out of a transient serving hiccup.
+    NewRoot =
+        case Transport:request(Peer, Instance, get_root, TransportOpts) of
+            {ok, R, _Fp} -> R;
+            {ok, R} -> R;
+            {error, _} = RootErr -> RootErr
+        end,
+    case NewRoot of
+        {error, _} = E ->
+            E;
+        OldRoot ->
+            PeerFrontier = request_peer_frontier(
+                Instance, Peer, Transport, TransportOpts
+            ),
+            case frontier_deficit(Instance, PeerFrontier) of
+                Deficit when map_size(Deficit) =:= 0 ->
+                    telemetry:execute(
+                        [bondy_oplog, sync, pages_unavailable_benign],
+                        #{count => 1},
+                        #{instance_id => Instance, peer => Peer}
+                    ),
+                    {ok, bondy_oplog_instance:root_hash(Instance), skip};
+                _Deficit ->
+                    {error, {peer_pages_unavailable, Batch}}
+            end;
+        undefined ->
+            %% The peer compacted to an empty tree: nothing left to pull.
+            %% `undefined` keeps the existing empty-peer record semantics
+            %% (recency only).
+            {ok, bondy_oplog_instance:root_hash(Instance), undefined};
+        _ ->
+            %% Chasing a refreshed root: pin it like the session-start
+            %% root (the stale pin expires by TTL).
+            ok = bondy_oplog_instance:pin_peer_root(Instance, NewRoot),
+            pull_until_complete(
+                Instance,
+                Peer,
+                Transport,
+                TransportOpts,
+                NewRoot,
+                Budget - 1
+            )
+    end.
+
+%% @private
+%% Builds the page request. The reciprocal 4-tuple form carries this node's id
+%% and root; when the transport does not export `self_id/1` the request is the
+%% 2-tuple form and the responder does not reciprocate.
+get_pages_request(Instance, Transport, Batch) ->
+    try Transport:self_id(Instance) of
+        SelfId ->
+            {get_pages, SelfId, bondy_oplog_instance:root_hash(Instance), Batch}
+    catch
+        error:undef ->
+            {get_pages, Batch}
+    end.
+
+%% @private
+initial_round_budget(MissingCount, PerRound) ->
+    (MissingCount div PerRound + 1) * ?AAE_ROUND_BUDGET_SLACK +
+        ?AAE_ROUND_BUDGET_FLOOR.
+
+%% @private
+%% A successful round (`{ok, Root}`, `Record =:= true`) freshens this
+%% instance's AE targets — INCLUDING when `Root =:= undefined` (an empty
+%% instance verified caught-up with the peer). The empty case is exactly the
+%% idle low-churn shard the auth freshness fence depends on, so it MUST bump.
+%% The peer-state record also always lands, with the PEER's durable frontier:
+%% `peer_state` is a statement about what peers hold
+%% (`bondy_oplog_instance:compute_frontier_for/2`).
+maybe_record({ok, _LocalRoot}, _Instance, _Peer, _Record, skip, _Frontier) ->
+    %% Benign incomplete round (`chase_refreshed_root/7`): the peer's
+    %% advertised root was never fully held, so even bumping recency against
+    %% it would overstate this session.
+    ok;
+maybe_record({ok, _LocalRoot}, Instance, Peer, true, _PeerRoot, Frontier) ->
+    ok = bondy_oplog_peer_state:record_sync_complete(Peer, Instance, Frontier),
+    ok = bump_ae_on_sync(Instance, Peer);
+maybe_record(_, _, _, _, _, _) ->
+    ok.
+
+%% @private
+%% Completes the swap: report our durable frontier to the peer, so it records
+%% it against us. Sync is pull-only, so without this the peer learns what we
+%% hold only when it pulls, in a session this one knows nothing about, and each
+%% side's stability frontier advances at its own rate. Best-effort: a failure
+%% costs the peer a stale record, which only delays its frontier, and never
+%% fails the session.
+maybe_report_frontier(
+    {ok, _}, Instance, Peer, Transport, TransportOpts, true, PeerRoot
+) when PeerRoot =/= skip ->
+    SelfId =
+        try
+            Transport:self_id(Instance)
+        catch
+            error:undef -> undefined
+        end,
+    case {SelfId, bondy_oplog_instance:durable_frontier(Instance)} of
+        {undefined, _} ->
+            %% Transport cannot name us, so the peer could not attribute the
+            %% report. Degrade to the unilateral behaviour.
+            ok;
+        {_, {error, _}} ->
+            ok;
+        {_, {ok, Frontier}} ->
+            Req = {confirm_frontier, SelfId, Frontier},
+            case Transport:request(Peer, Instance, Req, TransportOpts) of
+                {ok, _} ->
+                    ok;
+                {error, Reason} ->
+                    ?LOG_DEBUG(#{
+                        description => "swap report not delivered",
+                        instance => Instance,
+                        peer => Peer,
+                        reason => Reason
+                    }),
+                    ok
+            end
+    end;
+maybe_report_frontier(_, _, _, _, _, _, _) ->
+    ok.
+
+%% @private
+%% A peer answering `{error, {root_unservable, _}}` refuses a dangling root, a
+%% benign transient (the truncate/GC race window) that the next tick heals. A
+%% peer whose own root pages are permanently lost stays unservable, and because
+%% every round errors the frontier-gap verdict never fires. This helper turns
+%% the error into escalation evidence only when the peer's pre-round applied
+%% frontier is strictly ahead of ours after the local settle; the scheduler
+%% debounces those strikes into a catalogue re-bootstrap from the projection.
+maybe_unservable_behind(
+    {error, {root_unservable, _}} = E, Instance, PeerFrontier
+) when is_map(PeerFrontier), map_size(PeerFrontier) > 0 ->
+    Deficit0 = frontier_deficit(Instance, PeerFrontier),
+    map_size(Deficit0) =:= 0 orelse settle_local(Instance),
+    case frontier_deficit(Instance, PeerFrontier) of
+        Deficit when map_size(Deficit) =:= 0 ->
+            E;
+        Deficit ->
+            {error,
+                {root_unservable_behind, lists:sublist(maps:keys(Deficit), 5)}}
+    end;
+maybe_unservable_behind(Result, _Instance, _PeerFrontier) ->
+    Result.
+
+%% @private
+%% THE FRONTIER-GAP CHECK: fires on a successful round when the peer's pre-round
+%% applied frontier is still strictly ahead of ours after the local settle, so
+%% replay lag is not read as a gap. Adoption rests on "a peer dropped an event
+%% only if this node held it"; compaction and the watermark door keep that
+%% (bondy_oplog_bootstrap_rederive_test:applier_door_keeps_what_a_member_lacks)
+%% while `mst_retention` and `truncate_prefix/2` do not. The session therefore
+%% fails `{frontier_gap, Origins}` and the scheduler flags a rebootstrap.
+maybe_frontier_gap({ok, _} = Result, _Instance, _Peer, _PeerFrontier, skip) ->
+    %% Benign incomplete round: a deficit here is expected transfer lag,
+    %% not evidence of compacted-away history. The next complete round
+    %% judges.
+    Result;
+maybe_frontier_gap(
+    {ok, _} = Result, Instance, Peer, PeerFrontier, PeerRoot
+) when
+    is_map(PeerFrontier), map_size(PeerFrontier) > 0
+->
+    case frontier_deficit(Instance, PeerFrontier) of
+        Deficit0 when map_size(Deficit0) =:= 0 ->
+            Result;
+        Deficit0 ->
+            ok = settle_local(Instance),
+            case frontier_deficit(Instance, PeerFrontier) of
+                Deficit when map_size(Deficit) =:= 0 ->
+                    ?LOG_DEBUG(#{
+                        description =>
+                            "Frontier deficit settled by the local "
+                            "apply-pipeline barriers (replay lag, not "
+                            "a gap)",
+                        instance => Instance,
+                        peer => Peer,
+                        deficit => Deficit0
+                    }),
+                    Result;
+                Deficit ->
+                    Presence = deficit_presence(Instance, Deficit),
+                    LocalRoot = bondy_oplog_instance:root_hash(Instance),
+                    telemetry:execute(
+                        [bondy_oplog, sync_session, frontier_gap],
+                        #{count => 1, origins => map_size(Deficit)},
+                        #{
+                            instance_id => Instance,
+                            peer => Peer,
+                            deficit => Deficit,
+                            present_locally => Presence,
+                            completed_peer_root => PeerRoot,
+                            local_root => LocalRoot
+                        }
+                    ),
+                    ?LOG_INFO(#{
+                        description =>
+                            "Frontier gap: peer's applied frontier is "
+                            "still ahead after a complete round and a "
+                            "local settle (per-origin peer vs local "
+                            "sequences in `deficit`; `present_locally` "
+                            "discriminates apply-side lag from a "
+                            "peer-side over-claim)",
+                        instance => Instance,
+                        peer => Peer,
+                        deficit => Deficit,
+                        present_locally => Presence
+                    }),
+                    Origins = lists:sublist(maps:keys(Deficit), 5),
+                    {error, {frontier_gap, Origins}}
+            end
+    end;
+maybe_frontier_gap(Result, _Instance, _Peer, _PeerFrontier, _PeerRoot) ->
+    Result.
+
+%% @private
+%% Forensic probe on a residual deficit: is each behind `{Origin, Seq}` event
+%% present in the local log (MST + overlay, which `fold_range/5` reads in one
+%% instance callback)? `true` means the round delivered the event and the
+%% deficit is apply-side lag the settle barriers did not cover; `false` means
+%% the peer's frontier counted an event its served tree never shipped. Probes
+%% at most 10 missing seqs per behind origin. `#{}` for an empty log; the
+%% instance calls raise as they do everywhere else.
+deficit_presence(Instance, Deficit) ->
+    case
+        {
+            bondy_oplog_instance:first_key(Instance),
+            bondy_oplog_instance:latest_key(Instance)
+        }
+    of
+        {{ok, First}, {ok, Last}} ->
+            Want = maps:fold(
+                fun(Origin, #{peer := S, local := L}, Acc) ->
+                    Lo = max(L + 1, S - 9),
+                    lists:foldl(
+                        fun(Seq, Acc1) -> Acc1#{{Origin, Seq} => false} end,
+                        Acc,
+                        lists:seq(Lo, S)
+                    )
+                end,
+                #{},
+                Deficit
+            ),
+            bondy_oplog_instance:fold_range(
+                Instance,
+                First,
+                Last,
+                fun(E, Acc) ->
+                    K = bondy_oplog_event:key(E),
+                    OS = {
+                        bondy_oplog_event:key_origin(K),
+                        bondy_oplog_event:key_seq(K)
+                    },
+                    case maps:is_key(OS, Acc) of
+                        true -> Acc#{OS => true};
+                        false -> Acc
+                    end
+                end,
+                Want
+            );
+        {empty, _} ->
+            #{};
+        {_, empty} ->
+            #{}
+    end.
+
+%% @private
+%% Settle the local apply pipeline: overlay drained (local events
+%% projected + installed) and, when the instance is applier-backed, the
+%% applier caught up (queued replay casts served + the I1 fence run).
+settle_local(Instance) ->
+    _ = bondy_oplog_instance:await_apply(Instance),
+    case bondy_oplog_registry:applier_pid(Instance) of
+        Pid when is_pid(Pid) ->
+            bondy_oplog_applier:barrier(Pid);
+        undefined ->
+            ok
+    end.
+
+%% @private
+%% Per-origin deficit map (`Origin => #{peer => Seq, local => Cur}`) for
+%% which the peer's applied-frontier VV is strictly ahead of the local
+%% one — the convergence oracle's definition of "this replica is missing
+%% something". Empty map = no deficit. Origins are node-scoped so the
+%% map is bounded by cluster size.
+frontier_deficit(Instance, PeerFrontier) ->
+    Local = bondy_oplog_registry:frontier(Instance),
+    %% One read for the whole peer frontier, not one per origin.
+    Retired = bondy_oplog_origin_bans:retired_set(),
+    maps:fold(
+        fun(Origin, Seq, Acc) ->
+            case maps:get(Origin, Local, 0) of
+                Cur when Seq > Cur ->
+                    %% A RETIRED origin is skipped: the origin is banned, so
+                    %% no further event from it will ever be applied here,
+                    %% and a deficit this replica cannot fill is not a
+                    %% deficit worth reporting. Reporting the
+                    %% peer's surviving entry as a deficit would flag a
+                    %% catalogue rebootstrap for data already held, on
+                    %% every round, until the peer reaps it too. An
+                    %% ordinary BAN does not qualify — it can be lifted.
+                    case is_map_key(Origin, Retired) of
+                        true -> Acc;
+                        false -> Acc#{Origin => #{peer => Seq, local => Cur}}
+                    end;
+                _ ->
+                    Acc
+            end
+        end,
+        #{},
+        PeerFrontier
+    ).
+
+%% @private
+%% Substrate read-side freshness wiring. After a successful AE round, bump every
+%% shard the consumer registered for this instance so long-quiet shards do not
+%% trip `{stale, _}` purely on inactivity. An empty target list is a no-op.
+%% This is the `synced` site; under the `quorum` isolation policy the bump is
+%% gated on a connected majority, so a minority partition does not
+%% self-certify fresh.
+bump_ae_on_sync(Instance, Peer) ->
+    case should_certify_freshness(synced) of
+        true -> do_bump_ae_targets(Instance, #{peer => Peer, site => synced});
+        false -> ok
+    end.
+
+-doc """
+Freshen this instance's AE targets for a node whose peer list is empty
+this round (no peer reachable). Certification follows
+`should_certify_freshness/1`: with clustering disabled
+(`bondy_cluster:enabled/0`) it always certifies, since there is no peer to
+lag. Otherwise the
+`db.aae.fence.on_isolation` policy decides — `proceed` always bumps
+(treat isolation as vacuously fresh), `refuse` never bumps (fail closed —
+the fence will refuse), `quorum` bumps only while connected to a majority.
+Called by the sync scheduler at its no-peer seam.
+""".
+-spec maybe_bump_ae_isolated(instance_id()) -> ok.
+
+maybe_bump_ae_isolated(Instance) when is_binary(Instance) ->
+    case should_certify_freshness(isolated) of
+        true ->
+            do_bump_ae_targets(Instance, #{peer => undefined, site => isolated});
+        false ->
+            ok
+    end.
+
+%% @private
+do_bump_ae_targets(Instance, Meta) ->
+    case bondy_oplog_registry:ae_targets(Instance) of
+        Targets when is_list(Targets), Targets =/= [] ->
+            Now = erlang:monotonic_time(millisecond),
+            {Bumped, NotFound} =
+                bondy_oplog_core_registry:bump_ae_targets(Targets, Now),
+            telemetry:execute(
+                [bondy_oplog, sync, ae_bumped],
+                #{count => Bumped, not_found => NotFound},
+                Meta#{instance_id => Instance, now_ms => Now}
+            ),
+            ok;
+        _ ->
+            ok
+    end.
+
+%% @private
+%% The configured no-peer fence policy (`db.aae.fence.on_isolation`).
+isolation_policy() ->
+    bondy_oplog_config:aae_fence_on_isolation().
+
+%% @private
+%% Whether a freshness certification is permitted now under the isolation
+%% policy, for a bump arising from `Site` (`synced` = a successful round that
+%% reached a peer; `isolated` = a tick with no peers in membership). With
+%% clustering disabled the node certifies unconditionally: no peer exists for
+%% its local view to lag. With clustering enabled a membership of this node
+%% alone is not evidence of that, since a just-restarted member lists only
+%% itself (`bondy_oplog_instance:reclamation_members/0`), so the policy decides.
+should_certify_freshness(Site) ->
+    case bondy_cluster:enabled() of
+        false ->
+            true;
+        true ->
+            case isolation_policy() of
+                proceed -> true;
+                refuse -> Site =:= synced;
+                quorum -> connected_majority()
+            end
+    end.
+
+%% @private
+%% True iff this node is connected to a strict majority of its expected
+%% Partisan membership (self counts). A membership with no other member is
+%% unknown, not a majority.
+connected_majority() ->
+    case bondy_oplog_instance:reclamation_members() of
+        {ok, Others} ->
+            (length(partisan:nodes()) + 1) * 2 > length(Others) + 1;
+        {error, _} ->
+            false
+    end.
+
+%% @private
+%% Inserts pages into the local store. When the backend supports
+%% concurrent writes (e.g. ETS), runs in this process — no gen_server
+%% round-trip. Otherwise falls back to the gen_server merge_pages
+%% call, which is required for backends whose store *is* the
+%% gen_server's state (e.g. map_store).
+merge_pages(Instance, Pages) when is_map(Pages) ->
+    merge_pages(Instance, maps:values(Pages));
+merge_pages(Instance, Pages) when is_list(Pages) ->
+    case bondy_oplog_registry:mst(Instance) of
+        undefined ->
+            bondy_oplog_instance:merge_pages(Instance, Pages);
+        MST ->
+            Store = bondy_mst:store(MST),
+            Caps = bondy_mst_store:capabilities(Store),
+            case maps:get(concurrent_writes, Caps, false) of
+                true ->
+                    %% Direct insert in this process. The store
+                    %% mutates in place (e.g. ETS); the gen_server's
+                    %% MST handle wraps the same store and sees the
+                    %% new pages on the next read.
+                    lists:foreach(
+                        fun(Page) ->
+                            {_Hash, _MST1} = bondy_mst:put_page(MST, Page)
+                        end,
+                        Pages
+                    ),
+                    ok;
+                false ->
+                    bondy_oplog_instance:merge_pages(Instance, Pages)
+            end
+    end.
+
+%% @private
+%% `undefined` selects the adaptive round budget (scaled to the initial missing
+%% set, see `pull_until_complete/6`) — the right default now that each round
+%% pulls a bounded page batch and a bulk sync needs many rounds. A caller may
+%% still pass an explicit integer cap (tests, special cases).
+default_max_iterations(Opts) ->
+    maps:get(max_iterations, Opts, undefined).

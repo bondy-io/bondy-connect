@@ -1,0 +1,511 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_oplog_catalogue_snapshot).
+
+-include_lib("kernel/include/logger.hrl").
+-include("bondy_oplog.hrl").
+
+-moduledoc #{format => "text/markdown"}.
+-moduledoc """
+Peer-side responder for the catalogue-snapshot bootstrap protocol.
+
+Two entry points:
+
+- `init/1` — opens a session. Returns `{ok, {Watermark, Cursor, Buckets}}` on
+  success, `Buckets` naming every bucket the session scans, or `{ok, no_snapshot}` when neither an applier nor a fused
+  instance process is registered for it, or its projection shard is not
+  registered in `bondy_oplog_core_registry`.
+- `next/2` — pulls the next chunk of `(Bucket, Key, Frame)` triples
+  from the projection. Returns `{ok, {batch, {Cursor, Cells}}}` while
+  there is more, `{ok, {done, []}}` on end-of-keyspace, or
+  `{error, cursor_expired}` when the session's cursor was reaped.
+
+The implementation is direct ETS / direct adapter — no instance
+gen_server round-trip in the hot path so multiple bootstrap sessions
+on the same peer run fully in parallel. Only the initial `init/1` call
+hits the applier (to discover `cell_apply_target`).
+
+## Scan order
+
+A session walks the tables of one projection shard, one bucket each, a
+table at a time; a single-table instance walks the default bucket `<<>>`.
+Within a bucket it ships keys in ascending order, and a cell too large for
+one batch goes out in parts before any later key, which the initiator's
+install relies on to delete the cells the stream skipped
+(`bondy_oplog_applier:commit_stage/4`).
+
+## Snapshot consistency
+
+The cursor captures the high-water HLC at session start. Cells
+returned in subsequent batches MAY include writes past that HLC: the
+range scan is live, not a frozen snapshot. So a session's cells reflect
+at least the frontier its initiator read before streaming, and possibly
+more, which the initiator's re-fold skips (`bondy_oplog_cell_kernel:apply/6`)
+and its frontier claims only once it reaches the frontier this instance reports
+after the stream (`bondy_oplog_instance:install_target/2`).
+
+That lower bound holds only while this instance's cells only grow, and
+reflect no event its frontier does not claim. A session is therefore
+refused while the instance holds the re-fold mark of a snapshot install of its
+own, or has yet to replay the events its frontier does not
+claim (`bondy_oplog_instance:serving/1`); the instance does not start
+installing while a session is open on it
+(`bondy_oplog_instance:begin_install/3`), and the sessions open on it expire
+when it restarts owing that replay
+(`bondy_oplog_catalogue_cursor:discard_instance/1`).
+""".
+
+-export([init/1]).
+-export([next/2]).
+-export([release/2]).
+
+-ifdef(TEST).
+-export([cap_cells/4]).
+-export([take_parts/7]).
+-export([part_payload_bytes/3]).
+-export([total_parts/2]).
+-endif.
+
+%% Default bucket for catalogue projections. Matches the convention in
+%% `bondy_oplog_applier_cell_apply_test` and the e2e test suites: cell
+%% events are appended with `Bucket = <<>>`.
+-define(DEFAULT_BUCKET, <<>>).
+
+%% Headroom for the enclosing `{ok, {chunked_batch, {Cursor, [], Parts}}}`
+%% wrapper, which `part_payload_bytes/3` does not measure.
+-define(PART_MARGIN_BYTES, 256).
+
+%% Max binary sentinel for unbounded-high range scans. 256 bytes of
+%% 0xFF — beyond any production catalogue key.
+-define(MAX_KEY_SENTINEL,
+    <<255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255>>
+).
+
+-define(DEFAULT_BATCH_SIZE, 64).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-spec init(instance_id()) ->
+    {ok, {non_neg_integer(), bondy_oplog_catalogue_cursor:cursor(), [binary()]}}
+    | {ok, no_snapshot}
+    | {error, term()}.
+
+-doc """
+Opens a catalogue-snapshot session on the given instance, walking EVERY
+table on the shard. A collapsed per-shard instance carries several tables,
+each under its own entity-type bucket (and, on a memory topology, its own
+projection handle); the session streams them all in one cursor, advancing
+from one table to the next as each table's keyspace is exhausted
+(`bondy_oplog_catalogue_cursor:next_target/1`). A single-table instance (no
+per-table bucket on its registry entry) falls back to the legacy
+single-bucket walk over the default bucket (`<<>>`). The reply names the
+buckets the session scans, a bucket with no cell included, so the initiator
+can tell an empty table from one this instance does not have
+(`bondy_oplog_applier:commit_stage/4`).
+
+`{error, {refold_owed, InstanceId}}`, discarding the cursor, while the
+instance may not serve a snapshot (`bondy_oplog_instance:serving/1`). The
+cursor is minted before that check, so an install that starts after the check
+finds it open (`bondy_oplog_instance:begin_install/3`), and one that starts
+before it makes the check refuse (`bondy_oplog_bootstrap_rederive_test`,
+`cursor_open_before_the_serve_check_holds_the_install`).
+""".
+init(InstanceId) ->
+    Opened = init_catalogue_multi(InstanceId),
+    case {bondy_oplog_instance:serving(InstanceId), Opened} of
+        {ok, _} ->
+            Opened;
+        {Refused, {ok, {_, Cursor, _}}} ->
+            ok = bondy_oplog_catalogue_cursor:discard(Cursor),
+            Refused;
+        {Refused, _} ->
+            Refused
+    end.
+
+-spec next(
+    instance_id(),
+    bondy_oplog_catalogue_cursor:cursor()
+) ->
+    {ok,
+        {batch,
+            {bondy_oplog_catalogue_cursor:cursor(), [
+                bondy_oplog_transport:cell()
+            ]}}}
+    | {ok, {done, []}}
+    | {error, cursor_expired}
+    | {error, term()}.
+
+-doc """
+Pulls the next batch from the given cursor. The cursor is opaque to
+the initiator and is returned unchanged on `batch` so the caller can
+chain calls without state.
+""".
+next(InstanceId, Cursor) when
+    is_binary(InstanceId), is_binary(Cursor)
+->
+    case bondy_oplog_catalogue_cursor:lookup(Cursor) of
+        not_found ->
+            %% A cursor unknown to the peer means the session was
+            %% started on a different peer, or the peer was restarted —
+            %% either way the initiator must retry from `init/1`. We
+            %% report this as `expired` for protocol simplicity (the
+            %% initiator's recovery path is the same).
+            {error, cursor_expired};
+        expired ->
+            {error, cursor_expired};
+        {ok, #{instance_id := SessionId} = _CState} when
+            SessionId =/= InstanceId
+        ->
+            %% Cursor belongs to a different instance. Treat as expired
+            %% so the initiator restarts cleanly on the correct
+            %% instance.
+            {error, cursor_expired};
+        {ok, CState} ->
+            do_next(Cursor, CState)
+    end.
+
+-doc """
+Ends a session whose initiator will not read it, so its cursor stops holding
+the instance's own install (`bondy_oplog_instance:begin_install/3`). A cursor
+on another instance, or one already gone, is left alone.
+""".
+-spec release(instance_id(), bondy_oplog_catalogue_cursor:cursor()) -> ok.
+
+release(InstanceId, Cursor) when is_binary(InstanceId), is_binary(Cursor) ->
+    case bondy_oplog_catalogue_cursor:lookup(Cursor) of
+        {ok, #{instance_id := InstanceId}} ->
+            bondy_oplog_catalogue_cursor:discard(Cursor);
+        _ ->
+            ok
+    end.
+
+%% =============================================================================
+%% PRIVATE — init flow
+%% =============================================================================
+
+%% @private
+%% Multi-target init: snapshot every table on the shard. The target set is
+%% derived from the registry (every primary entry sharing the instance's id,
+%% each tagged with its `cell_apply_bucket`), so a collapsed per-shard instance
+%% streams all of its tables; a single-table instance with no per-table bucket
+%% falls back to the legacy single-bucket walk.
+init_catalogue_multi(InstanceId) ->
+    case resolve_cell_apply_target(InstanceId) of
+        undefined ->
+            {ok, no_snapshot};
+        {ok, {NS, Index, Shard}} ->
+            Targets = build_targets(InstanceId, NS),
+            init_with_targets(InstanceId, NS, Index, Shard, Targets)
+    end.
+
+%% @private
+%% The instance's founding projection target, resolved through whichever
+%% process owns it: the applier for a non-fused instance, the fused
+%% instance's own gen_server otherwise (`bondy_oplog_instance:
+%% cell_apply_target/1`). A fused instance has no applier pid, so resolving
+%% through the applier alone would answer `no_snapshot` for every one of
+%% them, leaving retention-bounded registry shards with no bootstrap
+%% producer.
+resolve_cell_apply_target(InstanceId) ->
+    case bondy_oplog_registry:applier_pid(InstanceId) of
+        undefined ->
+            case
+                bondy_oplog_registry:fused(InstanceId) andalso
+                    bondy_oplog_instance:whereis(InstanceId)
+            of
+                Pid when is_pid(Pid) ->
+                    case bondy_oplog_instance:cell_apply_target(Pid) of
+                        {ok, {_, _, _}} = Ok -> Ok;
+                        _ -> undefined
+                    end;
+                _ ->
+                    undefined
+            end;
+        ApplierPid ->
+            bondy_oplog_applier:cell_apply_target(ApplierPid)
+    end.
+
+%% @private
+%% Every `(NS, Bucket)` target on the shard: one per primary table that carries
+%% a `cell_apply_bucket` (a collapsed per-shard instance). When none do — a
+%% single-table or raw registration — fall back to the founding namespace and
+%% the default bucket, which is exactly the legacy single-target walk.
+build_targets(InstanceId, FoundingNS) ->
+    Entries = bondy_oplog_core_registry:primary_entries_for_instance(
+        InstanceId
+    ),
+    Tagged = lists:filtermap(
+        fun(E) ->
+            case bondy_oplog_core_registry:entry_cell_apply_bucket(E) of
+                undefined ->
+                    false;
+                Bucket ->
+                    {NS, _Index, _Shard} =
+                        bondy_oplog_core_registry:entry_key(E),
+                    {true, {NS, Bucket}}
+            end
+        end,
+        Entries
+    ),
+    case Tagged of
+        [] -> [{FoundingNS, default_bucket()}];
+        _ -> lists:usort(Tagged)
+    end.
+
+%% @private
+%% The watermark is read from the founding namespace (it only seeds that
+%% table's freshness mark on finalize; each table's own high-water is advanced
+%% cell-by-cell as the install materialises its cells). The first target is the
+%% current scan position; the rest ride on the cursor for `next_target/1`.
+init_with_targets(InstanceId, FoundingNS, Index, Shard, Targets) ->
+    [{NS1, Bucket1} | Rest] = Targets,
+    Buckets = lists:usort([B || {_, B} <- Targets]),
+    case bondy_oplog_core_registry:high_water_hlc(FoundingNS, Index, Shard) of
+        not_found ->
+            {ok, no_snapshot};
+        {ok, no_watermark} ->
+            Cursor = bondy_oplog_catalogue_cursor:mint(
+                InstanceId, NS1, Index, Shard, Bucket1, 0, Rest
+            ),
+            {ok, {0, Cursor, Buckets}};
+        {ok, Watermark} when is_integer(Watermark) ->
+            Cursor = bondy_oplog_catalogue_cursor:mint(
+                InstanceId, NS1, Index, Shard, Bucket1, Watermark, Rest
+            ),
+            {ok, {Watermark, Cursor, Buckets}}
+    end.
+
+%% =============================================================================
+%% PRIVATE — next flow
+%% =============================================================================
+
+%% @private
+do_next(Cursor, #{pending := {_, _, _, _}} = CState) ->
+    %% Mid-cell: keep emitting parts of the held frame. No range scan, and
+    %% `last_key` stays put until the final part goes out, so the walk cannot
+    %% pass a cell it has not fully shipped.
+    #{bucket := Bucket, pending := {Key, Frame, PartBytes, NextIdx}} = CState,
+    emit_parts(Cursor, Bucket, Key, Frame, PartBytes, NextIdx);
+do_next(Cursor, CState) ->
+    #{
+        instance_id := InstanceId,
+        ns := NS,
+        index := Index,
+        shard := Shard,
+        bucket := Bucket,
+        last_key := LastKey
+    } = CState,
+    case bondy_oplog_core_registry:lookup(NS, Index, Shard) of
+        not_found ->
+            %% Shard vanished mid-session — initiator must restart.
+            ok = bondy_oplog_catalogue_cursor:discard(Cursor),
+            {error, cursor_expired};
+        {ok, Entry} ->
+            Adapter = bondy_oplog_core_registry:entry_projection_adapter(Entry),
+            Handle = bondy_oplog_core_registry:entry_projection_handle(Entry),
+            Low = next_key_after(LastKey),
+            High = ?MAX_KEY_SENTINEL,
+            BatchSize = batch_size(),
+            case
+                Adapter:range(Handle, Bucket, Low, High, #{limit => BatchSize})
+            of
+                {ok, []} ->
+                    %% Current target's keyspace exhausted. Advance to the next
+                    %% table on the shard, if any, and scan it; only when no
+                    %% targets remain is the whole shard done.
+                    case bondy_oplog_catalogue_cursor:next_target(Cursor) of
+                        done ->
+                            ok = bondy_oplog_catalogue_cursor:discard(Cursor),
+                            {ok, {done, []}};
+                        not_found ->
+                            {error, cursor_expired};
+                        {ok, NextState} ->
+                            do_next(Cursor, NextState)
+                    end;
+                {ok, Pairs} ->
+                    MaxBytes = bondy_oplog_config:sync_max_response_bytes(),
+                    case cap_cells(InstanceId, Bucket, Pairs, MaxBytes) of
+                        {oversized, OKey, OFrame} ->
+                            %% A single cell larger than the frame ceiling
+                            %% ships in parts; the receiver reassembles them.
+                            OPartBytes = part_payload_bytes(
+                                Bucket, OKey, MaxBytes
+                            ),
+                            emit_parts(
+                                Cursor, Bucket, OKey, OFrame, OPartBytes, 1
+                            );
+                        {ok, Cells, AdvanceKey} ->
+                            capped_batch(Cursor, Cells, AdvanceKey)
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end
+    end.
+
+%% @private
+%% `AdvanceKey` is the last key KEPT this round. The cursor advances to it so
+%% the next round resumes strictly after it, leaving any byte-capped tail for
+%% the next call. Nothing is ever advanced past without being shipped: an
+%% oversized cell is part-shipped (`emit_parts/6`), never skipped.
+capped_batch(Cursor, Cells, AdvanceKey) ->
+    case bondy_oplog_catalogue_cursor:advance(Cursor, AdvanceKey) of
+        ok ->
+            {ok, {batch, {Cursor, Cells}}};
+        not_found ->
+            %% Cursor was reaped concurrently — rare but possible if the
+            %% session sat idle past the TTL right at the moment the GC ran.
+            {error, cursor_expired}
+    end.
+
+%% @private
+%% Ship one oversized cell's frame as numbered parts, as many as fit in this
+%% round. The receiver (`bondy_oplog_sync_session`) reassembles by
+%% `{Bucket, Key}` and MUST fail the bootstrap if the stream ends with an
+%% incomplete reassembly — otherwise this becomes another silent drop.
+%%
+%% `last_key` is advanced ONLY after the final part, so a cursor reaped
+%% mid-cell resumes the whole cell rather than losing its tail.
+emit_parts(Cursor, Bucket, Key, Frame, PartBytes, NextIdx) ->
+    MaxBytes = bondy_oplog_config:sync_max_response_bytes(),
+    Total = total_parts(Frame, PartBytes),
+    {Parts, LastIdx} = take_parts(
+        Bucket, Key, Frame, PartBytes, Total, NextIdx, MaxBytes
+    ),
+    Result =
+        case LastIdx >= Total of
+            true ->
+                %% Final part emitted: the walk may now pass this key.
+                %% `advance/2` also clears `pending`.
+                bondy_oplog_catalogue_cursor:advance(Cursor, Key);
+            false ->
+                bondy_oplog_catalogue_cursor:set_pending(
+                    Cursor, {Key, Frame, PartBytes, LastIdx + 1}
+                )
+        end,
+    case Result of
+        ok -> {ok, {chunked_batch, {Cursor, [], Parts}}};
+        not_found -> {error, cursor_expired}
+    end.
+
+%% @private
+%% Payload budget for one part: the round ceiling less the exact encoded
+%% overhead of the part tuple itself, less a margin for the enclosing
+%% response term. At least one byte, so a pathologically small ceiling
+%% still terminates (it just ships very slowly).
+part_payload_bytes(Bucket, Key, MaxBytes) ->
+    Overhead = erlang:external_size({Bucket, Key, 1, 1, <<>>}),
+    max(1, MaxBytes - Overhead - ?PART_MARGIN_BYTES).
+
+%% @private
+total_parts(Frame, PartBytes) ->
+    max(1, (byte_size(Frame) + PartBytes - 1) div PartBytes).
+
+%% @private
+%% Accumulate parts from `Idx` while they fit under the round ceiling.
+%% Always emits at least one part, so progress is guaranteed.
+take_parts(Bucket, Key, Frame, PartBytes, Total, Idx, MaxBytes) ->
+    take_parts(Bucket, Key, Frame, PartBytes, Total, Idx, MaxBytes, 0, []).
+
+take_parts(_B, _K, _F, _PB, Total, Idx, _Max, _Used, Acc) when Idx > Total ->
+    {lists:reverse(Acc), Total};
+take_parts(B, K, F, PB, Total, Idx, Max, Used, Acc) ->
+    Offset = (Idx - 1) * PB,
+    Len = min(PB, byte_size(F) - Offset),
+    Part = binary:part(F, Offset, Len),
+    Item = {B, K, Idx, Total, Part},
+    Size = erlang:external_size(Item),
+    case Acc =/= [] andalso Used + Size > Max of
+        true ->
+            {lists:reverse(Acc), Idx - 1};
+        false ->
+            take_parts(
+                B, K, F, PB, Total, Idx + 1, Max, Used + Size, [Item | Acc]
+            )
+    end.
+
+%% @private
+%% Pack cells into a batch no larger than the sync byte ceiling, mirroring the
+%% responder's page capping so bootstrap snapshots never exceed the transport
+%% frame. Returns `{ok, Kept, AdvanceKey}` (kept cells in key order, last key
+%% kept) or `{oversized, Key, Frame}` for a single cell that alone exceeds the
+%% ceiling, which the caller ships in parts. An oversized cell is surrendered
+%% only when nothing has been kept yet; otherwise the kept cells go first and
+%% the cursor meets it again next round, so it never passes an unshipped key.
+cap_cells(InstanceId, Bucket, Pairs, MaxBytes) ->
+    cap_cells(InstanceId, Bucket, Pairs, MaxBytes, 0, [], undefined).
+
+%% @private
+cap_cells(_InstanceId, _Bucket, [], _MaxBytes, _Used, KeptRev, Advance) ->
+    {ok, lists:reverse(KeptRev), Advance};
+cap_cells(
+    InstanceId, Bucket, [{K, F} | Rest], MaxBytes, Used, KeptRev, Advance
+) ->
+    Cell = {Bucket, K, F},
+    Size = erlang:external_size(Cell),
+    if
+        Size > MaxBytes andalso KeptRev =:= [] ->
+            %% Reported so the operator alarm and the `max_message_size`
+            %% guidance keep working; the cell still ships, in parts.
+            ok = bondy_oplog_sync_metrics:report_oversized(
+                cell, {InstanceId, Bucket, K}, Size, MaxBytes
+            ),
+            {oversized, K, F};
+        Size > MaxBytes ->
+            %% Flush what we have; this cell leads the next round.
+            {ok, lists:reverse(KeptRev), Advance};
+        KeptRev =:= [] orelse Used + Size =< MaxBytes ->
+            cap_cells(
+                InstanceId,
+                Bucket,
+                Rest,
+                MaxBytes,
+                Used + Size,
+                [Cell | KeptRev],
+                K
+            );
+        true ->
+            %% Ceiling reached; leave {K, F} and the rest for the next round.
+            {ok, lists:reverse(KeptRev), Advance}
+    end.
+
+%% @private
+%% Lexicographic successor for binary keys: `<<K/binary, 0>>` is the
+%% smallest binary strictly greater than `K`. Initial `undefined` maps
+%% to `<<>>` (the smallest possible Low).
+next_key_after(undefined) -> <<>>;
+next_key_after(K) when is_binary(K) -> <<K/binary, 0>>.
+
+%% @private
+default_bucket() ->
+    application:get_env(
+        bondy_oplog, catalogue_default_bucket, ?DEFAULT_BUCKET
+    ).
+
+%% @private
+batch_size() ->
+    application:get_env(
+        bondy_oplog, catalogue_snapshot_batch_size, ?DEFAULT_BATCH_SIZE
+    ).

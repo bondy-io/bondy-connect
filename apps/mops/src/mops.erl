@@ -1,0 +1,880 @@
+%% =============================================================================
+%%  mops.erl -
+%%
+%%  Copyright (c) 2016-2021 Leapsight. All rights reserved.
+%%
+%%  Licensed under the Apache License, Version 2.0 (the "License");
+%%  you may not use this file except in compliance with the License.
+%%  You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%%  Unless required by applicable law or agreed to in writing, software
+%%  distributed under the License is distributed on an "AS IS" BASIS,
+%%  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%%  See the License for the specific language governing permissions and
+%%  limitations under the License.
+%% =============================================================================
+
+-module(mops).
+-moduledoc """
+Mops is a mustache-style expression language. `eval/2` evaluates the
+expressions in a term against a context, a map with binary keys.
+
+## Expressions
+
+A binary that holds `{{Path}}` evaluates to the value at `Path` in the
+context, of whatever type. `Path` is a list of keys separated by `.`, so
+`{{foo.bar}}` reads key `bar` of the map under key `foo`. A key is looked up
+as a binary first, then as an existing atom. A path that does not resolve
+fails with `{badkeypath, Path}`; `mops_SUITE` covers an absent key and a path
+through a value that is not a map.
+
+A binary in double quotes is a string template: `"Hello {{name}}"`
+evaluates to a binary. A binary value is inserted as it is, and any other
+value is formatted with `~p`. Text before `{{` in a binary that is not
+quoted fails with `{badarg, Bin}`.
+
+`eval/2` walks maps, lists and tuples and evaluates every binary in them.
+Any other term is returned unchanged.
+
+## Pipes
+
+`{{Path |> Op}}` applies `Op` to the value, and pipes chain left to right.
+The operators are `integer`, `float`, `boolean`, `abs`, `head`, `tail`,
+`last`, `min`, `max`, `length`, `size`, `base64:encode`, `base64:decode`,
+`nth(N)`, `random(N)`, `get(Key)`, `get(Key, Default)`, `put(Key, Value)`,
+`merge(Expr)`, `with([Keys])` and `without([Keys])`. An operator that does
+not apply to its value fails with `{invalid_expression, [Op, Value]}`.
+
+An argument in single quotes is a literal: `get('first name')` reads the key
+`first name`. Spaces and tabs outside a literal are ignored, and spaces and
+tabs inside one are kept. Pipes, commas and closing brackets inside a
+literal are part of it, so `get('a,b')` reads the key `a,b`. An expression
+with a literal that is not closed fails with `{badarg, Expr}`. `mops_SUITE`
+covers each case.
+
+## Deferred evaluation
+
+A context value of `proxy/0` marks a key that is not known yet. An
+expression that reads it evaluates to `{'$mops_proxy', Fun}`: calling `Fun`
+with a later context finishes the evaluation, and may itself return another
+proxy when that context also defers a key. `mops_SUITE` covers a template
+completed over two contexts.
+""".
+-define(START, <<"{{">>).
+-define(END, <<"}}">>).
+-define(PIPE_OP, <<$|, $>>>).
+-define(DOUBLE_QUOTES, <<$">>).
+
+-define(OPTS_SPEC, #{
+    %% Defines the format of the keys in the map
+    %% not in use at the moment
+    labels => #{
+        required => true,
+        default => binary,
+        allow_null => false,
+        allow_undefined => false,
+        datatype => {in, [binary, atom]}
+    },
+    callback => #{
+        required => false,
+        allow_null => false,
+        allow_undefined => false,
+        datatype => [{function, 2}, atom]
+    },
+    %% Allows to register custom pipe operators (aka filters)
+    %% not in use at the moment
+    operators => #{
+        required => false,
+        allow_null => false,
+        validator => fun
+            ({Name, Fun} = Op) when
+                (is_atom(Name) orelse
+                    is_binary(Name)) andalso
+                    is_function(Fun, 1)
+            ->
+                {ok, Op};
+            (_) ->
+                false
+        end
+    }
+}).
+
+-record(state, {
+    context :: map(),
+    opts :: map(),
+    acc = [] :: any(),
+    is_ground = true :: boolean(),
+    is_open = false :: boolean(),
+    is_string = false :: boolean(),
+    sp = binary:compile_pattern(?START) :: any(),
+    dqp = binary:compile_pattern(?DOUBLE_QUOTES) :: any(),
+    ep = binary:compile_pattern(?END) :: any(),
+    re = element(2, re:compile("^\\s+|\\s+$", "")) :: any()
+}).
+
+-type state() :: #state{}.
+-type context() :: map().
+
+-export([eval/2]).
+-export([eval/3]).
+-export([proxy/0]).
+-export([is_proxy/1]).
+
+%% =============================================================================
+%% CALLBACKS
+%% =============================================================================
+
+-callback will_get_path(Path :: [atom() | binary()]) ->
+    NewPath :: [atom() | binary()].
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-doc """
+Evaluates the expressions in `T` against `Ctxt`, as `eval/3` with no options.
+
+```erlang
+1> mops:eval(<<"{{foo.bar}}">>, #{<<"foo">> => #{<<"bar">> => 1}}).
+1
+2> mops:eval(<<"\"n = {{n}}\"">>, #{<<"n">> => 3}).
+<<"n = 3">>
+3> mops:eval(foo, #{}).
+foo
+```
+""".
+-spec eval(any(), context()) -> any().
+
+eval(T, Ctxt) ->
+    eval(T, Ctxt, #{}).
+
+-doc """
+Evaluates the expressions in `T` against `Ctxt`.
+
+The `callback` option names a fun of arity 2, called as
+`Fun(will_get_path, Path)`, or a module implementing `will_get_path/1`. It
+receives each path before the lookup and returns the path to look up.
+""".
+-spec eval(any(), context(), map()) -> any().
+
+eval(T, Ctxt, Opts) ->
+    do_eval(T, Ctxt, Opts).
+
+-doc "Returns the context value that defers a key; see the module doc.".
+-spec proxy() -> '$mops_proxy'.
+
+proxy() -> '$mops_proxy'.
+
+-doc "Returns `true` when `Term` is a deferred result of `eval/2,3`.".
+-spec is_proxy(any()) -> boolean().
+
+is_proxy({'$mops_proxy', _}) -> true;
+is_proxy(_) -> false.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+do_eval(T, Ctxt) ->
+    do_eval(T, Ctxt, #{}).
+
+%% @private
+-spec do_eval(any(), context(), map()) -> any().
+
+do_eval({'$mops_proxy', F}, Ctxt0, Opts0) when
+    is_function(F, 1), is_map(Ctxt0)
+->
+    Opts = maps_utils:validate(Opts0, ?OPTS_SPEC),
+    Ctxt = maybe_set_callback(Ctxt0, Opts),
+
+    do_eval(F, Ctxt, Opts);
+do_eval(F, Ctxt0, Opts0) when is_function(F, 1), is_map(Ctxt0) ->
+    Opts = maps_utils:validate(Opts0, ?OPTS_SPEC),
+    Ctxt = maybe_set_callback(Ctxt0, Opts),
+
+    F(maybe_set_callback(Ctxt, Opts));
+do_eval(T, Ctxt0, Opts0) when is_map(T), is_map(Ctxt0), is_map(Opts0) ->
+    Opts = maps_utils:validate(Opts0, ?OPTS_SPEC),
+    Ctxt = maybe_set_callback(Ctxt0, Opts),
+
+    eval_map(T, Ctxt, Opts);
+do_eval(T, Ctxt0, Opts0) when is_list(T), is_map(Ctxt0), is_map(Opts0) ->
+    Opts = maps_utils:validate(Opts0, ?OPTS_SPEC),
+    Ctxt = maybe_set_callback(Ctxt0, Opts),
+
+    eval_list(T, Ctxt, Opts);
+do_eval(T, Ctxt0, Opts0) when is_tuple(T), is_map(Ctxt0), is_map(Opts0) ->
+    Opts = maps_utils:validate(Opts0, ?OPTS_SPEC),
+    Ctxt = maybe_set_callback(Ctxt0, Opts),
+
+    list_to_tuple(eval_list(tuple_to_list(T), Ctxt, Opts));
+do_eval(<<>>, Ctxt, Opts) when is_map(Ctxt), is_map(Opts) ->
+    <<>>;
+do_eval(T, Ctxt0, Opts0) when is_binary(T), is_map(Ctxt0), is_map(Opts0) ->
+    Opts = maps_utils:validate(Opts0, ?OPTS_SPEC),
+    Ctxt = maybe_set_callback(Ctxt0, Opts),
+
+    eval_expr(T, #state{
+        context = Ctxt,
+        opts = Opts
+    });
+do_eval(T, Ctxt, Opts) when is_map(Ctxt), is_map(Opts) ->
+    T.
+
+%% @private
+maybe_set_callback(Ctxt, #{callback := Callback}) ->
+    maps:put('$mops_callback', Callback, Ctxt);
+maybe_set_callback(Ctxt, _) ->
+    Ctxt.
+
+%% @private
+eval_map(Map, Ctxt, Opts) ->
+    Fold = fun(K, V0, {L, R}) ->
+        case do_eval(V0, Ctxt, Opts) of
+            {'$mops_proxy', _} = V1 ->
+                {L, [{K, V1} | R]};
+            V1 ->
+                {[{K, V1} | L], R}
+        end
+    end,
+    case maps:fold(Fold, {[], []}, Map) of
+        {Ls, []} ->
+            maps:from_list(Ls);
+        {Ls, Rs} ->
+            maps:from_list(lists:append(Ls, Rs))
+    end.
+
+%% @private
+eval_list(List, Ctxt, Opts) ->
+    Fold = fun(V0, {L, R}) ->
+        case do_eval(V0, Ctxt, Opts) of
+            {'$mops_proxy', _} = V1 ->
+                {[V1 | L], true};
+            V1 ->
+                {[V1 | L], R}
+        end
+    end,
+    case lists:foldl(Fold, {[], false}, List) of
+        {L, false} ->
+            lists:reverse(L);
+        {L, true} ->
+            lists:reverse(L)
+    end.
+
+%% @private
+-spec eval_expr(binary(), state()) ->
+    {'$mops_proxy', function()} | any() | no_return().
+
+eval_expr(<<>>, #state{is_ground = true, is_string = true} = St) ->
+    Fun = fun(X, Acc) ->
+        [term_to_iolist(X) | Acc]
+    end,
+    iolist_to_binary(
+        lists:foldl(Fun, [], St#state.acc)
+    );
+eval_expr(<<>>, #state{is_ground = false, is_string = true} = St) ->
+    %% We have functions so we wrap the iolist in a function receiving
+    %% a future context as an argument
+
+    Fold = fun DoFold(FAcc, FCtxt) ->
+        Map = fun
+            ({'$mops_proxy', F}, {Flag, Acc}) when is_function(F, 1) ->
+                case F(FCtxt) of
+                    {'$mops_proxy', _} = Res ->
+                        {true, [Res | Acc]};
+                    Res ->
+                        {Flag, [term_to_iolist(Res) | Acc]}
+                end;
+            (Val, {Flag, Acc}) ->
+                {Flag, [term_to_iolist(Val) | Acc]}
+        end,
+        case lists:foldl(Map, {false, []}, FAcc) of
+            {true, L} ->
+                {'$mops_proxy', fun(OtherCtxt) ->
+                    DoFold(lists:reverse(L), OtherCtxt)
+                end};
+            {false, L} ->
+                iolist_to_binary(L)
+        end
+    end,
+
+    {'$mops_proxy', fun(Ctxt) -> Fold(St#state.acc, Ctxt) end};
+eval_expr(Bin0, #state{acc = [], is_string = false} = St0) when
+    is_binary(Bin0)
+->
+    Bin1 = maybe_trim(Bin0),
+    case binary:match(Bin1, St0#state.sp) of
+        nomatch ->
+            Bin0;
+        {Pos, 2} ->
+            St1 = St0#state{is_open = true},
+            Len = byte_size(Bin1),
+            case binary:matches(Bin1, St0#state.dqp) of
+                [] when Pos =:= 0 ->
+                    %% Not a string so we should have a single
+                    %% mustache expression
+                    parse_expr(binary:part(Bin1, 2, Len - 4), St1);
+                [] when St1#state.is_string =:= true ->
+                    %% An unquoted string so we might have multiple mustache
+                    %% expressions e.g. "Hello {{foo}}. Today is {{date}}."
+                    [Pre, Rest] = binary:split(Bin1, St0#state.sp),
+                    eval_expr(Rest, acc(St1, Pre));
+                [{0, 1}, {QPos, 1}] when QPos =:= Len - 1 ->
+                    %% A string so we might have multiple mustache expressions
+                    %% e.g. "\"Hello {{foo}}. Today is {{date}}.\""
+                    Unquoted = binary:part(Bin1, 1, Len - 2),
+                    [Pre, Rest] = binary:split(Unquoted, St0#state.sp),
+                    eval_expr(Rest, acc(St1#state{is_string = true}, Pre));
+                _ ->
+                    %% An invalid expression: quotes in the middle of the
+                    %% string (e.g. <<"   \"foo\"">> or <<"\"foo\"   ">>), no
+                    %% closing quote, or a non-string with chars before the
+                    %% opening mustache.
+                    error({badarg, Bin0})
+            end
+    end;
+eval_expr(Bin, #state{is_open = true, is_string = true} = St0) when
+    is_binary(Bin)
+->
+    %% `binary:split/2` returns sub-binaries of `Bin`, so `Bin` stays alive
+    %% until every piece of the split is dropped. The clause below has the
+    %% same hazard.
+    case binary:split(Bin, St0#state.ep) of
+        [Expr, Rest] ->
+            St1 = St0#state{is_open = false},
+            eval_expr(Rest, acc(St1, parse_expr(Expr, St1)));
+        _ ->
+            error({badarg, Bin})
+    end;
+eval_expr(Bin, #state{is_open = false, is_string = true} = St) when
+    is_binary(Bin)
+->
+    case binary:split(Bin, St#state.sp) of
+        [Pre, Rest] ->
+            eval_expr(Rest, acc(St#state{is_open = true}, Pre));
+        [Bin] ->
+            eval_expr(<<>>, acc(St, Bin))
+    end.
+
+%% @private
+
+acc(St, <<>>) ->
+    St;
+acc(#state{acc = Acc} = St, {'$mops_proxy', _} = Val) ->
+    St#state{acc = [Val | Acc], is_ground = false};
+acc(#state{acc = Acc} = St, Val) when is_function(Val, 1) ->
+    St#state{acc = [Val | Acc], is_ground = false};
+acc(#state{acc = Acc} = St, Val) when is_binary(Val) ->
+    St#state{acc = [Val | Acc]};
+acc(#state{acc = Acc} = St, Val) ->
+    St#state{acc = [io_lib:format("~p", [Val]) | Acc]}.
+
+%% @private
+parse_expr(Bin, #state{context = Ctxt}) ->
+    case split_unquoted(Bin, ?PIPE_OP) of
+        {ok, [Val]} ->
+            get_value(trim(Val), Ctxt);
+        {ok, [Val | Ops]} ->
+            apply_ops([trim(P) || P <- Ops], get_value(trim(Val), Ctxt), Ctxt);
+        error ->
+            error({badarg, Bin})
+    end.
+
+%% @private
+get_value(Key, F) when is_function(F, 1) ->
+    {'$mops_proxy', fun(X) -> get_value(Key, maybe_eval(F, X)) end};
+get_value(Key, {'$mops_proxy', F} = T) when is_function(F, 1) ->
+    {'$mops_proxy', fun(X) -> get_value(Key, maybe_eval(T, X)) end};
+get_value(Key, Ctxt) when is_binary(Key) ->
+    Path = binary:split(Key, <<$.>>, [global]),
+    get_value(Path, Ctxt);
+get_value(Path0, Ctxt) when is_list(Path0) ->
+    Path = maybe_callback(will_get_path, Path0, Ctxt),
+
+    try
+        case get(Path, Ctxt) of
+            {ok, '$mops_proxy', _Rem} ->
+                {'$mops_proxy', fun(X) -> get_value(Path, X) end};
+            {ok, Val} ->
+                maybe_eval(Val, Ctxt)
+        end
+    catch
+        error:{badkey, _} ->
+            %% We blame the full key
+            error({badkeypath, Path})
+    end.
+
+%% @private
+get(Path, '$mops_proxy') ->
+    {ok, '$mops_proxy', Path};
+get([], Term) ->
+    {ok, Term};
+get(Path, Val) when is_function(Val, 1) ->
+    Fun = fun(X) ->
+        try
+            get_value(Path, maybe_eval(Val, X))
+        catch
+            error:{badkey, _} ->
+                error({badkeypath, Path})
+        end
+    end,
+    {ok, {'$mops_proxy', Fun}};
+get(Path, {'$mops_proxy', _} = Val) ->
+    Fun = fun(X) ->
+        try
+            get_value(Path, maybe_eval(Val, X))
+        catch
+            error:{badkey, _} ->
+                error({badkeypath, Path})
+        end
+    end,
+    {ok, {'$mops_proxy', Fun}};
+get([H | T], Ctxt) when is_map(Ctxt) ->
+    get(T, safe_maps_get(H, Ctxt));
+get([H | _], _NotAMap) ->
+    error({badkey, H}).
+
+safe_maps_get(K, Map) when is_binary(K) ->
+    safe_maps_get(K, Map, '$error').
+
+%% Looks K up as a binary and, failing that, as an existing atom. Both
+%% misses take the same clause: whether the atom exists in the VM depends on
+%% unrelated code, so the outcome of a miss must not.
+safe_maps_get(K, Map, Default) when is_binary(K) ->
+    case maps:find(K, Map) of
+        {ok, Value} ->
+            Value;
+        error ->
+            safe_maps_get_atom(K, Map, Default)
+    end.
+
+safe_maps_get_atom(K, Map, Default) ->
+    Found =
+        try binary_to_existing_atom(K) of
+            Atom -> maps:find(Atom, Map)
+        catch
+            error:badarg -> error
+        end,
+    case Found of
+        {ok, Value} -> Value;
+        error when Default =/= '$error' -> Default;
+        error -> error({badkey, K})
+    end.
+
+%% @private
+apply_ops([H | T], Val, Ctxt) ->
+    apply_ops(T, apply_op(H, Val, Ctxt), Ctxt);
+apply_ops([], Val, _) ->
+    Val.
+
+%% @private
+
+apply_op(Op, {'$mops_proxy', F} = Val, _) when
+    is_function(F, 1) andalso
+        (Op == <<"integer">> orelse
+            Op == <<"float">> orelse
+            Op == <<"boolean">> orelse
+            Op == <<"abs">> orelse
+            Op == <<"head">> orelse
+            Op == <<"tail">> orelse
+            Op == <<"last">> orelse
+            Op == <<"min">> orelse
+            Op == <<"max">> orelse
+            Op == <<"length">> orelse
+            Op == <<"size">> orelse
+            Op == <<"base64:encode">> orelse
+            Op == <<"base64:decode">>)
+->
+    {'$mops_proxy', fun(X) -> apply_op(Op, maybe_eval(Val, X), X) end};
+apply_op(_, <<>>, _) ->
+    <<>>;
+apply_op(<<"abs">>, Val, _) when is_number(Val) ->
+    abs(Val);
+apply_op(<<"integer">> = Op, Val, _) when is_binary(Val) ->
+    try
+        safe_binary_to_integer(Val)
+    catch
+        error:badarg ->
+            error({invalid_expression, [Op, Val]})
+    end;
+apply_op(<<"integer">> = Op, Val, _) when is_list(Val) ->
+    try
+        safe_list_to_integer(Val)
+    catch
+        error:badarg ->
+            error({invalid_expression, [Op, Val]})
+    end;
+apply_op(<<"integer">>, Val, _) when is_integer(Val) ->
+    Val;
+apply_op(<<"integer">>, Val, _) when is_float(Val) ->
+    trunc(Val);
+apply_op(<<"float">> = Op, Val, _) when is_binary(Val) ->
+    try
+        safe_binary_to_float(Val)
+    catch
+        error:badarg ->
+            error({invalid_expression, [Op, Val]})
+    end;
+apply_op(<<"float">> = Op, Val, _) when is_list(Val) ->
+    try
+        safe_list_to_float(Val)
+    catch
+        error:badarg ->
+            error({invalid_expression, [Op, Val]})
+    end;
+apply_op(<<"float">>, Val, _) when is_float(Val) ->
+    Val;
+apply_op(<<"float">>, Val, _) when is_integer(Val) ->
+    float(Val);
+apply_op(<<"boolean">>, 0, _) ->
+    false;
+apply_op(<<"boolean">>, false, _) ->
+    false;
+apply_op(<<"boolean">>, <<"0">>, _) ->
+    false;
+apply_op(<<"boolean">>, <<"false">>, _) ->
+    false;
+apply_op(<<"boolean">>, 1, _) ->
+    true;
+apply_op(<<"boolean">>, true, _) ->
+    true;
+apply_op(<<"boolean">>, <<"1">>, _) ->
+    true;
+apply_op(<<"boolean">>, <<"true">>, _) ->
+    true;
+apply_op(<<"head">>, [], _) ->
+    <<>>;
+apply_op(<<"head">>, Val, _) when is_list(Val) ->
+    hd(Val);
+apply_op(<<"tail">>, [], _) ->
+    %% To avoid getting an exception at runtime we return []
+    [];
+apply_op(<<"tail">>, Val, _) when is_list(Val) ->
+    tl(Val);
+apply_op(<<"last">>, [], _) ->
+    <<>>;
+apply_op(<<"last">>, Val, _) when is_list(Val) ->
+    lists:last(Val);
+apply_op(<<"min">>, [], _) ->
+    <<>>;
+apply_op(<<"min">>, Val, _) when is_list(Val) ->
+    lists:min(Val);
+apply_op(<<"max">>, [], _) ->
+    <<>>;
+apply_op(<<"max">>, Val, _) when is_list(Val) ->
+    lists:max(Val);
+apply_op(<<"length">>, Val, _) when is_list(Val) ->
+    length(Val);
+apply_op(<<"size">>, Val, _) when is_map(Val) ->
+    maps:size(Val);
+apply_op(<<"base64:encode">>, Val, _) when is_binary(Val) orelse is_list(Val) ->
+    base64:encode(Val);
+apply_op(<<"base64:decode">>, Val, _) when is_binary(Val) orelse is_list(Val) ->
+    base64:decode(Val);
+apply_op(Bin, Val, Ctxt) ->
+    apply_custom_op(Bin, Val, Ctxt).
+
+%% @private
+
+apply_custom_op(<<"nth(", _/binary>> = Op, {'$mops_proxy', F} = Val, _) when
+    is_function(F, 1)
+->
+    {'$mops_proxy', fun(X) -> apply_custom_op(Op, maybe_eval(Val, X), X) end};
+apply_custom_op(<<"nth(", Rest/binary>> = Op, Val, Ctxt) when is_list(Val) ->
+    case [maybe_eval(K, Ctxt) || K <- get_arguments(Rest, Op, <<")">>)] of
+        [{'$mops_proxy', F} = N] when is_function(F, 1) ->
+            {'$mops_proxy', fun(X) -> lists:nth(maybe_eval(N, X), Val) end};
+        [N] ->
+            lists:nth(binary_to_integer(N), Val);
+        _ ->
+            error({invalid_expression, Op})
+    end;
+apply_custom_op(<<"random(", _/binary>> = Op, {'$mops_proxy', F} = Val, _) when
+    is_function(F, 1)
+->
+    {'$mops_proxy', fun(X) -> apply_custom_op(Op, maybe_eval(Val, X), X) end};
+apply_custom_op(<<"random(", Rest/binary>> = Op, Val, Ctxt) when is_list(Val) ->
+    case [maybe_eval(K, Ctxt) || K <- get_arguments(Rest, Op, <<")">>)] of
+        [{'$mops_proxy', F} = N] when is_function(F, 1) ->
+            {
+                '$mops_proxy',
+                fun(X) -> lists_utils:random(Val, maybe_eval(N, X)) end
+            };
+        [N] ->
+            lists_utils:random(Val, binary_to_integer(N));
+        _ ->
+            error({invalid_expression, Op})
+    end;
+apply_custom_op(<<"get(", _/binary>> = Op, {'$mops_proxy', F} = Val, _) when
+    is_function(F, 1)
+->
+    {'$mops_proxy', fun(X) -> apply_custom_op(Op, maybe_eval(Val, X), X) end};
+apply_custom_op(<<"get(", _/binary>> = Op, <<"$map">>, Ctxt) ->
+    apply_custom_op(Op, #{}, Ctxt);
+apply_custom_op(<<"get(", Rest/binary>> = Op, Val, Ctxt) when is_map(Val) ->
+    case [maybe_eval(K, Ctxt) || K <- get_arguments(Rest, Op, <<")">>)] of
+        [{'$mops_proxy', F} = Key] when is_function(F, 1) ->
+            {'$mops_proxy', fun(X) ->
+                safe_maps_get(maybe_eval(Key, X), Val)
+            end};
+        [Key] ->
+            safe_maps_get(Key, Val);
+        [{'$mops_proxy', _} = Key, {'$mops_proxy', _} = Default] ->
+            {'$mops_proxy', fun(X) ->
+                safe_maps_get(maybe_eval(Key, X), Val, maybe_eval(Default, X))
+            end};
+        [{'$mops_proxy', _} = Key, Default] ->
+            {'$mops_proxy', fun(X) ->
+                safe_maps_get(maybe_eval(Key, X), Val, Default)
+            end};
+        [Key, {'$mops_proxy', _} = Default] ->
+            {'$mops_proxy', fun(X) ->
+                safe_maps_get(Key, Val, maybe_eval(Default, X))
+            end};
+        [Key, Default] ->
+            safe_maps_get(Key, Val, Default);
+        _ ->
+            error({invalid_expression, Op})
+    end;
+apply_custom_op(<<"put(", _/binary>> = Op, <<"$map">>, Ctxt) ->
+    apply_custom_op(Op, #{}, Ctxt);
+apply_custom_op(<<"put(", _/binary>> = Op, {'$mops_proxy', F} = Val, _) when
+    is_function(F, 1)
+->
+    {'$mops_proxy', fun(X) -> apply_custom_op(Op, maybe_eval(Val, X), X) end};
+apply_custom_op(<<"put(", Rest/binary>> = Op, Map, Ctxt) when is_map(Map) ->
+    case [maybe_eval(K, Ctxt) || K <- get_arguments(Rest, Op, <<")">>)] of
+        [{'$mops_proxy', _} = Key, {'$mops_proxy', _} = Value] ->
+            {'$mops_proxy', fun(X) ->
+                maps:put(maybe_eval(Key, X), maybe_eval(Value, X), Map)
+            end};
+        [{'$mops_proxy', _} = Key, Value] ->
+            {'$mops_proxy', fun(X) ->
+                maps:put(maybe_eval(Key, X), Value, Map)
+            end};
+        [Key, {'$mops_proxy', _} = Value] ->
+            {'$mops_proxy', fun(X) ->
+                maps:put(Key, maybe_eval(Value, X), Map)
+            end};
+        [Key, Value] ->
+            maps:put(Key, Value, Map);
+        _ ->
+            error({invalid_expression, Op})
+    end;
+apply_custom_op(<<"merge(", Rest/binary>> = Op, Expr1, Ctxt) ->
+    EmptyMap = <<"$map">>,
+    Args =
+        case [maybe_eval(A, Ctxt) || A <- get_arguments(Rest, Op, <<")">>)] of
+            [EmptyMap] ->
+                {Expr1, #{}};
+            [Expr2] ->
+                {Expr1, Expr2};
+            [<<"_">>, EmptyMap] ->
+                {Expr1, #{}};
+            [<<"_">>, Expr2] ->
+                {Expr1, Expr2};
+            [EmptyMap, <<"_">>] ->
+                {#{}, Expr1};
+            [Expr2, <<"_">>] ->
+                {Expr2, Expr1};
+            _ ->
+                error({invalid_expression, Op})
+        end,
+    case Args of
+        {{'$mops_proxy', _} = L, {'$mops_proxy', _} = R} ->
+            {'$mops_proxy', fun(X) ->
+                maybe_merge(maybe_eval(L, X), maybe_eval(R, X))
+            end};
+        {{'$mops_proxy', _} = L, R} ->
+            {'$mops_proxy', fun(X) -> maybe_merge(maybe_eval(L, X), R) end};
+        {L, {'$mops_proxy', _} = R} ->
+            {'$mops_proxy', fun(X) -> maybe_merge(L, maybe_eval(R, X)) end};
+        {L, R} when is_map(L), is_map(R) ->
+            maps:merge(L, R);
+        _ ->
+            error({invalid_expression, Op})
+    end;
+apply_custom_op(<<"with(", _/binary>>, <<"$map">>, _) ->
+    #{};
+apply_custom_op(<<"without(", _/binary>>, <<"$map">>, _) ->
+    #{};
+apply_custom_op(<<"with(", _/binary>> = Op, {'$mops_proxy', _} = L, _) ->
+    {'$mops_proxy', fun(X) -> apply_custom_op(Op, maybe_eval(L, X), X) end};
+apply_custom_op(<<"without(", _/binary>> = Op, {'$mops_proxy', _} = L, _) ->
+    {'$mops_proxy', fun(X) -> apply_custom_op(Op, maybe_eval(L, X), X) end};
+apply_custom_op(<<"with([", Rest/binary>> = Op, Val, Ctxt) when is_map(Val) ->
+    Fold = fun(Arg, {L, R}) ->
+        case maybe_eval(Arg, Ctxt) of
+            {'$mops_proxy', _} = V ->
+                {L, [V | R]};
+            V ->
+                {[V | L], R}
+        end
+    end,
+    Args = get_arguments(Rest, Op, <<"])">>),
+    case lists:foldl(Fold, {[], []}, Args) of
+        {Ls, []} ->
+            maps:with(Ls, Val);
+        {Ls, Rs} ->
+            {'$mops_proxy', fun(X) ->
+                Keys = lists:append(Ls, [maybe_eval(R, X) || R <- Rs]),
+                maps:with(Keys, Val)
+            end}
+    end;
+apply_custom_op(<<"without([", Rest/binary>> = Op, Val, Ctxt) when
+    is_map(Val)
+->
+    Fold = fun(K, {L, R}) ->
+        case maybe_eval(K, Ctxt) of
+            {'$mops_proxy', _} = V ->
+                {L, [V | R]};
+            V ->
+                {[V | L], R}
+        end
+    end,
+    Args = get_arguments(Rest, Op, <<"])">>),
+    case lists:foldl(Fold, {[], []}, Args) of
+        {Ls, []} ->
+            maps:without(Ls, Val);
+        {Ls, Rs} ->
+            {'$mops_proxy', fun(X) ->
+                Keys = lists:append(Ls, [maybe_eval(R, X) || R <- Rs]),
+                maps:without(Keys, Val)
+            end}
+    end;
+apply_custom_op(Op, Val, _) ->
+    error({invalid_expression, [Op, Val]}).
+
+%% @private
+maybe_merge({'$mops_proxy', _} = L, {'$mops_proxy', _} = R) ->
+    {'$mops_proxy', fun(X) ->
+        maybe_merge(maybe_eval(L, X), maybe_eval(R, X))
+    end};
+maybe_merge({'$mops_proxy', _} = L, R) ->
+    {'$mops_proxy', fun(X) -> maybe_merge(maybe_eval(L, X), R) end};
+maybe_merge(L, {'$mops_proxy', _} = R) ->
+    {'$mops_proxy', fun(X) -> maybe_merge(L, maybe_eval(R, X)) end};
+maybe_merge(L, R) ->
+    maps:merge(L, R).
+
+%% @private
+maybe_eval({'$mops_proxy', T}, Ctxt) ->
+    do_eval(T, Ctxt);
+maybe_eval(Term, Ctxt) when is_binary(Term) ->
+    case unquote(Term) of
+        {true, Key} ->
+            Key;
+        {false, Expr} ->
+            do_eval(Expr, Ctxt)
+    end;
+maybe_eval(Term, _Ctxt) ->
+    Term.
+
+%% @private
+unquote(<<$', Rest/binary>>) ->
+    {true, binary:part(Rest, {0, byte_size(Rest) - 1})};
+unquote(Other) ->
+    {false, Other}.
+
+%% @private
+get_arguments(Rest, Op, Terminal) ->
+    case split_unquoted(Rest, Terminal) of
+        {ok, [Args, <<>>]} ->
+            {ok, Parts} = split_unquoted(Args, <<$,>>),
+            [Part || Part <- Parts, Part =/= <<>>];
+        {ok, _} ->
+            error({invalid_expression, Op})
+    end.
+
+%% @private
+split_unquoted(Bin, Sep) ->
+    split_unquoted(Bin, Sep, false, <<>>, []).
+
+split_unquoted(<<>>, _, false, Part, Acc) ->
+    {ok, lists:reverse([Part | Acc])};
+split_unquoted(<<>>, _, true, _, _) ->
+    error;
+split_unquoted(<<$', Rest/binary>>, Sep, Quoted, Part, Acc) ->
+    split_unquoted(Rest, Sep, not Quoted, <<Part/binary, $'>>, Acc);
+split_unquoted(<<C, Rest/binary>> = Bin, Sep, Quoted, Part, Acc) ->
+    Size = byte_size(Sep),
+    case Bin of
+        <<Sep:Size/binary, After/binary>> when not Quoted ->
+            split_unquoted(After, Sep, false, <<>>, [Part | Acc]);
+        _ ->
+            split_unquoted(Rest, Sep, Quoted, <<Part/binary, C>>, Acc)
+    end.
+
+%% @private
+term_to_iolist(Term) when is_binary(Term) ->
+    Term;
+term_to_iolist(Term) when is_list(Term) ->
+    Term;
+term_to_iolist(Term) ->
+    io_lib:format("~p", [Term]).
+
+maybe_trim(<<$", _Rest/binary>> = Bin) ->
+    Bin;
+maybe_trim(Bin) ->
+    trim(Bin).
+
+%% @private
+trim(Bin) ->
+    trim(Bin, false, <<>>).
+
+trim(<<$', Rest/binary>>, Quoted, Acc) ->
+    trim(Rest, not Quoted, <<Acc/binary, $'>>);
+trim(<<C, Rest/binary>>, false, Acc) when C =:= $\s; C =:= $\t ->
+    trim(Rest, false, Acc);
+trim(<<C, Rest/binary>>, Quoted, Acc) ->
+    trim(Rest, Quoted, <<Acc/binary, C>>);
+trim(<<>>, _, Acc) ->
+    Acc.
+
+%% @private
+safe_binary_to_float(Val) ->
+    try
+        binary_to_float(Val)
+    catch
+        error:badarg ->
+            float(binary_to_integer(Val))
+    end.
+
+%% @private
+safe_binary_to_integer(Val) ->
+    try
+        binary_to_integer(Val)
+    catch
+        error:badarg ->
+            trunc(binary_to_float(Val))
+    end.
+
+%% @private
+safe_list_to_float(Val) ->
+    try
+        list_to_float(Val)
+    catch
+        error:badarg ->
+            float(list_to_integer(Val))
+    end.
+
+%% @private
+safe_list_to_integer(Val) ->
+    try
+        list_to_integer(Val)
+    catch
+        error:badarg ->
+            trunc(list_to_float(Val))
+    end.
+
+maybe_callback(Event, Path, #{'$mops_callback' := Fun}) when
+    is_function(Fun, 2)
+->
+    Fun(Event, Path);
+maybe_callback(Event, Path, #{'$mops_callback' := Mod}) when is_atom(Mod) ->
+    Mod:Event(Path);
+maybe_callback(_, Path, _) ->
+    Path.

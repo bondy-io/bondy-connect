@@ -13,8 +13,6 @@
 %%% ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 %%% OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 %%%
-%%% @doc Email Mailgun Adapter
-%%% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 -module(email_adapter_mailgun2).
 
@@ -35,18 +33,15 @@ and `application/x-www-form-urlencoded` body encoding.
 
 -behaviour(email_adapter).
 
-
 -record(state, {
     apiurl :: string(),
     apikey :: string()
 }).
 
-
 -define(EMAIL_API_PATH(ApiUrl), ApiUrl ++ "/messages").
 -define(EMAIL_API_AUTH_HEADER(ApiKey), [
     {"Authorization",
-        "Basic " ++ base64:encode_to_string(lists:append(["api:", ApiKey]))
-    }
+        "Basic " ++ base64:encode_to_string(lists:append(["api:", ApiKey]))}
 ]).
 
 -define(FORM_URL_ENCODED, "application/x-www-form-urlencoded").
@@ -60,24 +55,18 @@ and `application/x-www-form-urlencoded` body encoding.
     {full_result, false}
 ]).
 
-
 -export([start/0]).
 -export([start/1]).
 -export([stop/1]).
 -export([send/6]).
 
-
-
 %% =============================================================================
 %% API
 %% =============================================================================
 
-
-
 -doc "Start the adapter with default options.".
 start() ->
     start([]).
-
 
 -doc """
 Start the adapter.
@@ -97,13 +86,11 @@ start(Options) ->
     ApiUrl = proplists:get_value(apiurl, Options),
     ApiKey = proplists:get_value(apikey, Options),
 
-    {ok, #state{apiurl=ApiUrl ++ "/" ++ Domain, apikey=ApiKey}}.
-
+    {ok, #state{apiurl = ApiUrl ++ "/" ++ Domain, apikey = ApiKey}}.
 
 -doc false.
 stop(_Conn) ->
     ok.
-
 
 -doc """
 Send an email through the Mailgun API.
@@ -113,16 +100,16 @@ sends it via `httpc`.
 """.
 send(Conn, {ToEmail, ToEmail}, {FromName, FromEmail}, Subject, Message, Opt) ->
     send(Conn, {<<>>, ToEmail}, {FromName, FromEmail}, Subject, Message, Opt);
-
 send(Conn, {ToName, ToEmail}, {FromEmail, FromEmail}, Subject, Message, Opt) ->
     send(Conn, {ToName, ToEmail}, {<<>>, FromEmail}, Subject, Message, Opt);
-
 send(Conn, {ToName, ToEmail}, {FromName, FromEmail}, Subject, Message, Opt) ->
     Body0 = [
         {<<"to">>, <<ToName/binary, $<, ToEmail/binary, $>>>},
-        {<<"from">>, <<FromName/binary, $<, FromEmail/binary, $>>>}, {<<"subject">>, Subject}
+        {<<"from">>, <<FromName/binary, $<, FromEmail/binary, $>>>},
+        {<<"subject">>, Subject}
     ],
-    Request = construct_request(Conn,
+    Request = construct_request(
+        Conn,
         add_message(Message, lists:merge(Opt, Body0))
     ),
 
@@ -146,29 +133,15 @@ send(Conn, {ToName, ToEmail}, {FromName, FromEmail}, Subject, Message, Opt) ->
             {error, timeout}
     end.
 
-
-
 %% =============================================================================
 %% PRIVATE
 %% =============================================================================
 
-
-
-%% -----------------------------------------------------------------------------
 %% @private
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
-add_message([], Body)    -> Body;
+add_message([], Body) -> Body;
+add_message([H | T], Body) -> add_message(T, [H | Body]).
 
-add_message([H|T], Body) -> add_message(T, [H|Body]).
-
-
-%% -----------------------------------------------------------------------------
 %% @private
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
 construct_request(Conn, Body) ->
     {
         ?EMAIL_API_PATH(Conn#state.apiurl),
@@ -177,73 +150,52 @@ construct_request(Conn, Body) ->
         url_encode(Body)
     }.
 
-
-%% -----------------------------------------------------------------------------
 %% @private
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
 url_encode(Data) ->
     url_encode(Data, <<"">>).
 
-
-%% -----------------------------------------------------------------------------
 %% @private
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
 url_encode([], Acc) ->
     Acc;
-
 url_encode([{Key, Value} | T], <<"">>) ->
-    url_encode(T,
+    url_encode(
+        T,
         <<(escape_uri(Key))/binary, $=, (escape_uri(Value))/binary>>
     );
-                
 url_encode([{Key, Value} | T], Acc) ->
-    url_encode(T,
+    url_encode(
+        T,
         <<Acc/binary, $&, (escape_uri(Key))/binary, $=,
-        (escape_uri(Value))/binary>>
+            (escape_uri(Value))/binary>>
     ).
 
-
-%% -----------------------------------------------------------------------------
 %% @private
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
 escape_uri(S) when is_list(S) ->
     escape_uri(unicode:characters_to_binary(S), <<>>);
-
 escape_uri(B) ->
     escape_uri(B, <<>>).
 
-
-%% -----------------------------------------------------------------------------
 %% @private
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
 escape_uri(<<C, Rest/binary>>, Acc) ->
-    if  C >= $0, C =< $9 -> escape_uri(Rest, <<Acc/binary, C>>);
-        C >= $A, C =< $Z -> escape_uri(Rest, <<Acc/binary, C>>);
-        C >= $a, C =< $z -> escape_uri(Rest, <<Acc/binary, C>>);
-        C =:= $          -> escape_uri(Rest, <<Acc/binary, $+>>);
+    if
+        C >= $0, C =< $9 ->
+            escape_uri(Rest, <<Acc/binary, C>>);
+        C >= $A, C =< $Z ->
+            escape_uri(Rest, <<Acc/binary, C>>);
+        C >= $a, C =< $z ->
+            escape_uri(Rest, <<Acc/binary, C>>);
+        C =:= $\s ->
+            escape_uri(Rest, <<Acc/binary, $+>>);
         C =:= $.; C =:= $-; C =:= $~; C =:= $_ ->
             escape_uri(Rest, <<Acc/binary, C>>);
         true ->
-            H = C band 16#F0 bsr 4, L = C band 16#0F,
+            H = C band 16#F0 bsr 4,
+            L = C band 16#0F,
             escape_uri(Rest, <<Acc/binary, $%, (tohexl(H)), (tohexl(L))>>)
     end;
-
 escape_uri(<<>>, Acc) ->
     Acc.
 
-
-%% -----------------------------------------------------------------------------
 %% @private
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
 tohexl(C) when C < 10 -> $0 + C;
 tohexl(C) when C < 17 -> $a + C - 10.

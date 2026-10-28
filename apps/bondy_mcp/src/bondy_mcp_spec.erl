@@ -1,0 +1,435 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_mcp_spec).
+
+-moduledoc """
+The compiled MCP manifest entry: the projection of one realm's interface
+metadata (`bondy_interface`, the base layer) joined with the MCP overlay
+documents (`bondy_mcp_spec_parser`, the naming/annotation layer) — the
+"one way out".
+
+`compile/3` derives the manifest of one realm. What the interface layer
+CREATES depends on the mode (`mcp.manifest.mode`; see `compile/3`'s doc):
+under `curated` — the shipped default — nothing, only overlay-named
+entries exist; under `derived`:
+
+- every EXACT-match `procedure` interface entry becomes a `tool` named by
+  its WAMP URI (the default name), unless an overlay tool entry claims that
+  procedure — a claim REPLACES the URI-named base entry, which is what
+  makes an overlay rename a rename rather than an added alias;
+- every exact-match `topic` interface entry becomes a `resource` at the
+  default URI `wamp:<realm>:<topic>`;
+
+In both modes:
+- overlay entries stand on their own, joining the interface entry of their
+  `wamp_procedure` (when one exists) field by field: an overlay field wins,
+  an absent one falls through to the interface layer;
+- two surviving entries claiming one name with DIFFERENT underlying WAMP
+  bindings are BOTH skipped and reported in `collisions` — the
+  caller raises the alarm; identical bindings from two documents
+  keep the entry from the lexicographically first document, so the result
+  is deterministic.
+
+Each compiled entry carries `hash`: a SHA-256 over its NORMATIVE content —
+name, kind, the flattened schemas, the WAMP binding and the annotations
+— so drift is visible and an operator can pin a tool to the exact
+content a security review saw. `description`, `version` and provenance are
+deliberately outside the hash: prose can be corrected without re-approving
+the tool. The canonical byte form is `term_to_binary/2` with
+`deterministic` (the `bondy_db_manifest:fingerprint/1` precedent): stable
+for one OTP release; an OTP major upgrade may re-key hashes, which surfaces
+as visible drift, never as silent acceptance.
+
+Schemas are flattened symmetrically for input and output: a
+kwargs-only shape passes through, an args-only shape wraps under the
+reserved `@args` key, a mixed shape merges `@args` into the kwargs
+properties.
+""".
+
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+
+%% The normative content: what `hash/1` covers. Everything else on a
+%% compiled entry (realm, description, version, source) may change without
+%% changing the hash.
+-define(NORMATIVE_KEYS, [
+    name,
+    kind,
+    procedure,
+    topic,
+    uri,
+    uri_template,
+    uri_vars_schema,
+    wamp_args,
+    wamp_kwargs,
+    update_topic,
+    wamp_options,
+    annotations,
+    input_schema,
+    output_schema
+]).
+
+-type kind() :: tool | resource | resource_template.
+-type t() :: #{
+    realm := uri(),
+    name := binary(),
+    kind := kind(),
+    hash := binary(),
+    annotations := map(),
+    wamp_options := map(),
+    source := #{interface => binary(), overlay => binary()},
+    procedure => uri(),
+    topic => uri(),
+    uri => binary(),
+    uri_template => binary(),
+    uri_vars_schema => map(),
+    wamp_args => list(),
+    wamp_kwargs => map(),
+    update_topic => binary(),
+    description => binary(),
+    version => binary(),
+    input_schema => map(),
+    output_schema => map(),
+    %% The audit redaction policy. Deliberately OUTSIDE ?NORMATIVE_KEYS:
+    %% the hash covers the tool's contract, not its capture policy, so a
+    %% capture-policy change does not re-key the tool. Whether it SHOULD —
+    %% a security review arguably approves the redaction posture too — is
+    %% an open design ruling, recorded in the design doc.
+    redaction => #{fields := [binary()]}
+}.
+-type collision() :: #{
+    realm := uri(),
+    name := binary(),
+    bindings := [uri()]
+}.
+
+-export_type([t/0]).
+-export_type([collision/0]).
+
+-export([compile/3]).
+-export([hash/1]).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-doc """
+Compiles the manifest of `RealmUri` from the interface store joined with
+`OverlayEntries` — the parsed entries of every loaded overlay document that
+name this realm, each annotated by the caller with `overlay_source` (its
+document id). Reads `bondy_db` only; contacts no peer.
+
+`Mode` decides what the interface layer CREATES (it always contributes
+fields to the join):
+
+- `curated` (the shipped default): only overlay-named entries
+  exist. Describing a procedure or topic for reflection is not consent to
+  agent exposure — the overlay is the explicit act, the same posture
+  upstream tool projection has always had.
+- `derived`: every exact-match `procedure` interface entry additionally
+  becomes a tool named by its URI, and every exact-match `topic` a
+  resource at the default URI.
+
+Falsifier:
+`bondy_mcp_gateway_SUITE:curated_mode_exposes_only_overlay_entries`.
+""".
+-spec compile(
+    RealmUri :: uri(),
+    OverlayEntries :: [map()],
+    Mode :: curated | derived
+) ->
+    #{entries := #{binary() => t()}, collisions := [collision()]}.
+
+compile(RealmUri, OverlayEntries, Mode) ->
+    Procedures = interface_entries(RealmUri, procedure),
+    Topics = interface_entries(RealmUri, topic),
+
+    %% An overlay tool entry claiming a procedure — or a resource entry
+    %% claiming a topic — replaces the URI-named base entry compiled
+    %% from that binding's interface entry.
+    %%
+    %% Both claim sets are MAPS, not lists: under `derived` the two
+    %% comprehensions below run once per interface entry, so a membership
+    %% test that scans would make the rebuild O(entries x overlay) —
+    %% quadratic in the two things an operator grows.
+    Claimed = maps:from_keys(
+        [
+            maps:get(wamp_procedure, O)
+         || O <- OverlayEntries, maps:get(kind, O) == tool
+        ],
+        []
+    ),
+    ClaimedTopics = maps:from_keys(
+        [
+            maps:get(wamp_topic, O)
+         || O <- OverlayEntries, maps:get(kind, O) == resource
+        ],
+        []
+    ),
+    BaseTools = [
+        base_tool(RealmUri, E)
+     || Mode == derived,
+        {Uri, E} <- maps:to_list(Procedures),
+        not is_map_key(Uri, Claimed)
+    ],
+    BaseResources = [
+        base_resource(RealmUri, E)
+     || Mode == derived,
+        {Uri, E} <- maps:to_list(Topics),
+        not is_map_key(Uri, ClaimedTopics)
+    ],
+    Overlaid = [
+        overlay_entry(RealmUri, O, Procedures, Topics)
+     || O <- OverlayEntries
+    ],
+    {Entries, Collisions} = resolve_names(
+        BaseTools ++ BaseResources ++ Overlaid
+    ),
+    #{
+        entries => maps:from_list([
+            {maps:get(name, E), with_hash(E)}
+         || E <- Entries
+        ]),
+        collisions => Collisions
+    }.
+
+-doc """
+The content-addressed hash of a compiled entry: `<<"sha256:...">>`
+(lowercase hex) over the entry's normative fields.
+""".
+-spec hash(t() | map()) -> binary().
+
+hash(Entry) when is_map(Entry) ->
+    Normative = maps:with(?NORMATIVE_KEYS, Entry),
+    Digest = crypto:hash(
+        sha256, term_to_binary(Normative, [deterministic])
+    ),
+    <<"sha256:", (binary:encode_hex(Digest, lowercase))/binary>>.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+%% The realm's exact-match interface entries of `Kind`, as `Uri => Entry`.
+%% Prefix / wildcard entries describe pattern registrations; MCP's surface
+%% is callable-by-exact-URI, so they do not project.
+interface_entries(RealmUri, Kind) ->
+    maps:from_list([
+        {maps:get(uri, E), E}
+     || E <- bondy_interface:list(RealmUri, Kind),
+        maps:get(match_policy, E) == ?EXACT_MATCH
+    ]).
+
+%% @private
+base_tool(RealmUri, Iface) ->
+    Uri = maps:get(uri, Iface),
+    finish(
+        RealmUri,
+        #{
+            name => Uri,
+            kind => tool,
+            procedure => Uri,
+            annotations => #{},
+            wamp_options => #{},
+            source => #{interface => maps:get(source, Iface)}
+        },
+        Iface,
+        #{}
+    ).
+
+%% @private
+base_resource(RealmUri, Iface) ->
+    Uri = maps:get(uri, Iface),
+    E = #{
+        realm => RealmUri,
+        name => Uri,
+        kind => resource,
+        topic => Uri,
+        uri => <<"wamp:", RealmUri/binary, ":", Uri/binary>>,
+        annotations => #{},
+        wamp_options => #{},
+        source => #{interface => maps:get(source, Iface)}
+    },
+    %% A topic's payload schemas describe what a subscriber RECEIVES, so
+    %% they flatten into the resource's output shape.
+    E1 = maybe_put(description, maps:get(description, Iface, undefined), E),
+    E2 = maybe_put(version, maps:get(version, Iface, undefined), E1),
+    E3 = maybe_put(
+        output_schema,
+        flatten(
+            maps:get(args_schema, Iface, undefined),
+            maps:get(kwargs_schema, Iface, undefined)
+        ),
+        E2
+    ),
+    E3.
+
+%% @private
+%% One overlay entry joined with the interface entry of its WAMP binding
+%% (a procedure, or for `resource` a topic): overlay fields win, absent
+%% ones fall through.
+overlay_entry(RealmUri, #{kind := resource} = O, _Procedures, Topics) ->
+    Topic = maps:get(wamp_topic, O),
+    Iface = maps:get(Topic, Topics, #{}),
+    E0 = #{
+        name => maps:get(name, O),
+        kind => resource,
+        topic => Topic,
+        uri => <<"wamp:", RealmUri/binary, ":", Topic/binary>>,
+        annotations => maps:get(annotations, O, #{}),
+        wamp_options => maps:get(wamp_options, O, #{}),
+        source => maybe_put(
+            interface,
+            maps:get(source, Iface, undefined),
+            #{overlay => maps:get(overlay_source, O)}
+        )
+    },
+    E1 = maybe_put(redaction, maps:get(redaction, O, undefined), E0),
+    Layered = fun(Key) ->
+        case maps:get(Key, O, undefined) of
+            undefined -> maps:get(Key, Iface, undefined);
+            Value -> Value
+        end
+    end,
+    E2 = maybe_put(description, Layered(description), E1),
+    E3 = maybe_put(version, Layered(version), E2),
+    E4 = maybe_put(
+        output_schema,
+        flatten(Layered(args_schema), Layered(kwargs_schema)),
+        E3
+    ),
+    E4#{realm => RealmUri};
+overlay_entry(RealmUri, O, Procedures, _Topics) ->
+    Procedure = maps:get(wamp_procedure, O),
+    Iface = maps:get(Procedure, Procedures, #{}),
+    E0 = #{
+        name => maps:get(name, O),
+        kind => maps:get(kind, O),
+        procedure => Procedure,
+        annotations => maps:get(annotations, O, #{}),
+        wamp_options => maps:get(wamp_options, O, #{}),
+        source => maybe_put(
+            interface,
+            maps:get(source, Iface, undefined),
+            #{overlay => maps:get(overlay_source, O)}
+        )
+    },
+    E01 = maybe_put(redaction, maps:get(redaction, O, undefined), E0),
+    E1 =
+        case maps:get(kind, O) of
+            tool ->
+                E01;
+            resource_template ->
+                E2 = E01#{
+                    uri_template => maps:get(uri_template, O),
+                    uri_vars_schema => maps:get(uri_vars_schema, O),
+                    wamp_args => maps:get(wamp_args, O),
+                    wamp_kwargs => maps:get(wamp_kwargs, O)
+                },
+                maybe_put(
+                    update_topic, maps:get(update_topic, O, undefined), E2
+                )
+        end,
+    finish(RealmUri, E1, Iface, O).
+
+%% @private
+%% Layered fields plus the flattened schemas. `Over` (the overlay entry)
+%% wins per field; `Iface` (the interface entry) supplies the rest.
+finish(RealmUri, E0, Iface, Over) ->
+    Layered = fun(Key) ->
+        case maps:get(Key, Over, undefined) of
+            undefined -> maps:get(Key, Iface, undefined);
+            Value -> Value
+        end
+    end,
+    E1 = maybe_put(description, Layered(description), E0),
+    E2 = maybe_put(version, Layered(version), E1),
+    E3 = maybe_put(
+        input_schema,
+        flatten(Layered(args_schema), Layered(kwargs_schema)),
+        E2
+    ),
+    E4 = maybe_put(
+        output_schema,
+        flatten(Layered(result_args_schema), Layered(result_kwargs_schema)),
+        E3
+    ),
+    E4#{realm => RealmUri}.
+
+%% @private
+%% Flattening: kwargs-only passes through; args-only wraps under `@args`;
+%% mixed merges `@args` into the kwargs properties.
+flatten(undefined, undefined) ->
+    undefined;
+flatten(undefined, KwargsSchema) ->
+    KwargsSchema;
+flatten(ArgsSchema, undefined) ->
+    #{
+        <<"type">> => <<"object">>,
+        <<"properties">> => #{<<"@args">> => ArgsSchema},
+        <<"required">> => [<<"@args">>]
+    };
+flatten(ArgsSchema, KwargsSchema) ->
+    Props = maps:get(<<"properties">>, KwargsSchema, #{}),
+    KwargsSchema#{
+        <<"properties">> => Props#{<<"@args">> => ArgsSchema}
+    }.
+
+%% @private
+maybe_put(_, undefined, Map) -> Map;
+maybe_put(Key, Value, Map) -> Map#{Key => Value}.
+
+%% @private
+%% One name, several entries. Different underlying bindings — the
+%% collision an agent must never be exposed to — skips them ALL and reports;
+%% identical bindings from two documents keep the first by document id.
+resolve_names(Candidates) ->
+    ByName = lists:foldl(
+        fun(E, Acc) ->
+            maps:update_with(
+                maps:get(name, E), fun(L) -> [E | L] end, [E], Acc
+            )
+        end,
+        #{},
+        Candidates
+    ),
+    maps:fold(
+        fun
+            (_, [E], {Es, Cs}) ->
+                {[E | Es], Cs};
+            (Name, Es0, {Es, Cs}) ->
+                case lists:usort([binding(E) || E <- Es0]) of
+                    [_] ->
+                        Sorted = lists:sort(
+                            fun(A, B) -> doc_of(A) =< doc_of(B) end, Es0
+                        ),
+                        {[hd(Sorted) | Es], Cs};
+                    Bindings ->
+                        Collision = #{
+                            realm => maps:get(realm, hd(Es0)),
+                            name => Name,
+                            bindings => Bindings
+                        },
+                        {Es, [Collision | Cs]}
+                end
+        end,
+        {[], []},
+        ByName
+    ).
+
+%% @private
+%% The underlying WAMP binding a name resolves to — what the collision
+%% rule compares.
+binding(#{procedure := P}) -> P;
+binding(#{topic := T}) -> T.
+
+%% @private
+doc_of(#{source := #{overlay := Id}}) -> Id;
+doc_of(_) -> <<>>.
+
+%% @private
+with_hash(E) ->
+    E#{hash => hash(E)}.

@@ -1,0 +1,1862 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_registry_SUITE).
+-include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
+
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("bondy.hrl").
+-include("bondy_db_tables.hrl").
+-include("bondy_security.hrl").
+-include("bondy_registry.hrl").
+
+-define(SORT(L), lists:sort(L)).
+
+-compile([nowarn_export_all, export_all]).
+
+all() ->
+    [
+        {group, rpc},
+        {group, pubsub},
+        {group, pagination}
+    ].
+
+groups() ->
+    [
+        {rpc, [sequence], [
+            register_invoke_single,
+            concurrent_single_registrations_admit_one,
+            register_shared,
+            register_callback,
+            pattern_based_registration_is_not_optional,
+            registry_rib_dual_write,
+            rib_completion_selects_local,
+            rib_completion_no_local_fails_fast,
+            forwarded_call_to_a_crashing_callback_is_answered,
+            local_call_to_a_crashing_callback_is_answered,
+            rib_restate_stale_cell,
+            rib_retry_local_win,
+            rib_retry_next_node,
+            rib_retry_exhausted,
+            rib_retry_requires_marker,
+            rib_metrics_surface,
+            rib_restored_after_storage_owner_death,
+            rib_restored_after_instance_death,
+            rib_restored_after_catalogue_restart,
+            rib_restored_after_registry_restart_during_reopen,
+            rib_check_survives_a_closed_registry_db
+        ]},
+        {pubsub, [sequence], [
+            sub_add_local_exact_1,
+            sub_add_local_exact_2,
+            sub_add_local_prefix_1,
+            sub_add_local_prefix_2,
+            sub_add_local_wildcard_1,
+            sub_add_local_wildcard_,
+            sub_del_local_exact_1,
+            sub_del_local_exact_2,
+            sub_session_death_cleans_registry,
+            sub_same_uri_multiple_policies,
+            sub_sessionless_refs,
+            remove_all_runs_task_once_per_entry,
+            partition_pick_recovers_after_crash
+        ]},
+        {pagination, [sequence], [
+            subscription_pages_reach_every_entry,
+            registration_pages_reach_every_entry
+        ]}
+    ].
+
+init_per_suite(Config) ->
+    bondy_ct:start_bondy(),
+    Realm = bondy_realm:create(<<"com.foobar">>),
+    RealmUri = bondy_realm:uri(Realm),
+    ok = bondy_realm:disable_security(Realm),
+    Peer = {{127, 0, 0, 1}, 10000},
+    Session = bondy_session:new(RealmUri, #{
+        peer => Peer,
+        authid => <<"foo">>,
+        authmethod => ?WAMP_ANON_AUTH,
+        is_anonymous => true,
+        security_enabled => true,
+        authroles => [<<"anonymous">>],
+        roles => #{
+            caller => #{},
+            subscriber => #{}
+        }
+    }),
+    Ctxt = bondy_context:new(Peer, {ws, text, json}, #{session => Session}),
+
+    [
+        {context, Ctxt},
+        {realm_uri, RealmUri}
+        | Config
+    ].
+
+end_per_suite(Config) ->
+    meck:unload(),
+    {save_config, Config}.
+
+%% =============================================================================
+%% PUBSUB
+%% =============================================================================
+
+sub_add_local_exact_1(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Ctxt = key_value:get(context, Config),
+    Type = subscription,
+    Opts = #{match => ?EXACT_MATCH},
+    Uri = <<"com.foo.bar">>,
+
+    add_subscription_test(Type, RealmUri, Uri, Opts, Ctxt),
+
+    Expected = {[{Uri, ?EXACT_MATCH}], []},
+
+    ?assertEqual(
+        Expected,
+        project(bondy_registry:find_matches(Type, RealmUri, Uri)),
+        "The trie should have the added entries. Remote subs should be empty"
+    ),
+
+    ?assertEqual(
+        {[], []},
+        bondy_registry:find_matches(Type, RealmUri, <<"com.foo.baz">>, #{}),
+        "Should not match com.foo.baz"
+    ).
+
+sub_add_local_exact_2(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Ctxt = key_value:get(context, Config),
+    Type = subscription,
+    Opts = #{match => ?EXACT_MATCH},
+    Uri = <<"com.foo.baz">>,
+
+    add_subscription_test(Type, RealmUri, Uri, Opts, Ctxt),
+
+    Expected = {[{Uri, ?EXACT_MATCH}], []},
+
+    ?assertEqual(
+        Expected,
+        project(bondy_registry:find_matches(Type, RealmUri, Uri)),
+        "The trie should have the added entries. Remote subs should be empty"
+    ),
+
+    Expected2 = {[{<<"com.foo.bar">>, ?EXACT_MATCH}], []},
+
+    ?assertEqual(
+        Expected2,
+        project(
+            bondy_registry:find_matches(Type, RealmUri, <<"com.foo.bar">>, #{})
+        ),
+        "Should match com.foo.bar"
+    ),
+
+    ?assertEqual(
+        {[], []},
+        bondy_registry:find_matches(Type, RealmUri, <<"com.foo.other">>, #{})
+    ).
+
+sub_add_local_prefix_1(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Ctxt = key_value:get(context, Config),
+    Type = subscription,
+    Opts = #{match => ?PREFIX_MATCH},
+    Uri = <<"com.foo">>,
+
+    add_subscription_test(Type, RealmUri, Uri, Opts, Ctxt),
+
+    Expected = {[{Uri, ?PREFIX_MATCH}], []},
+
+    ?assertEqual(
+        Expected,
+        project(bondy_registry:find_matches(Type, RealmUri, Uri)),
+        "We should match the prefix"
+    ),
+
+    ?assertEqual(
+        {
+            ?SORT([
+                {<<"com.foo.bar">>, ?EXACT_MATCH},
+                {<<"com.foo">>, ?PREFIX_MATCH}
+            ]),
+            []
+        },
+        project(bondy_registry:find_matches(Type, RealmUri, <<"com.foo.bar">>)),
+        "The trie should have the added entries. Remote subs should be empty"
+    ),
+
+    ?assertEqual(
+        {
+            ?SORT([
+                {<<"com.foo.baz">>, ?EXACT_MATCH},
+                {<<"com.foo">>, ?PREFIX_MATCH}
+            ]),
+            []
+        },
+        project(bondy_registry:find_matches(Type, RealmUri, <<"com.foo.baz">>)),
+        "The trie should have the added entries. Remote subs should be empty"
+    ),
+
+    ?assertEqual(
+        Expected,
+        project(
+            bondy_registry:find_matches(Type, RealmUri, <<"com.foo.other">>)
+        ),
+        "The trie match any subs starting with com.foo"
+    ).
+
+sub_add_local_prefix_2(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Ctxt = key_value:get(context, Config),
+    Type = subscription,
+
+    add_subscription_test(
+        Type, RealmUri, <<"com.a">>, #{match => ?PREFIX_MATCH}, Ctxt
+    ),
+
+    ?assertEqual(
+        {
+            ?SORT([
+                {<<"com.a">>, ?PREFIX_MATCH}
+            ]),
+            []
+        },
+        project(
+            bondy_registry:find_matches(subscription, RealmUri, <<"com.a">>)
+        )
+    ),
+
+    add_subscription_test(
+        Type, RealmUri, <<"com.a">>, #{match => ?EXACT_MATCH}, Ctxt
+    ),
+
+    ?assertEqual(
+        {
+            ?SORT([
+                {<<"com.a">>, ?EXACT_MATCH}, {<<"com.a">>, ?PREFIX_MATCH}
+            ]),
+            []
+        },
+        project(
+            bondy_registry:find_matches(subscription, RealmUri, <<"com.a">>)
+        )
+    ),
+
+    add_subscription_test(
+        Type, RealmUri, <<"com.a.b">>, #{match => ?PREFIX_MATCH}, Ctxt
+    ),
+
+    ?assertEqual(
+        {
+            ?SORT([
+                {<<"com.a">>, ?PREFIX_MATCH}, {<<"com.a.b">>, ?PREFIX_MATCH}
+            ]),
+            []
+        },
+        project(
+            bondy_registry:find_matches(subscription, RealmUri, <<"com.a.b">>)
+        )
+    ),
+
+    ?assertEqual(
+        {
+            ?SORT([
+                {<<"com.a">>, ?PREFIX_MATCH}, {<<"com.a.b">>, ?PREFIX_MATCH}
+            ]),
+            []
+        },
+        project(
+            bondy_registry:find_matches(
+                subscription, RealmUri, <<"com.a.b.c.d">>
+            )
+        )
+    ).
+
+sub_add_local_wildcard_1(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Ctxt = key_value:get(context, Config),
+    Type = subscription,
+    Opts = #{match => ?WILDCARD_MATCH},
+
+    add_subscription_test(Type, RealmUri, <<"com.">>, Opts, Ctxt),
+
+    ?assertEqual(
+        {
+            ?SORT([
+                {<<"com.">>, ?WILDCARD_MATCH},
+                {<<"com.a">>, ?EXACT_MATCH},
+                {<<"com.a">>, ?PREFIX_MATCH}
+            ]),
+            []
+        },
+        project(
+            bondy_registry:find_matches(subscription, RealmUri, <<"com.a">>)
+        )
+    ),
+
+    ?assertEqual(
+        {?SORT([{<<"com.">>, ?WILDCARD_MATCH}]), []},
+        project(
+            bondy_registry:find_matches(subscription, RealmUri, <<"com.b">>)
+        )
+    ),
+
+    ?assertEqual(
+        {?SORT([{<<"com.">>, ?WILDCARD_MATCH}]), []},
+        project(
+            bondy_registry:find_matches(subscription, RealmUri, <<"com.bar">>)
+        )
+    ),
+
+    ?assertEqual(
+        {
+            ?SORT([
+                {<<"com.a">>, ?PREFIX_MATCH},
+                {<<"com.a.b">>, ?PREFIX_MATCH}
+            ]),
+            []
+        },
+        project(
+            bondy_registry:find_matches(subscription, RealmUri, <<"com.a.b">>)
+        )
+    ),
+
+    ?assertEqual(
+        {
+            ?SORT([{<<"com.a">>, ?PREFIX_MATCH}, {<<"com.a.b">>, ?PREFIX_MATCH}]),
+            []
+        },
+        project(
+            bondy_registry:find_matches(
+                subscription, RealmUri, <<"com.a.b.c.d">>
+            )
+        )
+    ),
+
+    add_subscription_test(Type, RealmUri, <<"....">>, Opts, Ctxt),
+
+    add_subscription_test(Type, RealmUri, <<"com....">>, Opts, Ctxt),
+
+    add_subscription_test(Type, RealmUri, <<".a...">>, Opts, Ctxt),
+
+    add_subscription_test(Type, RealmUri, <<"..b..">>, Opts, Ctxt),
+
+    add_subscription_test(Type, RealmUri, <<"...c.">>, Opts, Ctxt),
+
+    add_subscription_test(Type, RealmUri, <<"....d">>, Opts, Ctxt),
+
+    ?assertEqual(
+        {
+            ?SORT([
+                {<<"....">>, ?WILDCARD_MATCH},
+                {<<"com....">>, ?WILDCARD_MATCH},
+                {<<"....d">>, ?WILDCARD_MATCH},
+                {<<".a...">>, ?WILDCARD_MATCH},
+                {<<"..b..">>, ?WILDCARD_MATCH},
+                {<<"...c.">>, ?WILDCARD_MATCH},
+                {<<"com.a">>, ?PREFIX_MATCH},
+                {<<"com.a.b">>, ?PREFIX_MATCH}
+            ]),
+            []
+        },
+        project(
+            bondy_registry:find_matches(
+                subscription, RealmUri, <<"com.a.b.c.d">>
+            )
+        )
+    ).
+
+sub_add_local_wildcard_(Config) ->
+    Config.
+
+sub_del_local_exact_1(Config) ->
+    Config.
+
+sub_del_local_exact_2(Config) ->
+    Config.
+
+%% The subscription-side counterpart of
+%% `bondy_http_connector_callee_lifecycle_SUITE:callee_death_cleans_registry/1`
+%% (registration side). A subscriber's session dying (a killed connection
+%% process) must trigger the SAME `bondy_session_manager` DOWN handler ->
+%% `bondy_router:flush/2` -> `bondy_broker:flush/2` -> registry `remove_all`
+%% chain, or every disconnect of a subscribe-heavy load leaves orphaned
+%% subscriptions in the registry projection.
+sub_session_death_cleans_registry(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+
+    Pid = start_subscriber(RealmUri, Uri, #{match => ?EXACT_MATCH}),
+
+    {Matches, _} = bondy_registry:find_matches(subscription, RealmUri, Uri),
+    ?assertMatch([_ | _], Matches, "The subscriber must have a live entry"),
+
+    ok = kill_and_wait(Pid),
+
+    ?assert(
+        await(
+            fun() ->
+                {M, _} =
+                    bondy_registry:find_matches(subscription, RealmUri, Uri),
+                M =:= []
+            end,
+            500
+        ),
+        "subscription was not cleaned after session death"
+    ).
+
+%% A killed partition must not leave pick/1 serving its dead pid: once
+%% the supervisor restarts the partition and its init reconnects the
+%% pool worker, pick must return the restarted partition's live pid.
+partition_pick_recovers_after_crash(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+
+    Pid0 = bondy_registry_partition:pick(RealmUri),
+    ?assert(is_pid(Pid0) andalso is_process_alive(Pid0)),
+
+    true = exit(Pid0, kill),
+
+    ?assert(
+        await(
+            fun() ->
+                case bondy_registry_partition:pick(RealmUri) of
+                    Pid when is_pid(Pid), Pid =/= Pid0 ->
+                        is_process_alive(Pid);
+                    _ ->
+                        %% restart window: the pool may briefly have no
+                        %% connected worker for this slot
+                        false
+                end
+            end,
+            500
+        ),
+        "pick/1 must serve the restarted partition's live pid"
+    ).
+
+%% It is valid for one session to subscribe to the same URI under two
+%% match policies — the duplicate check is keyed on (session, uri, POLICY),
+%% so the second policy must create its own entry, not hit already_exists.
+sub_same_uri_multiple_policies(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Ctxt = key_value:get(context, Config),
+    Ref = bondy_context:ref(Ctxt),
+    Type = subscription,
+    Uri = <<"com.multi.policy">>,
+
+    {ok, E1} = bondy_registry:add(
+        Type, RealmUri, Uri, #{match => ?EXACT_MATCH}, Ref
+    ),
+    {ok, E2} = bondy_registry:add(
+        Type, RealmUri, Uri, #{match => ?PREFIX_MATCH}, Ref
+    ),
+
+    ?assertNotEqual(
+        bondy_registry_entry:id(E1),
+        bondy_registry_entry:id(E2),
+        "Each match policy must get its own entry"
+    ),
+
+    ?assertMatch(
+        {error, {already_exists, _}},
+        bondy_registry:add(Type, RealmUri, Uri, #{match => ?EXACT_MATCH}, Ref),
+        "Re-subscribing under an already-held policy is idempotent"
+    ),
+    ?assertMatch(
+        {error, {already_exists, _}},
+        bondy_registry:add(Type, RealmUri, Uri, #{match => ?PREFIX_MATCH}, Ref),
+        "Re-subscribing under an already-held policy is idempotent"
+    ).
+
+%% `remove_all/4' must remove every matched entry and run the task exactly once
+%% per entry, over a set LARGER than the `{limit, _}' option it passes.
+%%
+%% That option does not bound a page: `bondy_registry_store:find/4' keys only
+%% the return SHAPE on its presence and answers the whole match set with an
+%% already-exhausted continuation. `do_remove_all/3' asserts that shape rather
+%% than looping, so if the store ever regains real paging this case fails loudly
+%% instead of the removal silently stopping after one page.
+remove_all_runs_task_once_per_entry(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    SessionId = bondy_session_id:new(),
+    Ref = bondy_ref:new(internal, self(), SessionId),
+    Opts = #{match => ?EXACT_MATCH},
+    N = 250,
+
+    Uris = [
+        <<"com.example.removeall.", (integer_to_binary(I))/binary>>
+     || I <- lists:seq(1, N)
+    ],
+    _ = [
+        {ok, _} =
+            bondy_registry:add(subscription, RealmUri, Uri, Opts, Ref)
+     || Uri <- Uris
+    ],
+    Owned = bondy_registry:entries(
+        subscription, RealmUri, SessionId, infinity
+    ),
+    ?assertEqual(
+        N, length(Owned), "precondition: the session must own every entry"
+    ),
+
+    %% A sibling session's entry and a session-less (internal callback) one,
+    %% both in the same realm and served by the same partition. `find_pairs/5'
+    %% is what narrows the match set to `SessionId', so these are the case that
+    %% would break if it ever stopped doing so.
+    OtherSessionId = bondy_session_id:new(),
+    OtherRef = bondy_ref:new(internal, self(), OtherSessionId),
+    OtherUri = <<"com.example.removeall.sibling">>,
+    {ok, OtherEntry} =
+        bondy_registry:add(subscription, RealmUri, OtherUri, Opts, OtherRef),
+
+    SessionlessPid = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    SessionlessRef = bondy_ref:new(internal, SessionlessPid),
+    SessionlessUri = <<"com.example.removeall.sessionless">>,
+    {ok, SessionlessEntry} = bondy_registry:add(
+        subscription, RealmUri, SessionlessUri, Opts, SessionlessRef
+    ),
+
+    Calls = ets:new(remove_all_task_calls, [set, public]),
+    Task = fun(Entry) ->
+        Id = bondy_registry_entry:id(Entry),
+        _ = ets:update_counter(Calls, Id, {2, 1}, {Id, 0}),
+        ok
+    end,
+
+    ok = bondy_registry:remove_all(subscription, RealmUri, SessionId, Task),
+
+    ?assertEqual(
+        [],
+        bondy_registry:entries(subscription, RealmUri, SessionId, infinity),
+        "every entry of the session must be removed"
+    ),
+
+    Counts = ets:select(Calls, [{{'_', '$1'}, [], ['$1']}]),
+    true = ets:delete(Calls),
+
+    ?assertEqual(
+        N, length(Counts), "the task must be run for every removed entry"
+    ),
+    ?assertEqual(
+        [1], lists:usort(Counts), "the task must be run exactly once per entry"
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        bondy_registry:lookup(
+            subscription, bondy_registry_entry:key(OtherEntry)
+        ),
+        "a sibling session's entry must survive"
+    ),
+    ?assertMatch(
+        {ok, _},
+        bondy_registry:lookup(
+            subscription, bondy_registry_entry:key(SessionlessEntry)
+        ),
+        "a session-less entry must survive"
+    ),
+
+    ok = bondy_registry:remove(OtherEntry),
+    ok = bondy_registry:remove(SessionlessEntry),
+
+    SessionlessPid ! stop,
+    ok.
+
+%% Session-less (internal) subscribers: the SAME process reference
+%% re-subscribing to a topic is idempotent (already_exists with its own
+%% entry), while a DIFFERENT process subscribing to the same topic gets its
+%% own entry — each internal subscriber needs its own delivery.
+sub_sessionless_refs(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Type = subscription,
+    Uri = <<"com.sessionless.topic">>,
+    Opts = #{match => ?EXACT_MATCH},
+
+    PidA = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    PidB = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    RefA = bondy_ref:new(internal, PidA),
+    RefB = bondy_ref:new(internal, PidB),
+
+    {ok, EntryA} = bondy_registry:add(Type, RealmUri, Uri, Opts, RefA),
+
+    ?assertMatch(
+        {error, {already_exists, EntryA}},
+        bondy_registry:add(Type, RealmUri, Uri, Opts, RefA),
+        "Same internal ref re-subscribing is idempotent"
+    ),
+
+    {ok, EntryB} = bondy_registry:add(Type, RealmUri, Uri, Opts, RefB),
+
+    ?assertNotEqual(
+        bondy_registry_entry:id(EntryA),
+        bondy_registry_entry:id(EntryB),
+        "A different internal process gets its own subscription"
+    ),
+
+    ok = bondy_registry:remove(EntryA),
+    ok = bondy_registry:remove(EntryB),
+    PidA ! stop,
+    PidB ! stop,
+    ok.
+
+register_invoke_single(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Opts = #{invoke => ?INVOKE_SINGLE},
+
+    Ref = bondy_ref:new(internal),
+
+    ?assertMatch(
+        {ok, _},
+        bondy_dealer:register(Uri, Opts, RealmUri, Ref)
+    ),
+
+    ?assertMatch(
+        {error, already_exists},
+        bondy_dealer:register(Uri, Opts, RealmUri, Ref)
+    ),
+
+    ?assertMatch(
+        {error, already_exists},
+        bondy_dealer:register(
+            Uri, #{invoke => ?INVOKE_ROUND_ROBIN}, RealmUri, Ref
+        )
+    ).
+
+%% Callees in distinct processes race to register the same URI with
+%% `invoke => single`, released together, over several URIs.
+concurrent_single_registrations_admit_one(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Opts = #{invoke => ?INVOKE_SINGLE, shared_registration => true},
+    Self = self(),
+    Results = lists:map(
+        fun(_) ->
+            Uri =
+                <<"com.example.",
+                    (bondy_router_utils:generate_fragment(12))/binary>>,
+            Workers = [
+                spawn_link(fun() ->
+                    Ref = bondy_ref:new(internal, self()),
+                    receive
+                        go -> ok
+                    end,
+                    Self !
+                        {registered, self(),
+                            bondy_registry:add(
+                                registration, RealmUri, Uri, Opts, Ref
+                            )},
+                    receive
+                        stop -> ok
+                    end
+                end)
+             || _ <- lists:seq(1, 16)
+            ],
+            _ = [W ! go || W <- Workers],
+            Replies = [
+                receive
+                    {registered, W, Reply} -> {W, Reply}
+                end
+             || W <- Workers
+            ],
+            Entries = [E || {_, {ok, E}} <- Replies],
+            _ = [ok = bondy_registry:remove(E) || E <- Entries],
+            _ = [W ! stop || W <- Workers],
+            length(Entries)
+        end,
+        lists:seq(1, 20)
+    ),
+    ?assertEqual(lists:duplicate(20, 1), Results).
+
+register_shared(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Opts = #{invoke => ?INVOKE_ROUND_ROBIN},
+
+    Ref = bondy_ref:new(internal),
+
+    ?assertMatch(
+        {ok, _},
+        bondy_dealer:register(Uri, Opts, RealmUri, Ref)
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        bondy_dealer:register(Uri, Opts, RealmUri, Ref)
+    ).
+
+register_callback(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+
+    Uri1 =
+        <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Uri2 =
+        <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+
+    Opts = #{invoke => ?INVOKE_ROUND_ROBIN},
+
+    Ref1 = bondy_ref:new(internal, {bondy_wamp_api, handle_call}),
+
+    ?assertMatch(
+        {ok, _},
+        bondy_dealer:register(Uri1, Opts, RealmUri, Ref1)
+    ),
+    ?assertMatch(
+        {error, already_exists},
+        bondy_dealer:register(Uri1, Opts, RealmUri, Ref1),
+        "Callbacks cannot use shared registration"
+    ),
+
+    Ref2 = bondy_ref:new(internal, {bondy_wamp_api, resolve}),
+
+    ?assertMatch(
+        {error, already_exists},
+        bondy_dealer:register(Uri1, Opts, RealmUri, Ref2)
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        bondy_dealer:register(Uri2, Opts, RealmUri, Ref2),
+        "We can register another URI"
+    ),
+    ?assertMatch(
+        {error, already_exists},
+        bondy_dealer:register(Uri2, Opts, RealmUri, Ref2),
+        "Callbacks cannot use shared registration"
+    ),
+
+    %% This should fail, for this we should be using static callbacks
+    Ref3 = bondy_ref:new(
+        internal, {bondy_wamp_api, handle_call}, undefined, 'bondy2@127.0.0.1'
+    ),
+    ?assertMatch(
+        {error, already_exists},
+        bondy_dealer:register(Uri1, Opts, RealmUri, Ref3)
+    ).
+
+pattern_based_registration_is_not_optional(Config) ->
+    %% `wamp.dealer.pattern_based_registration` and
+    %% `wamp.broker.pattern_based_subscription` are not operator flags:
+    %% `bondy_config` seats both at setup, with no mapping to override them.
+    %% A node that refuses pattern-based registration refuses the wildcard the
+    %% session manager registers to serve `wamp.session.get`, and so stops
+    %% opening sessions at all. Two halves, because a re-introduced flag and a
+    %% dropped `set` break different ones.
+    RealmUri = key_value:get(realm_uri, Config),
+
+    %% One: the registration the router makes of itself. The same shape as the
+    %% session manager's — an internal callback reference, wildcard policy, the
+    %% empty component standing in for the session's id segment.
+    Frag = bondy_router_utils:generate_fragment(12),
+    Uri = <<"com.example.", Frag/binary, "..get">>,
+    Ref = bondy_ref:new(internal, {bondy_session_api, get}),
+    Opts = #{match => ?WILDCARD_MATCH, callback_args => [RealmUri]},
+    ?assertMatch(
+        {ok, _},
+        bondy_dealer:register(Uri, Opts, RealmUri, Ref),
+        "A wildcard registration is not refusable"
+    ),
+
+    %% Two: what WELCOME tells a client. Advertising these as absent is the
+    %% quieter half of the same fault — a client that reads the roles before it
+    %% registers a pattern would conclude the router cannot route one.
+    #{dealer := #{features := DF}, broker := #{features := BF}} =
+        bondy_router:roles(),
+    ?assertEqual(true, maps:get(pattern_based_registration, DF, false)),
+    ?assertEqual(true, maps:get(pattern_based_subscription, BF, false)).
+
+%% Proves the RIB dual-write path end-to-end: local register/unregister
+%% drives this node's replicated summary cell via the partition hooks. The
+%% delta is appended inline; only its apply is asynchronous, which
+%% `await_cell/4`'s barrier covers.
+registry_rib_dual_write(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Opts = #{invoke => ?INVOKE_ROUND_ROBIN},
+    Ref = bondy_ref:new(internal),
+    Table = bondy_namespace_catalog:table(?BONDY_DB_REGISTRATION_RIB_TAB),
+    Key = term_to_binary(
+        {RealmUri, ?EXACT_MATCH, Uri, bondy_config:nodestring()}
+    ),
+
+    %% Two shared registrations -> one summary cell, count 2.
+    ?assertMatch({ok, _}, bondy_dealer:register(Uri, Opts, RealmUri, Ref)),
+    ?assertMatch({ok, _}, bondy_dealer:register(Uri, Opts, RealmUri, Ref)),
+
+    %% `bondy_db:read/3` returns the RAW `bondy_oplog_crdt_struct`
+    %% projection (registered directly, no per-use-case wrapper) —
+    %% schema fields are top-level, with `earliest`/`latest` as the
+    %% min/max ratchet registers over the group's creation times.
+    ?assert(
+        await_cell(Table, RealmUri, Key, fun
+            (
+                {ok, {
+                    #{
+                        invoke := I,
+                        count := 2,
+                        earliest := E,
+                        latest := L
+                    },
+                    _
+                }}
+            ) when
+                I == ?INVOKE_ROUND_ROBIN,
+                is_integer(E),
+                is_integer(L),
+                E =< L
+            ->
+                true;
+            (_) ->
+                false
+        end),
+        "Two shared registrations must summarise to one cell with count 2"
+    ),
+
+    Entries = bondy_registry:find_matches(registration, RealmUri, Uri),
+    ?assertEqual(2, length(Entries)),
+    [E1, E2] = Entries,
+    ok = bondy_registry:remove(E1),
+
+    ?assert(
+        await_cell(Table, RealmUri, Key, fun
+            ({ok, {#{count := 1}, _}}) -> true;
+            (_) -> false
+        end),
+        "Removing one of two registrations must leave count 1"
+    ),
+
+    %% Removing the last registration settles the cell to count=0 — no
+    %% explicit clear; a count=0 cell is "not routable" (see
+    %% `bondy_registry_rib`'s moduledoc "Concurrency model"), physically
+    %% reclaimed later via `stabilize/2` once causally stable.
+    ok = bondy_registry:remove(E2),
+
+    ?assert(
+        await_cell(Table, RealmUri, Key, fun
+            ({ok, {#{count := 0}, _}}) -> true;
+            (_) -> false
+        end),
+        "Removing the last registration must settle the cell to count=0"
+    ),
+
+    %% Subscriptions: reachability-only cells (`#{count}`).
+    Ctxt = key_value:get(context, Config),
+    SubUri =
+        <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    add_subscription_test(
+        subscription, RealmUri, SubUri, #{match => ?EXACT_MATCH}, Ctxt
+    ),
+    SubTable = bondy_namespace_catalog:table(?BONDY_DB_SUBSCRIPTION_RIB_TAB),
+    SubKey = term_to_binary(
+        {RealmUri, ?EXACT_MATCH, SubUri, bondy_config:nodestring()}
+    ),
+
+    %% Subscription is reachability-only: one reading, carried by
+    %% `bondy_oplog_crdt_owned_reading`, so the RAW projection is a plain
+    %% integer. `bondy_registry_rib:reshape_summary/2` derives the
+    %% `#{count => N}` summary that consumers read.
+    ?assert(
+        await_cell(SubTable, RealmUri, SubKey, fun
+            ({ok, {1, _}}) -> true;
+            (_) -> false
+        end),
+        "A local subscription must produce a count-only cell"
+    ),
+
+    {[SubEntry], []} =
+        bondy_registry:find_matches(subscription, RealmUri, SubUri),
+    ok = bondy_registry:remove(SubEntry),
+
+    ?assert(
+        await_cell(SubTable, RealmUri, SubKey, fun
+            ({ok, {0, _}}) -> true;
+            (_) -> false
+        end),
+        "Removing the subscription must settle the cell to count=0"
+    ),
+
+    %% The consistency gate over the whole realm — including every entry the
+    %% earlier cases in this suite left registered: the node set derivable
+    %% from summaries must equal the node set derivable from full entries.
+    %% Recomputes are async, so poll to a fixpoint.
+    ?assert(
+        await(fun() -> bondy_registry_rib:check(RealmUri) =:= [] end, 500),
+        lists:flatten(
+            io_lib:format(
+                "RIB summaries must agree with the full-entry view, got: ~p",
+                [bondy_registry_rib:check(RealmUri)]
+            )
+        )
+    ).
+
+%% Owner-side completion: a node-addressed forwarded CALL (`rib_completion`
+%% tag) must IGNORE the sender's entry hint and re-select among this node's
+%% live local registrations — here a callback procedure, so the selected
+%% callee is applied and the RESULT is sent back to the caller ref.
+rib_completion_selects_local(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Ref = bondy_ref:new(internal, {?MODULE, rib_echo}),
+    ?assertMatch(
+        {ok, _},
+        bondy_dealer:register(Uri, #{invoke => ?INVOKE_SINGLE}, RealmUri, Ref)
+    ),
+
+    Caller = bondy_ref:new(internal),
+    %% A deliberately bogus hint: completion must not trust it.
+    Hint = bondy_ref:new(internal),
+    Call = rib_call(1, #{}, Uri),
+
+    ok = bondy_dealer:forward(Call, Hint, #{
+        realm_uri => RealmUri,
+        from => Caller,
+        rib_completion => true
+    }),
+
+    receive
+        {?BONDY_REQ, _, RealmUri, #result{args = [<<"pong">>]}} ->
+            ok;
+        {?BONDY_REQ, _, RealmUri, Other} ->
+            error({unexpected_response, Other})
+    after 5000 ->
+        error(no_response)
+    end.
+
+%% Owner-side completion with NO live local registration (a stale route)
+%% must fail fast back to the caller with wamp.error.no_eligible_callee —
+%% never hang, never re-forward.
+rib_completion_no_local_fails_fast(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+
+    Caller = bondy_ref:new(internal),
+    Call = rib_call(1, #{}, Uri),
+
+    ok = bondy_dealer:forward(Call, bondy_ref:new(internal), #{
+        realm_uri => RealmUri,
+        from => Caller,
+        rib_completion => true
+    }),
+
+    receive
+        {?BONDY_REQ, _, RealmUri, #error{
+            request_type = ?CALL,
+            request_id = 1,
+            error_uri = ?WAMP_NO_ELIGIBLE_CALLE
+        }} ->
+            ok;
+        {?BONDY_REQ, _, RealmUri, Other} ->
+            error({unexpected_response, Other})
+    after 5000 ->
+        error(no_response)
+    end.
+
+%% A CALL from another node to a callback that raises gets an `internal_error`
+%% ERROR back, on both the node-addressed and the entry-addressed path.
+forwarded_call_to_a_crashing_callback_is_answered(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Callee = bondy_ref:new(internal, {?MODULE, rib_crash}),
+    ?assertMatch(
+        {ok, _},
+        bondy_dealer:register(
+            Uri, #{invoke => ?INVOKE_SINGLE}, RealmUri, Callee
+        )
+    ),
+    Caller = bondy_ref:new(internal),
+    Opts = #{realm_uri => RealmUri, from => Caller},
+    lists:foreach(
+        fun({ReqId, To, ForwardOpts}) ->
+            ok = bondy_dealer:forward(
+                rib_call(ReqId, #{}, Uri), To, ForwardOpts
+            ),
+            await_internal_error(RealmUri, ReqId)
+        end,
+        [
+            {1, bondy_ref:new(internal), Opts#{rib_completion => true}},
+            {2, Callee, Opts}
+        ]
+    ).
+
+%% A local caller's CALL to a callback that raises gets an `internal_error`
+%% ERROR back.
+local_call_to_a_crashing_callback_is_answered(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Callee = bondy_ref:new(internal, {?MODULE, rib_crash}),
+    {ok, _} = bondy_dealer:register(
+        Uri, #{invoke => ?INVOKE_SINGLE}, RealmUri, Callee
+    ),
+    {ok, Session} = bondy_session_manager:open(
+        bondy_session_id:new(),
+        RealmUri,
+        #{
+            type => internal,
+            roles => #{caller => #{}},
+            agent => ~"bondy_registry_SUITE",
+            is_anonymous => true
+        }
+    ),
+    Ctxt = bondy_context:new(
+        {{127, 0, 0, 1}, 0}, {ws, text, json}, #{session => Session}
+    ),
+    ok = bondy_dealer:forward(bondy_wamp_message:call(1, #{}, Uri), Ctxt),
+    await_internal_error(RealmUri, 1).
+
+await_internal_error(RealmUri, ReqId) ->
+    InternalError = bondy_connect_error:uri(internal_error),
+    receive
+        {?BONDY_REQ, _, RealmUri, #error{
+            request_type = ?CALL,
+            request_id = ReqId,
+            error_uri = ErrorUri,
+            kwargs = #{~"trace_id" := _}
+        }} ->
+            ?assertEqual(InternalError, ErrorUri);
+        {?BONDY_REQ, _, RealmUri, Other} ->
+            error({unexpected_response, Other})
+    after 5000 ->
+        error({no_response, ReqId})
+    end.
+
+%% A merged RIB cell naming THIS node is an echo of a reading it wrote,
+%% possibly before a restart, and the node answers it with its current
+%% reading: a stale cell with no local members settles to count=0, and a
+%% reading stamped earlier than the live one cannot override it.
+rib_restate_stale_cell(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Table = bondy_namespace_catalog:table(?BONDY_DB_REGISTRATION_RIB_TAB),
+    Key = term_to_binary(
+        {RealmUri, ?EXACT_MATCH, Uri, bondy_config:nodestring()}
+    ),
+
+    %% Plant a stale self cell, as an AAE merge-back of a previous
+    %% incarnation's reading would leave one, and deliver its echo. There is
+    %% no local registration for the URI, so the restatement reads 0.
+    ok = bondy_db:apply_batch(Table, RealmUri, Key, [
+        {apply, count, {set, {1, 1}}},
+        {apply, invoke, {set, ?INVOKE_SINGLE}},
+        {apply, earliest, {set, 1}},
+        {apply, latest, {set, 1}}
+    ]),
+    ok = bondy_registry_rib:on_remote_set(registration, Key, #{}),
+    ?assert(
+        await_cell(Table, RealmUri, Key, fun
+            ({ok, {#{count := 0}, _}}) -> true;
+            (_) -> false
+        end),
+        "A stale self cell with no local members must settle to count=0"
+    ),
+
+    Ref = bondy_ref:new(internal),
+    {ok, _} = bondy_dealer:register(
+        Uri, #{invoke => ?INVOKE_SINGLE}, RealmUri, Ref
+    ),
+    ?assert(
+        await_cell(Table, RealmUri, Key, fun
+            ({ok, {#{count := 1}, _}}) -> true;
+            (_) -> false
+        end)
+    ),
+    ok = bondy_db:apply_batch(Table, RealmUri, Key, [
+        {apply, count, {set, {1, 7}}}
+    ]),
+    ok = bondy_registry_rib:on_remote_set(registration, Key, #{}),
+    ?assert(
+        await_cell(Table, RealmUri, Key, fun
+            ({ok, {#{count := 1}, _}}) -> true;
+            (_) -> false
+        end),
+        "An earlier-stamped reading must not override the live one"
+    ),
+
+    Entries = bondy_registry:find_matches(registration, RealmUri, Uri),
+    _ = [ok = bondy_registry:remove(E) || E <- Entries],
+    ok.
+
+%% Bounded pre-invocation retry, local absorption: a node-addressed CALL
+%% came back with the owner's completion-miss ERROR; with budget left and a
+%% live LOCAL registration, the retry must re-select — `self` competes
+%% again — and complete the call locally instead of relaying the error.
+rib_retry_local_win(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Ref = bondy_ref:new(internal, {?MODULE, rib_echo}),
+    ?assertMatch(
+        {ok, _},
+        bondy_dealer:register(Uri, #{invoke => ?INVOKE_SINGLE}, RealmUri, Ref)
+    ),
+
+    Caller = bondy_ref:new(internal),
+    CallId = 71,
+    ok = add_rib_retry_promise(
+        RealmUri, Caller, CallId, Uri, [<<"deadnode@nohost">>], 1
+    ),
+    ok = bondy_dealer:forward(
+        completion_miss_error(CallId, #{rib_completion_miss => true}),
+        Caller,
+        #{realm_uri => RealmUri}
+    ),
+
+    receive
+        {?BONDY_REQ, _, RealmUri, #result{args = [<<"pong">>]}} ->
+            ok;
+        {?BONDY_REQ, _, RealmUri, Other} ->
+            error({unexpected_response, Other})
+    after 5000 ->
+        error(no_response)
+    end.
+
+%% Retry, next-node leg: no local registration, one UNTRIED stub node
+%% remains. The retry must re-forward node-addressed to it — no error to
+%% the caller — under a NEW call promise carrying the shrunk budget and
+%% the failed node in the tried set.
+rib_retry_next_node(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Dead = <<"deadnode@nohost">>,
+    Next = <<"nextnode@nohost">>,
+    StubKey = term_to_binary({RealmUri, ?EXACT_MATCH, Uri, Next}),
+    Summary = #{
+        invoke => ?INVOKE_SINGLE, count => 1, earliest => 1, latest => 1
+    },
+    ok = bondy_registry_rib:on_remote_set(registration, StubKey, Summary),
+
+    Caller = bondy_ref:new(internal),
+    CallId = 72,
+    ok = add_rib_retry_promise(RealmUri, Caller, CallId, Uri, [Dead], 1),
+    ok = bondy_dealer:forward(
+        completion_miss_error(CallId, #{rib_completion_miss => true}),
+        Caller,
+        #{realm_uri => RealmUri}
+    ),
+
+    %% No response reaches the caller — the call is in flight again.
+    receive
+        {?BONDY_REQ, _, RealmUri, Unexpected} ->
+            error({unexpected_response, Unexpected})
+    after 1000 ->
+        ok
+    end,
+
+    %% The re-routed leg holds a fresh promise: budget spent, both nodes
+    %% recorded as tried.
+    Key = bondy_rpc_promise:call_key_pattern(RealmUri, Caller, CallId),
+    {ok, Promise} = bondy_rpc_promise:find(Key),
+    ?assertMatch(
+        #{rib_retry := #{remaining := 0, tried := [Next, Dead]}},
+        bondy_rpc_promise:info(Promise)
+    ),
+    %% Cleanup: the in-flight leg targets a fictional node.
+    _ = bondy_rpc_promise:take(Key),
+    ok = bondy_registry_rib:on_remote_clear(registration, StubKey).
+
+%% Retry with an exhausted budget: the completion-miss ERROR is final and
+%% must reach the caller with the routing-internal marker stripped.
+rib_retry_exhausted(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Ref = bondy_ref:new(internal, {?MODULE, rib_echo}),
+    ?assertMatch(
+        {ok, _},
+        bondy_dealer:register(Uri, #{invoke => ?INVOKE_SINGLE}, RealmUri, Ref)
+    ),
+
+    Caller = bondy_ref:new(internal),
+    CallId = 73,
+    ok = add_rib_retry_promise(
+        RealmUri, Caller, CallId, Uri, [<<"deadnode@nohost">>], 0
+    ),
+    ok = bondy_dealer:forward(
+        completion_miss_error(CallId, #{rib_completion_miss => true}),
+        Caller,
+        #{realm_uri => RealmUri}
+    ),
+
+    receive
+        {?BONDY_REQ, _, RealmUri, #error{
+            request_type = ?CALL,
+            request_id = CallId,
+            error_uri = ?WAMP_NO_ELIGIBLE_CALLE,
+            details = Details
+        }} ->
+            ?assertNot(maps:is_key(rib_completion_miss, Details));
+        {?BONDY_REQ, _, RealmUri, Other} ->
+            error({unexpected_response, Other})
+    after 5000 ->
+        error(no_response)
+    end.
+
+%% A no_eligible_callee WITHOUT the completion-miss marker must never be
+%% retried, even with budget and a live local alternative: without the marker
+%% an invocation may have been in flight, and at-most-once invocation would
+%% otherwise break.
+rib_retry_requires_marker(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Ref = bondy_ref:new(internal, {?MODULE, rib_echo}),
+    ?assertMatch(
+        {ok, _},
+        bondy_dealer:register(Uri, #{invoke => ?INVOKE_SINGLE}, RealmUri, Ref)
+    ),
+
+    Caller = bondy_ref:new(internal),
+    CallId = 74,
+    ok = add_rib_retry_promise(
+        RealmUri, Caller, CallId, Uri, [<<"deadnode@nohost">>], 1
+    ),
+    ok = bondy_dealer:forward(
+        completion_miss_error(CallId, #{}),
+        Caller,
+        #{realm_uri => RealmUri}
+    ),
+
+    receive
+        {?BONDY_REQ, _, RealmUri, #error{
+            request_type = ?CALL,
+            request_id = CallId,
+            error_uri = ?WAMP_NO_ELIGIBLE_CALLE
+        }} ->
+            ok;
+        {?BONDY_REQ, _, RealmUri, Other} ->
+            error({unexpected_response, Other})
+    after 5000 ->
+        error(no_response)
+    end.
+
+%% The RIB observability surface: every family moves at its capture site.
+%% Values are read as deltas — the suite's earlier cases already moved
+%% most of these counters.
+rib_metrics_surface(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    V = fun(Name, Label) ->
+        case bondy_metrics:value(#{name => Name, label => Label}) of
+            undefined -> 0;
+            N -> N
+        end
+    end,
+
+    %% Occupancy: the members gauge follows local entry lifecycle.
+    Members0 = V(bondy_registry_rib_members, #{}),
+    Ref = bondy_ref:new(internal, {?MODULE, rib_echo}),
+    {ok, _} = bondy_dealer:register(
+        Uri, #{invoke => ?INVOKE_SINGLE}, RealmUri, Ref
+    ),
+    ?assertEqual(Members0 + 1, V(bondy_registry_rib_members, #{})),
+
+    %% Stub occupancy follows remote cell lifecycle, by type.
+    Stubs0 = V(bondy_registry_rib_stub_cells, #{type => registration}),
+    PeerKey = term_to_binary(
+        {RealmUri, ?EXACT_MATCH, Uri, <<"metrics_peer@nohost">>}
+    ),
+    Summary = #{
+        invoke => ?INVOKE_SINGLE, count => 1, earliest => 1, latest => 1
+    },
+    ok = bondy_registry_rib:on_remote_set(registration, PeerKey, Summary),
+    ?assertEqual(
+        Stubs0 + 1, V(bondy_registry_rib_stub_cells, #{type => registration})
+    ),
+    %% Upserting the same stub must not drift the gauge.
+    ok = bondy_registry_rib:on_remote_set(registration, PeerKey, Summary),
+    ?assertEqual(
+        Stubs0 + 1, V(bondy_registry_rib_stub_cells, #{type => registration})
+    ),
+    ok = bondy_registry_rib:on_remote_clear(registration, PeerKey),
+    ?assertEqual(
+        Stubs0, V(bondy_registry_rib_stub_cells, #{type => registration})
+    ),
+
+    %% Retry outcomes: a completion miss absorbed by the local
+    %% registration counts as a `local` retry.
+    Local0 = V(bondy_rpc_rib_retries_total, #{outcome => local}),
+    Caller = bondy_ref:new(internal),
+    ok = add_rib_retry_promise(
+        RealmUri, Caller, 91, Uri, [<<"deadnode@nohost">>], 1
+    ),
+    ok = bondy_dealer:forward(
+        completion_miss_error(91, #{rib_completion_miss => true}),
+        Caller,
+        #{realm_uri => RealmUri}
+    ),
+    receive
+        {?BONDY_REQ, _, RealmUri, #result{}} -> ok
+    after 5000 ->
+        error(no_response)
+    end,
+    ?assertEqual(
+        Local0 + 1, V(bondy_rpc_rib_retries_total, #{outcome => local})
+    ),
+
+    %% Owner-side completion outcomes.
+    Ok0 = V(bondy_rpc_rib_completions_total, #{outcome => ok}),
+    Miss0 = V(bondy_rpc_rib_completions_total, #{outcome => miss}),
+    ok = bondy_dealer:forward(
+        rib_call(92, #{}, Uri),
+        bondy_ref:new(internal),
+        #{realm_uri => RealmUri, from => Caller, rib_completion => true}
+    ),
+    receive
+        {?BONDY_REQ, _, RealmUri, #result{}} -> ok
+    after 5000 ->
+        error(no_response)
+    end,
+    NoProc =
+        <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    ok = bondy_dealer:forward(
+        rib_call(93, #{}, NoProc),
+        bondy_ref:new(internal),
+        #{realm_uri => RealmUri, from => Caller, rib_completion => true}
+    ),
+    receive
+        {?BONDY_REQ, _, RealmUri, #error{request_id = 93}} -> ok
+    after 5000 ->
+        error(no_response)
+    end,
+    ?assertEqual(Ok0 + 1, V(bondy_rpc_rib_completions_total, #{outcome => ok})),
+    ?assertEqual(
+        Miss0 + 1, V(bondy_rpc_rib_completions_total, #{outcome => miss})
+    ),
+
+    %% The divergence sweep gauges the node-wide total. The raw read
+    %% distinguishes "sweep ran, converged" (0) from "never gauged"
+    %% (undefined).
+    bondy_registry ! rib_check,
+    ?assert(
+        await(
+            fun() ->
+                0 =:=
+                    bondy_metrics:value(#{
+                        name => bondy_registry_rib_divergences
+                    })
+            end,
+            500
+        ),
+        "the sweep must gauge zero divergences on a converged node"
+    ),
+
+    Entries = bondy_registry:find_matches(registration, RealmUri, Uri),
+    _ = [ok = bondy_registry:remove(E) || E <- Entries],
+    ok.
+
+%% @private
+%% A caller-side call promise as `rib_forward_call` leaves it: the prepared
+%% entry-less CALL plus the retry state.
+add_rib_retry_promise(RealmUri, Caller, CallId, Uri, Tried, Remaining) ->
+    Call0 = bondy_wamp_message:call(CallId, #{}, Uri),
+    Call = Call0#call{
+        options = (Call0#call.options)#{
+            '$private' => #{
+                call_id => CallId,
+                registration_id => undefined,
+                invocation_details => #{procedure => Uri, trust_level => 0}
+            }
+        }
+    },
+    Promise = bondy_rpc_promise:new_call(RealmUri, Caller, CallId, #{
+        procedure_uri => Uri,
+        timeout => 10000,
+        rib_retry => #{
+            call => Call,
+            opts => #{call_opts => #{}},
+            tried => Tried,
+            remaining => Remaining
+        }
+    }),
+    bondy_rpc_promise:add(Promise).
+
+%% @private
+%% The completion-miss ERROR as the owner node sends it (the marker is
+%% stamped on the record, mirroring `reply_no_eligible_callee`).
+completion_miss_error(CallId, Details) ->
+    Error = bondy_wamp_message:error(
+        ?CALL,
+        CallId,
+        #{},
+        ?WAMP_NO_ELIGIBLE_CALLE,
+        [<<"There are no eligible callees for the procedure.">>]
+    ),
+    Error#error{details = maps:merge(Error#error.details, Details)}.
+
+%% @private
+%% A node-addressed forwarded CALL (`rib_completion`) carries the caller
+%% node's prepared envelope: every wire producer stamps
+%% `Options.'$private'.call_id` (bondy_dealer:prepare_call_rib/3), and the
+%% owner-side clause reads it to match an open progressive-input stream. A
+%% hand-built test CALL must carry the same envelope.
+rib_call(ReqId, Opts, Uri) ->
+    Call = bondy_wamp_message:call(ReqId, Opts, Uri),
+    Call#call{
+        options = (Call#call.options)#{
+            '$private' => #{
+                call_id => ReqId,
+                registration_id => undefined,
+                invocation_details => #{procedure => Uri, trust_level => 0}
+            }
+        }
+    }.
+
+%% The callback target for rib_completion_selects_local. The dynamic
+%% callback convention: return {ok, Details, Args, KWArgs} -> RESULT.
+rib_echo() ->
+    {ok, #{}, [<<"pong">>], #{}}.
+
+rib_echo(_) ->
+    rib_echo().
+
+rib_echo(_, _) ->
+    rib_echo().
+
+rib_crash() ->
+    error(crashed_on_purpose).
+
+rib_crash(_) ->
+    rib_crash().
+
+rib_crash(_, _) ->
+    rib_crash().
+
+%% @private
+await(_Pred, 0) ->
+    false;
+await(Pred, N) ->
+    case Pred() of
+        true ->
+            true;
+        false ->
+            timer:sleep(10),
+            await(Pred, N - 1)
+    end.
+
+%% @private
+%% Opens a real, `bondy_session_manager`-monitored session in a dedicated
+%% process (so killing it is a genuine process-monitor DOWN, exercising the
+%% same cleanup trigger a real WAMP connection dying would), subscribes to
+%% `Uri` through it, then blocks until killed by the caller.
+start_subscriber(RealmUri, Uri, Opts) ->
+    Parent = self(),
+    Pid = spawn(fun() ->
+        SessionId = bondy_session_id:new(),
+        SessionOpts = #{
+            type => internal,
+            roles => #{subscriber => #{}},
+            agent => <<"bondy_registry_SUITE">>,
+            is_anonymous => true
+        },
+        {ok, Session} = bondy_session_manager:open(
+            SessionId, RealmUri, SessionOpts
+        ),
+        Ctxt = bondy_context:new(
+            {{127, 0, 0, 1}, 0}, {ws, text, json}, #{session => Session}
+        ),
+        Ref = bondy_context:ref(Ctxt),
+        {ok, _Entry} =
+            bondy_registry:add(subscription, RealmUri, Uri, Opts, Ref),
+        Parent ! {self(), ready},
+        receive
+            stop -> ok
+        end
+    end),
+    receive
+        {Pid, ready} -> Pid
+    after 5000 ->
+        ct:fail({timeout_waiting_for_subscriber_ready, Pid})
+    end.
+
+%% @private
+kill_and_wait(Pid) ->
+    MonRef = monitor(process, Pid),
+    exit(Pid, kill),
+    receive
+        {'DOWN', MonRef, process, _, _} -> ok
+    after 5000 ->
+        ct:fail({timeout_waiting_for_exit, Pid})
+    end.
+
+%% The `registry` DB's ETS tables die with their storage owner. The cells this
+%% node wrote must come back from its members tables, with every registration
+%% field, and later writes must reach the reopened DB. Single node: no peer
+%% holds a copy to merge back, so a cell can only come from this node.
+rib_restored_after_storage_owner_death(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    T0 = bondy_namespace_catalog:table(?BONDY_DB_REGISTRATION_RIB_TAB),
+    ok = register_n(RealmUri, Uri, 2),
+    ?assertEqual(true, poll_summary(RealmUri, Uri, 2)),
+    #{table_state := #{owner := Owner}} = T0,
+    ok = kill_and_wait(Owner),
+    ?assertEqual(true, poll_summary(RealmUri, Uri, 2)),
+    ?assertNotEqual(
+        T0, bondy_namespace_catalog:table(?BONDY_DB_REGISTRATION_RIB_TAB)
+    ),
+    ok = register_n(RealmUri, Uri, 1),
+    ?assertEqual(true, poll_summary(RealmUri, Uri, 3)),
+    ok = unregister_all(RealmUri, Uri).
+
+%% A registry shard's oplog instance dies while a RIB write for a new
+%% registration is in flight to it, so the write is lost with its in-memory
+%% WAL. The cell must still come to carry that registration.
+rib_restored_after_instance_death(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    ok = register_n(RealmUri, Uri, 1),
+    ?assertEqual(true, poll_summary(RealmUri, Uri, 1)),
+    T = bondy_namespace_catalog:table(?BONDY_DB_REGISTRATION_RIB_TAB),
+    Key = rib_cell_key(RealmUri, Uri),
+    #{instance_ids := Ids} = T,
+    Id = maps:get(bondy_db:shard_for(T, RealmUri, Key), Ids),
+    Pid = bondy_oplog_registry:instance_pid(Id),
+    ok = sys:suspend(Pid),
+    _ = spawn(fun() -> register_n(RealmUri, Uri, 1) end),
+    ok = await_registrations(RealmUri, Uri, 2, 250),
+    ok = kill_and_wait(Pid),
+    ?assertEqual(true, poll_summary(RealmUri, Uri, 2)),
+    ok = unregister_all(RealmUri, Uri).
+
+%% The catalogue restarts, as it does when `main`'s leveled supervisor dies,
+%% and so closes and reopens the `registry` DB while the registry partitions
+%% keep their entries.
+rib_restored_after_catalogue_restart(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    ok = register_n(RealmUri, Uri, 2),
+    ?assertEqual(true, poll_summary(RealmUri, Uri, 2)),
+    Old = whereis(bondy_namespace_catalog),
+    ok = gen_server:stop(bondy_namespace_catalog),
+    ok = await_restarted(bondy_namespace_catalog, Old, 500),
+    ?assertEqual(true, poll_summary(RealmUri, Uri, 2)),
+    ok = unregister_all(RealmUri, Uri).
+
+%% The registry restarts while the `registry` DB reopens, so the catalogue's
+%% restore finds no partition to read; the cells must still come back once
+%% the partitions do. The suspended supervisor holds the restart until the
+%% reopen has finished.
+rib_restored_after_registry_restart_during_reopen(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    ok = register_n(RealmUri, Uri, 2),
+    ?assertEqual(true, poll_summary(RealmUri, Uri, 2)),
+    T0 = bondy_namespace_catalog:table(?BONDY_DB_REGISTRATION_RIB_TAB),
+    #{table_state := #{owner := Owner}} = T0,
+    ok = sys:suspend(bondy_registry_sup),
+    Registry = whereis(bondy_registry),
+    _ = [ok = kill_and_wait(P) || {_, P} <- bondy_registry:partitions()],
+    ok = kill_and_wait(Registry),
+    ok = kill_and_wait(Owner),
+    ok = await_reopened(T0, 250),
+    ok = sys:resume(bondy_registry_sup),
+    ok = await_restarted(bondy_registry, Registry, 500),
+    ?assertEqual(true, poll_summary(RealmUri, Uri, 2)),
+    ok = unregister_all(RealmUri, Uri).
+
+%% The `registry` DB's tables are deleted while the periodic RIB sweep is
+%% walking them. The sweep skips the round instead of taking the registry
+%% down. The subscriptions make the walk long enough to kill the owner inside
+%% it, and the kill waits until the sweep is in the projection walk.
+rib_check_survives_a_closed_registry_db(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Refs = [subscribe_unique(RealmUri) || _ <- lists:seq(1, 50000)],
+    T0 = bondy_namespace_catalog:table(?BONDY_DB_SUBSCRIPTION_RIB_TAB),
+    #{table_state := #{owner := Owner}} = T0,
+    Registry = whereis(bondy_registry),
+    Registry ! rib_check,
+    ok = await_walking(Registry, 5000),
+    ok = kill_and_wait(Owner),
+    _ = sys:get_state(bondy_registry),
+    ?assertEqual(Registry, whereis(bondy_registry)),
+    ok = await_reopened(T0, 250),
+    [ok = bondy_registry:remove(E) || E <- Refs],
+    ok.
+
+subscribe_unique(RealmUri) ->
+    Ref = bondy_ref:new(internal, self(), bondy_session_id:new()),
+    Uri =
+        <<"com.example.sweep.",
+            (integer_to_binary(erlang:unique_integer([positive])))/binary>>,
+    {ok, Entry} = bondy_registry:add(
+        subscription, RealmUri, Uri, #{match => ?EXACT_MATCH}, Ref
+    ),
+    Entry.
+
+await_walking(_Pid, 0) ->
+    {error, not_walking};
+await_walking(Pid, N) ->
+    case process_info(Pid, current_function) of
+        {current_function, {bondy_oplog_projection_ets, _, _}} ->
+            ok;
+        _ ->
+            erlang:yield(),
+            await_walking(Pid, N - 1)
+    end.
+
+register_n(_RealmUri, _Uri, 0) ->
+    ok;
+register_n(RealmUri, Uri, N) ->
+    %% A callee process per registration: a second REGISTER from the same
+    %% callee is not reliably a second entry.
+    Callee = spawn_link(fun() -> receive
+        after infinity -> ok
+        end end),
+    Ref = bondy_ref:new(internal, Callee),
+    Opts = #{invoke => ?INVOKE_ROUND_ROBIN},
+    {ok, _} = bondy_dealer:register(Uri, Opts, RealmUri, Ref),
+    register_n(RealmUri, Uri, N - 1).
+
+unregister_all(RealmUri, Uri) ->
+    [
+        ok = bondy_registry:remove(E)
+     || E <- bondy_registry:find_matches(registration, RealmUri, Uri)
+    ],
+    ok.
+
+rib_cell_key(RealmUri, Uri) ->
+    term_to_binary({RealmUri, ?EXACT_MATCH, Uri, bondy_config:nodestring()}).
+
+%% Reads through the catalogue's current handle on every attempt, since a
+%% reopen replaces it; `true` once this node's cell carries `Count` with the
+%% registration's invoke policy and creation bounds.
+poll_summary(RealmUri, Uri, Count) ->
+    poll_summary(RealmUri, Uri, Count, 250, undefined).
+
+poll_summary(_RealmUri, _Uri, _Count, 0, Last) ->
+    {false, Last};
+poll_summary(RealmUri, Uri, Count, N, _Last) ->
+    Observed =
+        try
+            T = bondy_namespace_catalog:table(?BONDY_DB_REGISTRATION_RIB_TAB),
+            bondy_db:read(T, RealmUri, rib_cell_key(RealmUri, Uri))
+        catch
+            Class:Reason -> {Class, Reason}
+        end,
+    case Observed of
+        {ok, {#{count := Count, invoke := ?INVOKE_ROUND_ROBIN} = V, _}} when
+            is_integer(map_get(earliest, V)),
+            map_get(earliest, V) =< map_get(latest, V)
+        ->
+            true;
+        _ ->
+            timer:sleep(20),
+            poll_summary(RealmUri, Uri, Count, N - 1, Observed)
+    end.
+
+await_registrations(_RealmUri, _Uri, _N, 0) ->
+    {error, timeout};
+await_registrations(RealmUri, Uri, N, Tries) ->
+    case bondy_registry:find_matches(registration, RealmUri, Uri) of
+        L when length(L) =:= N ->
+            ok;
+        _ ->
+            timer:sleep(20),
+            await_registrations(RealmUri, Uri, N, Tries - 1)
+    end.
+
+await_reopened(_T0, 0) ->
+    {error, not_reopened};
+await_reopened(T0, N) ->
+    case bondy_namespace_catalog:table(?BONDY_DB_REGISTRATION_RIB_TAB) of
+        T when is_map(T), T =/= T0 ->
+            ok;
+        _ ->
+            timer:sleep(20),
+            await_reopened(T0, N - 1)
+    end.
+
+await_restarted(_Name, _Old, 0) ->
+    {error, not_restarted};
+await_restarted(Name, Old, N) ->
+    case whereis(Name) of
+        Pid when is_pid(Pid), Pid =/= Old ->
+            ok;
+        _ ->
+            timer:sleep(20),
+            await_restarted(Name, Old, N - 1)
+    end.
+
+%% @private
+%% Every RIB write this suite waits on is appended synchronously in the
+%% caller's process; only the projection apply is asynchronous. So the
+%% read-your-writes barrier `bondy_db:await/3` makes one read deterministic,
+%% where a poll would only hide the applier's lag behind a budget. Returns
+%% `{false, Observed}` on a mismatch so the assertion shows what the cell held.
+await_cell(Table, RealmUri, Key, Pred) ->
+    ok = bondy_db:await(Table, RealmUri, Key),
+    Observed = bondy_db:read(Table, RealmUri, Key),
+    case Pred(Observed) of
+        true -> true;
+        false -> {false, Observed}
+    end.
+
+project(?EOT) ->
+    [];
+project(L) when is_list(L) ->
+    project_aux(L);
+project({L, R}) when is_list(L), is_list(R) ->
+    {project_aux(L), R};
+project({{L, R}, Cont}) ->
+    {{project_aux(L), R}, Cont}.
+
+project_aux(Entries) ->
+    ?SORT([
+        {
+            bondy_registry_entry:uri(E),
+            bondy_registry_entry:match_policy(E)
+        }
+     || E <- Entries
+    ]).
+
+%% =============================================================================
+%% GENERIC
+%% =============================================================================
+
+add_subscription_test(Type, RealmUri, Uri, Opts, Ctxt) ->
+    Ref = bondy_context:ref(Ctxt),
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    SessionId = bondy_context:session_id(Ctxt),
+
+    {ok, Entry} = bondy_registry:add(Type, RealmUri, Uri, Opts, Ref),
+
+    Key = bondy_registry_entry:key(Entry),
+
+    Id = bondy_registry_entry:id(Entry),
+
+    ?assertEqual(
+        {ok, Entry},
+        bondy_registry:lookup(Type, Key),
+        "The new entry should be returned by lookup/2"
+    ),
+
+    ?assertEqual(
+        {ok, Entry},
+        bondy_registry:lookup(Type, RealmUri, Id),
+        "The new entry should be returned by lookup/3"
+    ),
+
+    ?assert(
+        lists:member(Entry, bondy_registry:entries(Type, RealmUri, SessionId)),
+        "The new entry should be included in the list of stored entries "
+        "for this session"
+    ),
+
+    ?assertEqual(
+        {error, {already_exists, Entry}},
+        bondy_registry:add(Type, RealmUri, Uri, Opts, Ref),
+        "The registry should not allow duplicates"
+    ).
+
+%% =============================================================================
+%% PAGINATION
+%% =============================================================================
+
+-define(PAGED, 150).
+-define(PAGE, 100).
+-define(PAGE_CAP, 10).
+
+%% A match bounded by `limit` returns a first page and a continuation. Resuming
+%% the continuation, through either `find_matches/1` or `match/1`, must reach
+%% every entry exactly once and then answer end-of-table. Covers subscriptions
+%% (local exact entries) with more entries than one page.
+subscription_pages_reach_every_entry(_) ->
+    Realm = <<"com.foobar">>,
+    Topic = <<"com.foobar.paged.topic">>,
+    Keeper = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    Ids = lists:sort([
+        begin
+            Ref = bondy_ref:new(internal, Keeper, bondy_session_id:new()),
+            {ok, Entry} = bondy_registry:add(
+                subscription, Realm, Topic, #{match => ?EXACT_MATCH}, Ref
+            ),
+            bondy_registry_entry:id(Entry)
+        end
+     || _ <- lists:seq(1, ?PAGED)
+    ]),
+    Opts = #{limit => ?PAGE},
+    Find = page_ids(
+        bondy_registry:find_matches(subscription, Realm, Topic, Opts),
+        fun bondy_registry:find_matches/1
+    ),
+    Match = page_ids(
+        bondy_registry:match(subscription, Realm, Topic, Opts),
+        fun bondy_registry:match/1
+    ),
+    Keeper ! stop,
+    ?assertEqual(Ids, lists:sort(Find)),
+    ?assertEqual(Ids, lists:sort(Match)).
+
+%% As above for shared registrations, whose exact matches page through the
+%% registration index rather than the subscription tables.
+registration_pages_reach_every_entry(_) ->
+    Realm = <<"com.foobar">>,
+    Uri = <<"com.foobar.paged.proc">>,
+    Keeper = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    Opts0 = #{
+        match => ?EXACT_MATCH,
+        invoke => ?INVOKE_ROUND_ROBIN,
+        shared_registration => true
+    },
+    Ids = lists:sort([
+        begin
+            Ref = bondy_ref:new(internal, Keeper, bondy_session_id:new()),
+            {ok, Entry} = bondy_registry:add(
+                registration, Realm, Uri, Opts0, Ref
+            ),
+            bondy_registry_entry:id(Entry)
+        end
+     || _ <- lists:seq(1, ?PAGED)
+    ]),
+    Opts = #{limit => ?PAGE, match => '_'},
+    Find = page_ids(
+        bondy_registry:find_matches(registration, Realm, Uri, Opts),
+        fun bondy_registry:find_matches/1
+    ),
+    Match = page_ids(
+        bondy_registry:match(registration, Realm, Uri, Opts),
+        fun bondy_registry:match/1
+    ),
+    Keeper ! stop,
+    ?assertEqual(Ids, lists:sort(Find)),
+    ?assertEqual(Ids, lists:sort(Match)).
+
+%% @private
+%% Collects the entry ids of every page, resuming with `Next`. Fails after
+%% `?PAGE_CAP` pages, so a continuation that restarts instead of advancing is
+%% reported rather than looping.
+page_ids(Result, Next) ->
+    page_ids(Result, Next, 0, []).
+
+page_ids(_Result, _Next, ?PAGE_CAP, _Acc) ->
+    error(page_cap_reached);
+page_ids(?EOT, _Next, _N, Acc) ->
+    Acc;
+page_ids({{L, _Nodes}, Cont}, Next, N, Acc) when is_list(L) ->
+    page_ids(Next(Cont), Next, N + 1, ids(L) ++ Acc);
+page_ids({L, Cont}, Next, N, Acc) when is_list(L) ->
+    page_ids(Next(Cont), Next, N + 1, ids(L) ++ Acc);
+page_ids({L, _Nodes}, _Next, _N, Acc) when is_list(L) ->
+    ids(L) ++ Acc;
+page_ids(L, _Next, _N, Acc) when is_list(L) ->
+    ids(L) ++ Acc.
+
+ids(Entries) ->
+    [bondy_registry_entry:id(E) || E <- Entries].

@@ -31,7 +31,6 @@ context so that action templates can reference `{{email_sender}}`.
 
 -include_lib("kernel/include/logger.hrl").
 
-
 -define(PRODUCE_ACTION_SPEC, #{
     <<"email_address">> => #{
         alias => email_address,
@@ -88,19 +87,14 @@ context so that action templates can reference `{{email_sender}}`.
     }
 }).
 
-
 -export([init/1]).
 -export([validate_action/1]).
 -export([apply_action/1]).
 -export([terminate/2]).
 
-
-
 %% =============================================================================
 %% BONDY_BROKER_BRIDGE CALLBACKS
 %% =============================================================================
-
-
 
 -doc """
 Configure and start the `email` application for Mailgun.
@@ -108,36 +102,42 @@ Configure and start the `email` application for Mailgun.
 Extracts `email_sender` from config and returns it as the bridge context.
 """.
 init(Config) ->
-
     ?LOG_DEBUG(#{
         description => "Configuration",
         config => Config
     }),
 
-    try
-        application:set_env([{email, Config}]),
-
-        {ok, _} = application:ensure_all_started(email),
-
-        %% set the email sender in the context for the action using mops
-        case lists:keyfind(email_sender, 1, Config) of
-            false ->
-                error({invalid_config, Config});
-            SenderTuple ->
-                Context = maps:from_list([SenderTuple]),
-                {ok, Context}
-        end
-    catch
-        _:Reason ->
+    Result =
+        try
+            application:set_env([{email, Config}]),
+            case application:ensure_all_started(email) of
+                {ok, _} ->
+                    case lists:keyfind(email_sender, 1, Config) of
+                        false ->
+                            {error, {invalid_config, Config}};
+                        SenderTuple ->
+                            Context = maps:from_list([SenderTuple]),
+                            {ok, Context}
+                    end;
+                {error, _} = Error ->
+                    Error
+            end
+        catch
+            %% `application:set_env/1` rejects malformed configuration data.
+            error:{badarg, _} = BadArg ->
+                {error, BadArg}
+        end,
+    case Result of
+        {ok, _} ->
+            Result;
+        {error, Reason} ->
             ?LOG_ERROR(#{
                 description => "Error while initialising bridge",
                 config => Config,
                 reason => Reason
             }),
-            {error, Reason}
+            Result
     end.
-
-
 
 -doc "Validate a Mailgun email action spec.".
 validate_action(Action0) ->
@@ -145,14 +145,18 @@ validate_action(Action0) ->
         Action1 ->
             {ok, Action1}
     catch
-       _:Reason->
-            {error, Reason}
+        error:#{code := _} = Reason ->
+            {error, Reason};
+        %% The `sender` validator: a value neither list nor binary, or a list
+        %% that is not an iolist.
+        error:function_clause ->
+            {error, function_clause};
+        error:badarg ->
+            {error, badarg}
     end.
-
 
 -doc "Send an email via Mailgun.".
 apply_action(Action) ->
-
     ?LOG_DEBUG(#{
         description => "Action",
         action => Action
@@ -186,27 +190,18 @@ apply_action(Action) ->
             {error, EReason}
     end.
 
-
 -doc "Stop the `email` application.".
 terminate(_Reason, _State) ->
-    _  = application:stop(email),
+    _ = application:stop(email),
     ok.
-
-
 
 %% =============================================================================
 %% PRIVATE
 %% =============================================================================
 
-
-
-%% -----------------------------------------------------------------------------
 %% @private
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
--spec send_email(map())
-    -> {ok, binary()} | {error, Reason :: any()} | no_return().
+-spec send_email(map()) ->
+    {ok, binary()} | {error, Reason :: any()} | no_return().
 
 send_email(Action) ->
     #{
@@ -228,38 +223,37 @@ send_email(Action) ->
 
     case email:send(Email, Sender, Subject, FormattedBody) of
         {ok, Res} ->
-            #{<<"id">> := Ref} = bondy_wamp_json:decode(Res, [{object_format, map}]),
+            #{<<"id">> := Ref} = bondy_wamp_json:decode(Res, [
+                {object_format, map}
+            ]),
             {ok, Ref};
         {error, timeout} = Error ->
             Error;
-        {error, {Status, RespBody}}
-            when Status == 400 orelse Status == 413 ->
-                %% Unrecoverable, there is an issue with our request
-                error(RespBody);
-        {error, {Status, _}} = Error
-            when Status == 401 orelse Status == 402 orelse Status == 404 ->
-                %% An implementation error,
-                %% recoverable but needs manual intervention
-                Error;
-        {error, {Status, _}} = Error
-            when Status >= 500 ->
-                %% Emails service Error, recoverable by retrying
-                Error;
+        {error, {Status, RespBody}} when
+            Status == 400 orelse Status == 413
+        ->
+            %% Unrecoverable, there is an issue with our request
+            error(RespBody);
+        {error, {Status, _}} = Error when
+            Status == 401 orelse Status == 402 orelse Status == 404
+        ->
+            %% An implementation error,
+            %% recoverable but needs manual intervention
+            Error;
+        {error, {Status, _}} = Error when
+            Status >= 500
+        ->
+            %% Emails service Error, recoverable by retrying
+            Error;
         {error, _} = Error ->
             Error
     end.
 
-
-%% -----------------------------------------------------------------------------
 %% @private
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
 formatted_body(#{<<"text/html">> := HTML}) ->
-    Message =  <<
+    Message = <<
         "Please open this email with an HTML viewer to complete the process."
     >>,
     [{html, HTML}, {text, Message}];
-
 formatted_body(#{<<"text/plain">> := Text}) ->
     [{text, Text}].

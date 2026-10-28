@@ -1,0 +1,353 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_log_segment).
+
+-include("bondy_log.hrl").
+
+-moduledoc """
+Segment header read/write and segment file lifecycle primitives.
+
+A WAL segment file (`.qdata`) starts with a fixed 48-byte header
+followed by a stream of frames written by `bondy_log_frame`.
+The header is written once on segment creation, fsynced, and never
+updated afterwards.
+
+```
+Offset  Size  Field           Description
+------  ----  -----           -----------
+   0     4    Magic           0x42445347  ("BDSG")
+   4     1    Version
+   5     3    Flags
+   8     8    SegmentId       monotonic per-instance
+  16     8    Hash8           identity field, see below
+  24     8    CreatedAt       wall-clock millis since epoch
+  32    16    Id16            identity field, see below
+```
+
+`Hash8` and `Id16` are the log's identity as encoded by its
+`bondy_log_identity` adapter (`encode_identity/1`); this module stores
+and returns them and never interprets them. For the oplog adapter they
+are the first 8 bytes of `sha256(InstanceId)` and the 16-byte origin.
+
+`create/3` writes a new segment file with its header, fsyncs both file
+and enclosing directory, and returns the open RW file descriptor.
+`read_header/1` parses the header from an already-open file. `verify/3`
+hands the parsed identity to the adapter and reports a mismatch as an
+orphan segment (a backup tarball restored into the wrong log, a segment
+copied between instances).
+""".
+
+-define(MAGIC, ?BONDY_LOG_SEGMENT_MAGIC).
+-define(HEADER_BYTES, ?BONDY_LOG_SEGMENT_HEADER_BYTES).
+-define(VERSION, ?BONDY_LOG_SEGMENT_VERSION).
+-define(HASH8_BYTES, ?BONDY_LOG_SEGMENT_HASH8_BYTES).
+-define(ID16_BYTES, ?BONDY_LOG_SEGMENT_ID16_BYTES).
+
+-record(?MODULE, {
+    segment_id :: non_neg_integer(),
+    version :: non_neg_integer(),
+    flags :: non_neg_integer(),
+    hash8 :: <<_:64>>,
+    created_at :: non_neg_integer(),
+    id16 :: <<_:128>>
+}).
+
+-type segment_id() :: non_neg_integer().
+-type t() :: #?MODULE{}.
+
+-export_type([segment_id/0]).
+-export_type([t/0]).
+
+-export([create/3]).
+-export([open/1]).
+-export([read_header/1]).
+-export([decode_header/1]).
+-export([verify/3]).
+-export([header_bytes/0]).
+-export([filename/1]).
+-export([segment_id/1]).
+-export([identity/1]).
+-export([created_at/1]).
+-export([encode_header/1]).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-doc "Returns the segment header size in bytes (48).".
+-spec header_bytes() -> pos_integer().
+
+header_bytes() ->
+    ?HEADER_BYTES.
+
+-doc """
+Returns the canonical filename for the `.qdata` of the given segment id.
+The id is rendered as a 9-digit zero-padded decimal so that
+lexicographic order matches numeric order on directory listings.
+
+Returns a binary to match the in-tree convention; `filename:join/2`
+accepts both binaries and charlists transparently.
+""".
+-spec filename(segment_id()) -> binary().
+
+filename(Id) when is_integer(Id), Id >= 0 ->
+    iolist_to_binary(io_lib:format("~9..0B.qdata", [Id])).
+
+-doc """
+Creates a new segment file at `Path` with the given header fields.
+
+Steps:
+1. Open the file with `[write, raw, binary, exclusive]` so we error if
+   the file already exists.
+2. Write the 48-byte header.
+3. `datasync` the file descriptor.
+4. `datasync` the enclosing directory so the new dirent is durable.
+
+The fd is opened read/write up front and returned as-is, so the caller
+can append frames without re-opening.
+
+Returns `{ok, Fd, Header}` on success or `{error, Reason}` on failure. A
+failure removes the file: the segment is created with an exclusive open, so
+a partial file left behind would fail every later create of that segment.
+""".
+-spec create(
+    Path :: file:filename_all(),
+    SegmentId :: segment_id(),
+    Identity :: bondy_log_identity:identity()
+) ->
+    {ok, file:fd(), t()} | {error, term()}.
+
+create(Path, SegmentId, #{hash8 := Hash8, id16 := Id16}) when
+    is_integer(SegmentId),
+    SegmentId >= 0,
+    is_binary(Hash8),
+    byte_size(Hash8) =:= ?HASH8_BYTES,
+    is_binary(Id16),
+    byte_size(Id16) =:= ?ID16_BYTES
+->
+    CreatedAt = erlang:system_time(millisecond),
+    Header = #?MODULE{
+        segment_id = SegmentId,
+        version = ?VERSION,
+        flags = 0,
+        hash8 = Hash8,
+        created_at = CreatedAt,
+        id16 = Id16
+    },
+    HeaderBin = encode_header(Header),
+    case prim_file:open(Path, [read, write, raw, binary, exclusive]) of
+        {ok, Fd} ->
+            case write_and_sync(Fd, HeaderBin, Path) of
+                ok ->
+                    {ok, Fd, Header};
+                {error, _} = E ->
+                    ok = prim_file:close(Fd),
+                    _ = prim_file:delete(Path),
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+-doc """
+Opens an existing segment file for read/write and parses its header.
+
+Returns `{ok, Fd, Header}` if the segment header parses cleanly, or
+`{error, Reason}`. Caller-side identity verification should use
+`verify/3` against the parsed header.
+
+`{error, missing_segment}` means the file does not exist — distinct from
+`truncated_header`, which means it exists but is shorter than the 48-byte
+header. Never creates the file.
+""".
+-spec open(file:filename_all()) ->
+    {ok, file:fd(), t()} | {error, missing_segment | term()}.
+
+open(Path) ->
+    %% The header is probed through a READ-ONLY fd on purpose. Opening
+    %% `[read, write]` creates the file when it is absent, which would
+    %% turn "this segment is missing" into a 0-byte file reported as
+    %% `truncated_header` — a corruption class — and make that verdict
+    %% self-confirming on every subsequent open. Recovery inspects the
+    %% directory before deciding what to do with it; inspection must not
+    %% mutate it. `missing_segment` keeps the two conditions apart.
+    case prim_file:open(Path, [read, raw, binary]) of
+        {ok, ROFd} ->
+            Result = read_header(ROFd),
+            ok = prim_file:close(ROFd),
+            open_verified(Path, Result);
+        {error, enoent} ->
+            {error, missing_segment};
+        {error, _} = E ->
+            E
+    end.
+
+%% @private
+%% Re-opens read/write once the header has verified, so the caller gets
+%% the appendable fd it expects. Only reached for a file that existed a
+%% moment ago with a valid header.
+%%
+%% `read_header/1` positions the fd it validates past the header; that fd
+%% is the read-only probe and is closed here, so the returned fd is
+%% positioned explicitly to keep `open/1`'s contract — callers resume
+%% sequential frame I/O at offset 48.
+open_verified(Path, {ok, Header}) ->
+    case prim_file:open(Path, [read, write, raw, binary]) of
+        {ok, Fd} ->
+            {ok, _} = prim_file:position(Fd, ?HEADER_BYTES),
+            {ok, Fd, Header};
+        {error, _} = E ->
+            E
+    end;
+open_verified(_Path, {error, _} = E) ->
+    E.
+
+-doc """
+Reads and parses the 48-byte segment header from the start of `Fd`.
+
+Leaves the file position at offset 48 (the start of the first frame),
+so the caller can immediately begin streaming frame I/O.
+
+Errors:
+- `bad_magic` — header magic does not match `BDSG`.
+- `unsupported_version` — header version is not v1.
+- `truncated_header` — fewer than 48 bytes available.
+""".
+-spec read_header(file:fd()) ->
+    {ok, t()}
+    | {error, bad_magic | unsupported_version | truncated_header | term()}.
+
+read_header(Fd) ->
+    case prim_file:pread(Fd, 0, ?HEADER_BYTES) of
+        {ok, Bin} ->
+            case decode_header(Bin) of
+                {ok, _} = Ok ->
+                    {ok, _} = prim_file:position(Fd, ?HEADER_BYTES),
+                    Ok;
+                {error, _} = E ->
+                    E
+            end;
+        eof ->
+            {error, truncated_header};
+        {error, _} = E ->
+            E
+    end.
+
+-doc """
+Parses a segment header from its bytes — the first 48 of a segment held
+in memory — with `read_header/1`'s errors; a longer binary is parsed by
+its first 48 bytes.
+""".
+-spec decode_header(binary()) ->
+    {ok, t()} | {error, bad_magic | unsupported_version | truncated_header}.
+
+decode_header(Bin) when is_binary(Bin), byte_size(Bin) < ?HEADER_BYTES ->
+    %% Size check first so a too-small file is always reported as
+    %% truncated regardless of its contents.
+    {error, truncated_header};
+decode_header(
+    <<?MAGIC:32/big-unsigned, Version:8/unsigned, Flags:24/big-unsigned,
+        SegmentId:64/big-unsigned, Hash8:?HASH8_BYTES/binary,
+        CreatedAt:64/big-unsigned, Id16:?ID16_BYTES/binary, _/binary>>
+) ->
+    case Version of
+        ?VERSION ->
+            {ok, #?MODULE{
+                segment_id = SegmentId,
+                version = Version,
+                flags = Flags,
+                hash8 = Hash8,
+                created_at = CreatedAt,
+                id16 = Id16
+            }};
+        _ ->
+            {error, unsupported_version}
+    end;
+decode_header(<<Magic:32/big-unsigned, _/binary>>) when Magic =/= ?MAGIC ->
+    {error, bad_magic}.
+
+-doc """
+Verifies a parsed header belongs to the log identified by `Ctx`
+through the `bondy_log_identity` adapter `Adapter`.
+
+Returns `ok` when the adapter accepts the header's identity fields, or
+`{error, {orphan_segment, Reason}}` with the adapter's own reason (the
+oplog adapter answers `origin_mismatch` or `instance_id_hash_mismatch`).
+The recovery procedure and the reader use this to refuse orphan
+segments before reading any frame.
+
+The `SegmentId` is **not** checked here: the caller chooses which file
+to open and pairs it with its expected segment id separately.
+""".
+-spec verify(t(), Adapter :: module(), bondy_log_identity:ctx()) ->
+    ok | {error, {orphan_segment, term()}}.
+
+verify(#?MODULE{} = Header, Adapter, Ctx) ->
+    case Adapter:verify_identity(identity(Header), Ctx) of
+        ok -> ok;
+        {error, Reason} -> {error, {orphan_segment, Reason}}
+    end.
+
+-doc "Returns the SegmentId field of a parsed header.".
+-spec segment_id(t()) -> segment_id().
+
+segment_id(#?MODULE{segment_id = Id}) -> Id.
+
+-doc "Returns the two identity fields of a parsed header.".
+-spec identity(t()) -> bondy_log_identity:identity().
+
+identity(#?MODULE{hash8 = Hash8, id16 = Id16}) ->
+    #{hash8 => Hash8, id16 => Id16}.
+
+-doc "Returns the CreatedAt millisecond timestamp of a parsed header.".
+-spec created_at(t()) -> non_neg_integer().
+
+created_at(#?MODULE{created_at = C}) -> C.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+-doc """
+Encodes a segment header record back into its 48-byte on-disk form.
+
+Used by `bondy_log_recovery` to rewrite a head segment during
+`rescan` recovery: the new (compacted) segment carries the original
+header unchanged so the file's identity (`segment_id`, `hash8`, `id16`,
+`created_at`) is preserved across the rewrite.
+""".
+-spec encode_header(t()) -> binary().
+
+encode_header(#?MODULE{
+    segment_id = SegmentId,
+    version = Version,
+    flags = Flags,
+    hash8 = Hash8,
+    created_at = CreatedAt,
+    id16 = Id16
+}) ->
+    ?HASH8_BYTES = byte_size(Hash8),
+    ?ID16_BYTES = byte_size(Id16),
+    <<?MAGIC:32/big-unsigned, Version:8/unsigned, Flags:24/big-unsigned,
+        SegmentId:64/big-unsigned, Hash8/binary, CreatedAt:64/big-unsigned,
+        Id16/binary>>.
+
+%% @private
+%% Writes the header bytes, fsyncs the file descriptor, and fsyncs the
+%% enclosing directory. The directory fsync is required on POSIX so the
+%% new dirent survives a power loss.
+write_and_sync(Fd, HeaderBin, Path) ->
+    case prim_file:write(Fd, HeaderBin) of
+        ok ->
+            case bondy_mst_io:datasync(Fd) of
+                ok ->
+                    bondy_mst_io:fsync_dir(filename:dirname(Path));
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.

@@ -1,0 +1,248 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_oplog_crdt).
+
+-include("bondy_oplog.hrl").
+
+-moduledoc #{format => "text/markdown"}.
+-moduledoc """
+Behaviour for consumer-defined CRDTs.
+
+A *CRDT module* binds an oplog instance to a domain semantics. The
+library is otherwise agnostic to event payload meaning; it is the
+CRDT module — through its `interpret_cog/2` callback — that decides
+what an event "means" and how concurrent operations are resolved.
+
+The Concurrent Operation Group (COG) abstraction and the
+`interpret_cog` interface come from Preston McCrary's *Canteen*
+(UC Berkeley, 2022 — EECS-2022-160). The library carries the COG
+machinery; the consumer supplies the interpretation function.
+
+## Required callbacks
+
+- `causal_tier/0` declares which Tier of causal metadata this CRDT's
+  cells carry, and selects the substrate clock provisioned for the
+  table:
+  - `tier_0` = none — scalar HLC only. Correct for commutative types
+    (registers, counters, sets): HLC-monotonic delivery is a causal
+    linearization and order cannot change the result.
+  - `tier_1` = dot sets — per-operation observed dots (e.g. the legacy
+    observed-remove map).
+  - `tier_2` = version vectors — a per-cell causal context (a Dotted
+    Version Vector, `bondy_dvvset`) carried in the event `meta`, so
+    `interpret_cog/2` can compute true *happens-before* and resolve
+    concurrency-detecting types (multi-value register, add-wins map)
+    that scalar HLC cannot express. The substrate stamps the context
+    generically at the origin (it already mints the HLC dot); the CRDT
+    only consumes it.
+
+- `init/0` returns the bottom state — what the CRDT looks like when
+  no events have ever been applied. Pure; called at first compaction
+  on a fresh instance.
+
+- `interpret_cog(Events, State) -> NewState` is the *workhorse*. It
+  receives a batch of events (a Concurrent Operation Group) in key
+  order and returns the updated state. It MUST be deterministic: same
+  inputs ⇒ same output, on every replica. The library calls this on
+  compaction (folding stable prefixes into snapshots) and on hot
+  queries (folding live events on top of the latest snapshot).
+
+- `query(Query, State) -> Result` projects the CRDT state for a
+  client query. Pure.
+
+## Projection-seam callbacks
+
+These let the applier keep a materialised projection value current on
+write (the eager-materialised projection path), with `interpret_cog/2`
+as the sole convergence kernel.
+
+- `to_value(State) -> Value` projects a CRDT state to the user-facing
+  value stored in the projection / served on reads. Pure.
+
+- `hlc(State) -> hlc()` the state's logical timestamp — non-decreasing
+  as operations are interpreted. Drives the projection's per-cell HEAD
+  HLC.
+
+- `encode_state(State) -> binary()` / `decode_state(binary()) -> State`
+  serialise the state for the compaction checkpoint and the projection
+  HEAD column. There is deliberately **no** `encode_event/decode_event`:
+  operations travel as opaque terms in the WAL/MST — the substrate never
+  asks the CRDT to (de)serialise an op.
+
+## Optional callbacks
+
+- `removal_op() -> Op | undefined` the operation that removes the WHOLE
+  cell, for `bondy_db:delete/3` — `clear` for register-like types,
+  `disable` for the flags. Collection
+  types return `undefined`: a set or map has no whole-cell removal, its
+  entries are removed individually.
+
+- `stabilize(StableHlc, State) -> keep | {keep, State} | discard` — what
+  remains of `State` once `StableHlc` is causally stable, i.e. once no
+  operation older than it can ever be delivered again.
+
+  `discard` means the cell carries no remaining semantic content and may
+  be physically removed from the projection. A tombstone is the case that
+  matters: it exists only to reject a concurrent write with a lower HLC,
+  so once that is impossible it is pure overhead.
+
+  `{keep, State'}` is the weaker form — retain the cell but reduce its
+  representation, dropping or compressing metadata that only served to
+  order it against operations that can no longer arrive. The sweep
+  persists the reduced state with a value-preserving frame rewrite
+  (`bondy_oplog_cell_utils`'s STABILIZE section): `to_value(State')`
+  MUST equal `to_value(State)`, and the reduction MUST NOT shrink
+  `context_of/1` (a legitimately-shrinking context is `reap_origins/2`'s
+  job, which co-evicts the stamp-site guard — the sweep does not).
+
+  This is causal *stabilization* in the sense of Baquero, Almeida and
+  Shoker (arXiv:1710.04469 §7.2): a data-type-specific reduction licensed
+  by stability, distinct from the redundancy applied on delivery. It MUST
+  NOT be called with an `StableHlc` derived from anything weaker than a
+  confirmed all-peer frontier — see
+  `bondy_oplog_peer_state:confirmed_peer_states/2`.
+
+  The license this contract extends is exactly as strong as invariants
+  I1 (prepare-after-deliver, enforced by the applier's prepare fence —
+  `bondy_oplog_applier:ensure_remote_caught_up/1`, where the full
+  theorem is stated) and I2 (containment stability, what the confirmed
+  frontier proves). Together they guarantee no event at or below the
+  frontier will ever be delivered again — which is what makes a
+  `discard`, whose observable effect is governed purely by HLC
+  comparison, invisible to all late arrivals. A `{keep, State'}`
+  reduction that changes how a *causal context* would select parts of
+  the state (folding an observed-remove dot-store) needs a strictly
+  stronger license than this HLC frontier — see
+  `bondy_oplog_crdt_nested_core:stabilize_fold/2` for the boundary and
+  the counterexample.
+
+- `value_equals_state() -> boolean()` declares that `to_value/1` is the
+  identity (the projection value *is* the state) — a storage optimisation
+  for value-carrying CRDTs (e.g. g-sets). Default `false`.
+
+- `order_independent() -> boolean()` the **commutativity marker**: `true`
+  lets the applier apply one operation onto the materialised state, because
+  order cannot change the result. The eager kernel refuses a CRDT that
+  declares `false` (`bondy_oplog_cell_kernel:apply/6` raises
+  `non_commutative_crdt_eager_unsupported`), and `bondy_db:open_table/3`
+  refuses it at `tier_2`. It is a property of the CRDT *module*, checked by
+  each CRDT's tests, never an arrival-order heuristic. Default `false`.
+
+- `state_to_op(State) -> Op | undefined` — **tier_0 accumulators.** The
+  single operation that rebuilds an equivalent state from bottom:
+  applying `Op` to `init/0` must converge (same `to_value/1`, same
+  ordering behaviour against later ops) with `State`. This is what lets
+  causal-stabilization folding
+  (`bondy_oplog_crdt_nested_core:stabilize_fold/2`) collapse an
+  origin's causally-stable run of sub-ops inside a nested PO-Log into
+  one synthetic op. Only meaningful alongside
+  `order_independent() =:= true` (the fold displaces the run's
+  contributions to a single position in the replay order). `undefined`
+  when no single op can represent `State` (typically bottom).
+
+- `context_of(State) -> term()` — **tier_2 only.** Returns the cell's
+  current causal context (a version vector, e.g. `bondy_dvvset:join/1`).
+  The substrate reads this at the origin to stamp a new write's observed
+  context into the event `meta`, so `interpret_cog/2` can later resolve
+  concurrency. tier_0 CRDTs do not export it.
+
+- `dotted_context() -> boolean()` — `true` when `context_of/1` is a version
+  vector over event dots that grows by exactly the context and the dot of each
+  operation applied (every kernel built on
+  `bondy_oplog_crdt_aw_core:cc_absorb/3`). The projection kernel then skips an
+  event whose dot the context already covers
+  (`bondy_oplog_cell_kernel:apply/6`). A context of per-cell write counters,
+  such as `bondy_dvvset:join/1`'s, is not one.
+
+- `reap_origins(State, RetiredOrigins) -> {NewState, Reaped}` — for a
+  tier_2 CRDT: garbage-collect the per-cell causal context entries of
+  permanently-retired origins. A tier_2 CRDT carries one version-vector
+  entry per origin that ever wrote the cell; an origin whose node is
+  decommissioned leaves that entry behind forever (the one cost that grows
+  with cluster *churn* rather than op count). Given a set of retired
+  origins, this drops only the entries that carry **no live value** —
+  pure causal bookkeeping whose every value has already been dominated —
+  so the projection's value (`to_value/1`) is unchanged. An origin still
+  holding a surviving sibling is *retained* (its value is real data) and
+  excluded from `Reaped`, which lists exactly the origins actually
+  dropped. The substrate cannot know which origins are retired (membership
+  is delegated to the consumer); the *operator* supplies `RetiredOrigins`
+  and the obligation that they are permanently gone and causally stable
+  cluster-wide, exactly as it owns origin-uniqueness. This callback only
+  enforces the local value-preserving gate. A tier_0 CRDT's per-origin
+  entries are value, not bookkeeping, so a tier_0 module exports it only
+  when naming it as a table's carrier declares the cells single-writer and
+  scoped to their owner: `bondy_oplog_crdt_owned_reading` drops a retired
+  origin's readings outright, changing the value.
+
+## Determinism invariant
+
+`interpret_cog/2`'s determinism is the foundation of the system's
+*Strong Eventual Consistency* guarantee. A non-deterministic
+implementation will break convergence: replicas that received the
+same events will produce different snapshots and the system will
+silently diverge.
+""".
+
+-type tier() :: tier_0 | tier_1 | tier_2.
+
+-export_type([tier/0]).
+
+-callback causal_tier() -> tier().
+
+-callback init() -> State :: term().
+
+-callback interpret_cog(
+    Events :: [bondy_oplog_event:t()],
+    State :: term()
+) -> NewState :: term().
+
+-callback query(Query :: term(), State :: term()) -> Result :: term().
+
+%% Projection-seam callbacks (operation-based projection).
+
+-callback to_value(State :: term()) -> Value :: term().
+
+-callback hlc(State :: term()) -> bondy_connect_hlc:hlc().
+
+-callback encode_state(State :: term()) -> binary().
+
+-callback decode_state(binary()) -> State :: term().
+
+%% Optional callbacks.
+
+-callback removal_op() -> Op :: term() | undefined.
+
+-callback stabilize(
+    StableHlc :: bondy_connect_hlc:hlc(),
+    State :: term()
+) -> keep | {keep, State :: term()} | discard.
+
+-callback value_equals_state() -> boolean().
+
+-callback order_independent() -> boolean().
+
+-callback state_to_op(State :: term()) -> Op :: term() | undefined.
+
+-callback context_of(State :: term()) -> Context :: term().
+
+-callback dotted_context() -> boolean().
+
+-callback reap_origins(
+    State :: term(),
+    RetiredOrigins :: [term()]
+) -> {NewState :: term(), Reaped :: [term()]}.
+
+-optional_callbacks([
+    removal_op/0,
+    stabilize/2,
+    value_equals_state/0,
+    order_independent/0,
+    state_to_op/1,
+    context_of/1,
+    dotted_context/0,
+    reap_origins/2
+]).

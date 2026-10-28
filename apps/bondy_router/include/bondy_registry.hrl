@@ -1,0 +1,1 @@
+-define(REGISTRY_POOL, {bondy_registry, pool}).

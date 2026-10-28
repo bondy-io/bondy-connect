@@ -1,0 +1,311 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_connect_cancel_SUITE).
+
+-moduledoc """
+M3 integration tests for **call cancellation** against a live Bondy router over
+raw TCP. A `bondy_connect_sdk` caller issues an asynchronous CALL to a slow callee
+and then cancels it with each WAMP mode:
+
+- `skip` — the caller is errored immediately; the callee is **not** interrupted.
+- `killnowait` — the caller is errored immediately; an INTERRUPT is sent to the
+  callee (and its servicing worker is killed).
+- `kill` — an INTERRUPT is sent to the callee and the caller is errored only
+  once the callee answers the INVOCATION with ERROR.
+
+The `kill` test is also the proof of the **callee INTERRUPT** path: the caller
+receives the `canceled` error long before the slow handler would have completed,
+which is only possible if the callee killed its worker and answered the
+INVOCATION. It further asserts the callee connection survives and keeps serving.
+""".
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("bondy_connect.hrl").
+
+-compile([nowarn_export_all, export_all]).
+
+-define(REALM, <<"com.example.bondy_connect.m3.cancel">>).
+-define(NO_CANCEL_REALM, <<"com.example.bondy_connect.m3.cancel.refused">>).
+-define(PERMISSIONS, [
+    <<"wamp.register">>, <<"wamp.unregister">>, <<"wamp.call">>
+]).
+
+-define(HOST, "127.0.0.1").
+-define(PORT, 18082).
+
+%% Long enough that, without a working interrupt/cancel, the caller would only
+%% hear back when the handler finishes — so a fast `canceled` reply proves it.
+-define(SLOW_MS, 5000).
+-define(RECV_MS, 3000).
+
+all() ->
+    [
+        cancel_skip,
+        cancel_killnowait,
+        cancel_kill_interrupts_callee,
+        cancel_specific_among_many,
+        cancel_unknown_token,
+        kill_without_callee_support_skips,
+        killnowait_without_callee_support_skips,
+        a_refused_cancel_leaves_the_call_running
+    ].
+
+init_per_suite(Config) ->
+    bondy_ct:start_bondy(),
+    {ok, _} = application:ensure_all_started(bondy_connect_sdk),
+    ok = add_anon_realm(?REALM, [<<"wamp.cancel">> | ?PERMISSIONS]),
+    ok = add_anon_realm(?NO_CANCEL_REALM, ?PERMISSIONS),
+    Config.
+
+end_per_suite(_) ->
+    ok.
+
+%% =============================================================================
+%% TESTS
+%% =============================================================================
+
+%% A callee that did not announce `call_canceling` is never sent an INTERRUPT:
+%% `kill` and `killnowait` act as `skip`. The caller is errored at once and the
+%% handler, never interrupted, runs to completion.
+kill_without_callee_support_skips(_) ->
+    cancel_without_callee_support(kill).
+
+killnowait_without_callee_support_skips(_) ->
+    cancel_without_callee_support(killnowait).
+
+cancel_without_callee_support(Mode) ->
+    Uri = <<"com.example.cancel.unsupported.", (atom_to_binary(Mode))/binary>>,
+    Self = self(),
+    Callee = connect(#{
+        roles => #{callee => #{features => #{caller_identification => true}}}
+    }),
+    {ok, _} = bondy_connect_client:register(Callee, Uri, fun(_, _, _) ->
+        timer:sleep(1000),
+        Self ! {handler_done, Uri},
+        {ok, #{args => [<<"done">>]}}
+    end),
+
+    Caller = connect(),
+    {ok, Token} = bondy_connect_client:call_async(Caller, Uri, []),
+    ok = bondy_connect_client:cancel(Caller, Token, Mode),
+    assert_canceled(Token),
+    receive
+        {handler_done, Uri} -> ok
+    after ?RECV_MS ->
+        ct:fail(handler_interrupted)
+    end,
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
+%% skip: caller errored immediately, no INTERRUPT to the callee.
+cancel_skip(_) ->
+    Callee = connect(),
+    {ok, _} = bondy_connect_client:register(
+        Callee, <<"com.example.cancel.skip">>, slow()
+    ),
+
+    Caller = connect(),
+    {ok, Token} = bondy_connect_client:call_async(
+        Caller, <<"com.example.cancel.skip">>, []
+    ),
+    ok = bondy_connect_client:cancel(Caller, Token, skip),
+    assert_canceled(Token),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
+%% killnowait: caller errored immediately, INTERRUPT sent to the callee.
+cancel_killnowait(_) ->
+    Callee = connect(),
+    {ok, _} = bondy_connect_client:register(
+        Callee, <<"com.example.cancel.kn">>, slow()
+    ),
+
+    Caller = connect(),
+    {ok, Token} = bondy_connect_client:call_async(
+        Caller, <<"com.example.cancel.kn">>, []
+    ),
+    ok = bondy_connect_client:cancel(Caller, Token, killnowait),
+    assert_canceled(Token),
+
+    ?assertEqual(established, bondy_connect_client:status(Callee)),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
+%% kill: the callee is interrupted; the caller hears `canceled` well before the
+%% slow handler would finish, and the callee survives to serve a fresh call.
+cancel_kill_interrupts_callee(_) ->
+    Callee = connect(),
+    {ok, _} = bondy_connect_client:register(
+        Callee, <<"com.example.cancel.kill">>, slow()
+    ),
+    Ok = fun(Args, _, _) -> {ok, #{args => Args}} end,
+    {ok, _} = bondy_connect_client:register(
+        Callee, <<"com.example.cancel.ok">>, Ok
+    ),
+
+    Caller = connect(),
+    {ok, Token} = bondy_connect_client:call_async(
+        Caller, <<"com.example.cancel.kill">>, []
+    ),
+    ok = bondy_connect_client:cancel(Caller, Token, kill),
+    assert_canceled(Token),
+    %% The dealer settles the call only on the callee's ERROR for the
+    %% INVOCATION (WAMP "Call Canceling", kill mode).
+    ?assertNot(
+        maps:is_key(
+            <<"com.example.cancel.kill">>,
+            bondy_rpc_promise:count_by_procedure()
+        )
+    ),
+
+    %% The crashing/killed worker must not take the callee connection down.
+    ?assertEqual(established, bondy_connect_client:status(Callee)),
+    {ok, R} = bondy_connect_client:call(
+        Caller, <<"com.example.cancel.ok">>, [<<"alive">>]
+    ),
+    ?assertEqual([<<"alive">>], maps:get(args, R)),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
+%% Cancelling one token among several in-flight async calls must cancel exactly
+%% that call and leave the others in flight — proving the token->ReqId secondary
+%% index resolves each token to its own request, not just "some"
+%% pending call.
+cancel_specific_among_many(_) ->
+    Callee = connect(),
+    {ok, _} = bondy_connect_client:register(
+        Callee, <<"com.example.cancel.many">>, slow()
+    ),
+
+    Caller = connect(),
+    [T1, T2, T3] = [
+        begin
+            {ok, T} = bondy_connect_client:call_async(
+                Caller, <<"com.example.cancel.many">>, []
+            ),
+            T
+        end
+     || _ <- lists:seq(1, 3)
+    ],
+
+    ok = bondy_connect_client:cancel(Caller, T2, killnowait),
+    assert_canceled(T2),
+
+    %% The other two are untouched: still in flight, so no reply within a window
+    %% the slow handler runs well past (only T1/T3 are matched here).
+    receive
+        {bondy_connect_client, T1, _} -> ct:fail(t1_unexpectedly_replied);
+        {bondy_connect_client, T3, _} -> ct:fail(t3_unexpectedly_replied)
+    after 500 ->
+        ok
+    end,
+
+    ?assertEqual(established, bondy_connect_client:status(Callee)),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
+%% Cancelling an unknown token is a clean error, not a crash.
+cancel_unknown_token(_) ->
+    Caller = connect(),
+    ?assertEqual(
+        {error, unknown_call},
+        bondy_connect_client:cancel(Caller, make_ref(), kill)
+    ),
+    ok = bondy_connect_client:disconnect(Caller).
+
+%% WAMP defines no ERROR for a CANCEL, so a CANCEL the caller may not make gets
+%% no reply: the call runs to its RESULT, which is the caller's only reply.
+a_refused_cancel_leaves_the_call_running(_) ->
+    Uri = <<"com.example.cancel.refused">>,
+    Callee = connect(#{realm => ?NO_CANCEL_REALM}),
+    {ok, _} = bondy_connect_client:register(Callee, Uri, fun(_, _, _) ->
+        timer:sleep(1000),
+        {ok, #{args => [<<"done">>]}}
+    end),
+
+    Caller = connect(#{realm => ?NO_CANCEL_REALM}),
+    {ok, Token} = bondy_connect_client:call_async(Caller, Uri, []),
+    ok = bondy_connect_client:cancel(Caller, Token, kill),
+    receive
+        {bondy_connect_client, Token, Reply} ->
+            ?assertMatch({ok, #{args := [<<"done">>]}}, Reply)
+    after ?RECV_MS ->
+        ct:fail(no_result)
+    end,
+    ?assertEqual(established, bondy_connect_client:status(Caller)),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
+%% =============================================================================
+%% HELPERS
+%% =============================================================================
+
+%% @private A handler that sleeps well past the receive window.
+slow() ->
+    fun(_, _, _) ->
+        timer:sleep(?SLOW_MS),
+        {ok, #{args => [<<"too_late">>]}}
+    end.
+
+%% @private Assert the async caller received a terminating `canceled` error.
+assert_canceled(Token) ->
+    receive
+        {bondy_connect_client, Token, Reply} ->
+            ?assertMatch(
+                {error, #{kind := wamp, uri := ?WAMP_CANCELLED}}, Reply
+            )
+    after ?RECV_MS ->
+        ct:fail(no_cancel_reply)
+    end.
+
+%% @private
+connect() ->
+    connect(#{}).
+
+%% @private `Overrides` replaces keys of the default connection spec.
+connect(Overrides) ->
+    Spec0 = #{
+        transport => tcp,
+        endpoint => {?HOST, ?PORT},
+        realm => ?REALM,
+        auth => #{method => ?WAMP_ANON_AUTH},
+        serializers => [json]
+    },
+    {ok, Conn} = bondy_connect_client:connect(maps:merge(Spec0, Overrides)),
+    Conn.
+
+%% @private
+add_anon_realm(RealmUri, Permissions) ->
+    Cfg = #{
+        uri => RealmUri,
+        authmethods => [?WAMP_ANON_AUTH],
+        security_enabled => true,
+        grants => [
+            #{
+                permissions => Permissions,
+                uri => <<"">>,
+                match => <<"prefix">>,
+                roles => [<<"anonymous">>]
+            }
+        ],
+        sources => [
+            #{
+                usernames => [<<"anonymous">>],
+                authmethod => ?WAMP_ANON_AUTH,
+                cidr => <<"0.0.0.0/0">>
+            }
+        ]
+    },
+    _ = bondy_realm:create(Cfg),
+    ok.

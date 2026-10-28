@@ -1,0 +1,274 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_oplog_crdt_lww_register).
+
+-behaviour(bondy_oplog_crdt).
+-behaviour(bondy_oplog_crdt_commutative).
+
+-moduledoc #{format => "text/markdown"}.
+-moduledoc """
+Last-writer-wins (LWW) register — native operation-based CRDT.
+
+The first production fold reimplemented as a native `bondy_oplog_crdt`
+on the commutative helper. It is the operation-based twin of the deprecated
+`bondy_oplog_fold_lww_register`, with identical state, operations, and
+conflict resolution — but expressed as a single-operation step
+(`apply_op/3`) interpreted in key order, with **no** `merge_states`
+join and **no** value delta. The materialised value is simply
+`to_value(State)`.
+
+## Why it is commutative
+
+The state is the join (lub) of `(HLC, payload)` on a total order:
+higher HLC wins; at equal HLC a deterministic tie-break on the encoded
+payload decides (and `cleared` beats `set` at a tie). "Take the max" is
+associative and commutative, so applying operations in any order yields
+the same state — hence `order_independent() -> true`, which lets the
+applier maintain the projection with the O(1) eager step.
+
+## State
+
+```
+undefined
+| {set, register_value(), hlc()}
+| {cleared, hlc()}
+```
+
+- `undefined` — initial; no operation observed.
+- `{set, V, H}` — value `V` written at HLC `H`.
+- `{cleared, H}` — cleared at HLC `H`. Not terminal: a later-HLC `set`
+  resurrects the register.
+
+`register_value()` is **any term** supplied by the application (serialised
+via `term_to_binary/1` in the state encoding); the caller never has to encode
+it by hand.
+
+## Operations
+
+```
+{set, register_value()}   %% HLC stamped from the event key
+| clear                   %% HLC stamped from the event key
+| {set, hlc(), register_value()}   %% explicit HLC (power users / replay)
+| {clear, hlc()}
+```
+
+The short forms (`{set, V}`, `clear`) take the write HLC from the event key the
+substrate already stamps, so the application never threads an HLC. The explicit
+forms remain for callers that supply their own HLC (e.g. deterministic tests or
+event replay).
+
+## Conflict resolution
+
+Higher HLC wins regardless of operation type. At equal HLC: two `set`s
+resolve to the larger value by Erlang term order; `set` vs `clear` resolves to
+`cleared`. Deterministic on every replica.
+
+## Encoding
+
+```
+undefined    -> <<0>>
+{set, V, H}  -> <<1, H:64/big-unsigned, (term_to_binary(V))/binary>>
+{cleared, H} -> <<2, H:64/big-unsigned>>
+```
+""".
+
+%% bondy_oplog_crdt
+-export([causal_tier/0]).
+-export([init/0]).
+-export([interpret_cog/2]).
+-export([query/2]).
+%% projection seam
+-export([to_value/1]).
+-export([hlc/1]).
+-export([removal_op/0]).
+-export([stabilize/2]).
+-export([state_to_op/1]).
+-export([value_equals_state/0]).
+-export([order_independent/0]).
+-export([encode_state/1]).
+-export([decode_state/1]).
+%% bondy_oplog_crdt_commutative
+-export([apply_op/3]).
+
+-type register_value() :: term().
+-type state() ::
+    undefined
+    | {set, register_value(), bondy_connect_hlc:hlc()}
+    | {cleared, bondy_connect_hlc:hlc()}.
+-type op() ::
+    {set, register_value()}
+    | clear
+    | {set, bondy_connect_hlc:hlc(), register_value()}
+    | {clear, bondy_connect_hlc:hlc()}.
+
+-export_type([state/0, op/0]).
+
+%% =============================================================================
+%% bondy_oplog_crdt
+%% =============================================================================
+
+-spec causal_tier() -> tier_0.
+
+causal_tier() ->
+    tier_0.
+
+-spec init() -> state().
+
+init() ->
+    undefined.
+
+-spec interpret_cog([bondy_oplog_event:t()], state()) -> state().
+
+interpret_cog(Events, State) ->
+    bondy_oplog_crdt_commutative:interpret_cog(?MODULE, Events, State).
+
+-spec query(value, state()) -> undefined | register_value().
+
+query(value, State) ->
+    to_value(State).
+
+%% =============================================================================
+%% bondy_oplog_crdt_commutative
+%% =============================================================================
+
+-doc """
+Apply one LWW operation in key order. Higher HLC wins; ties resolve
+deterministically.
+
+The short operation forms (`{set, V}`, `clear`) take the write HLC from the
+event `Key` (the dot the substrate stamps on append/replay); the explicit forms
+(`{set, H, V}`, `{clear, H}`) carry their own HLC. Both normalise to the same
+explicit clauses below, so resolution is identical.
+""".
+-spec apply_op(state(), op(), bondy_oplog_event:event_key()) -> state().
+
+apply_op(State, {set, V}, Key) ->
+    apply_op(State, {set, bondy_oplog_event:key_hlc(Key), V}, Key);
+apply_op(State, clear, Key) ->
+    apply_op(State, {clear, bondy_oplog_event:key_hlc(Key)}, Key);
+apply_op(undefined, {set, H, V}, _Key) ->
+    {set, V, H};
+apply_op(undefined, {clear, H}, _Key) ->
+    {cleared, H};
+apply_op({set, _OldV, OldH}, {set, H, V}, _Key) when H > OldH ->
+    {set, V, H};
+apply_op({set, OldV, OldH} = S, {set, H, V}, _Key) when H == OldH ->
+    %% Tie at same HLC — deterministic resolution on Erlang term order.
+    case V > OldV of
+        true -> {set, V, OldH};
+        false -> S
+    end;
+apply_op({set, _, _} = S, {set, _, _}, _Key) ->
+    %% Older HLC; rejected.
+    S;
+apply_op({set, _OldV, OldH}, {clear, H}, _Key) when H > OldH ->
+    {cleared, H};
+apply_op({set, _OldV, OldH}, {clear, H}, _Key) when H == OldH ->
+    %% Tie — cleared deterministically wins.
+    {cleared, OldH};
+apply_op({set, _, _} = S, {clear, _}, _Key) ->
+    %% Older clear; rejected.
+    S;
+apply_op({cleared, OldH}, {set, H, V}, _Key) when H > OldH ->
+    %% Later-HLC set resurrects the register (LWW: latest wins).
+    {set, V, H};
+apply_op({cleared, OldH} = S, {set, H, _}, _Key) when H =< OldH ->
+    %% Older or tied set; cleared retains (cleared wins at tie).
+    S;
+apply_op({cleared, OldH}, {clear, H}, _Key) ->
+    {cleared, erlang:max(OldH, H)}.
+
+%% =============================================================================
+%% projection seam
+%% =============================================================================
+
+-spec to_value(state()) -> undefined | register_value().
+
+to_value(undefined) -> undefined;
+to_value({set, V, _H}) -> V;
+to_value({cleared, _H}) -> undefined.
+
+-spec hlc(state()) -> bondy_connect_hlc:hlc().
+
+hlc(undefined) -> 0;
+hlc({set, _, H}) -> H;
+hlc({cleared, H}) -> H.
+
+-doc """
+Whole-cell removal for a register is `clear`.
+""".
+-spec removal_op() -> clear.
+
+removal_op() ->
+    clear.
+
+-doc """
+A `{cleared, H}` tombstone exists for exactly one purpose: to reject a
+concurrent `{set, _, H0}` with `H0 < H` that has not yet been delivered. Once
+`H` is causally stable no such operation can arrive again — every replica has
+delivered the clear, and per-origin HLC monotonicity means everything they send
+from here on is newer. The tombstone is then pure overhead and the cell can go.
+
+A live `{set, V, H}` is never discarded: it carries the value. Nothing in its
+representation is redundant once stable either, so there is no `{keep, _}`
+reduction to make — the HLC is still needed to order it against future writes.
+""".
+-spec stabilize(bondy_connect_hlc:hlc(), state()) -> keep | discard.
+
+stabilize(StableHlc, {cleared, H}) when H < StableHlc ->
+    discard;
+stabilize(_StableHlc, _State) ->
+    keep.
+
+-doc """
+The single operation that rebuilds an equivalent register from bottom, in
+the **explicit-HLC** form so the winner's own write HLC travels with the
+op rather than being re-stamped from a synthetic event key. Used by
+causal-stabilization folding
+(`bondy_oplog_crdt_nested_core:stabilize_fold/2`): LWW resolution is a
+deterministic maximum over `(HLC, tie-break)`, so replacing a stable run
+with its winner is exact against any operations folded later. `undefined`
+(bottom, nothing ever written) has no representing op.
+""".
+-spec state_to_op(state()) -> op() | undefined.
+
+state_to_op(undefined) ->
+    undefined;
+state_to_op({set, V, H}) ->
+    {set, H, V};
+state_to_op({cleared, H}) ->
+    {clear, H}.
+
+-spec value_equals_state() -> boolean().
+
+value_equals_state() ->
+    false.
+
+-spec order_independent() -> boolean().
+
+order_independent() ->
+    true.
+
+-spec encode_state(state()) -> binary().
+
+encode_state(undefined) ->
+    <<0>>;
+encode_state({set, V, H}) when is_integer(H) ->
+    %% V is an arbitrary term; term_to_binary/1 occupies the tail (no length
+    %% prefix needed), so decode reads it back with binary_to_term/1.
+    <<1, H:64/big-unsigned, (term_to_binary(V))/binary>>;
+encode_state({cleared, H}) when is_integer(H) ->
+    <<2, H:64/big-unsigned>>.
+
+-spec decode_state(binary()) -> state().
+
+decode_state(<<0>>) ->
+    undefined;
+decode_state(<<1, H:64/big-unsigned, VBin/binary>>) ->
+    %% Own projection bytes, so no `[safe]`: see `bondy_oplog_cell_kernel`.
+    {set, binary_to_term(VBin), H};
+decode_state(<<2, H:64/big-unsigned>>) ->
+    {cleared, H}.

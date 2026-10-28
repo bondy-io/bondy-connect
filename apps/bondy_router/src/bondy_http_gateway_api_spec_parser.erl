@@ -1,0 +1,1977 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_http_gateway_api_spec_parser).
+
+-moduledoc """
+Parser for the Bondy HTTP API Gateway specification format.
+
+Transforms JSON API specification documents into the internal
+representation used to generate Cowboy dispatch tables. A spec defines
+one or more versioned RESTful APIs, each with paths, HTTP methods,
+actions (WAMP calls, WAMP publishes, HTTP forwards, or static
+responses), and response mappings.
+
+## Specification hierarchy
+
+An API spec is a nested structure with inheritance at each level — lower
+levels override variables, defaults and status codes from higher levels:
+
+```
+Host Spec
+├── id, name, host, realm_uri
+├── variables, defaults, status_codes   (top-level inheritance)
+└── versions
+    └── Version Spec
+        ├── base_path, is_active, is_deprecated, pool_size, languages
+        ├── variables, defaults, status_codes   (override host-level)
+        └── paths
+            └── Path Spec
+                ├── is_collection, schemes, security, accepts, provides
+                ├── variables, defaults                (override version-level)
+                └── <method> (get, post, put, patch, delete, head, options)
+                    └── Request Method Spec
+                        ├── action   → Action Spec
+                        └── response → Response Spec
+```
+
+## Action types
+
+Each HTTP method handler contains an action that defines what happens
+when the endpoint is called:
+
+- `wamp_call` — calls a WAMP procedure and returns the result
+- `wamp_publish` — publishes to a WAMP topic
+- `forward` — proxies the request to an upstream HTTP service. When the
+  upstream gives no response, a request with an idempotent method (RFC 9110,
+  section 9.2.2) is sent up to `retries` more times, `retry_timeout`
+  milliseconds apart; a response of any status is returned as it is. A
+  request left without a response fails with `bondy.error.gateway_timeout`
+  when it timed out, and with `bondy.error.bad_gateway` otherwise
+  (`bondy_http_gateway_forward_SUITE`).
+- `static` — returns a static body and headers
+
+## MOPS expressions
+
+Values throughout the spec support MOPS (`mops`) template expressions
+using `{{path.to.key}}` syntax. At parse time, expressions referencing
+`variables` or `defaults` are resolved eagerly. Expressions referencing
+runtime context (`request`, `action`, `security`) are compiled into
+proxy funs that are evaluated at request time by
+`bondy_http_gateway_rest_handler`.
+
+## Validation
+
+The parser uses `maps_utils:validate/2` with the validation specs
+defined in this module (`?API_HOST`, `?API_VERSION`, `?API_PATH`,
+`?REQ_SPEC`, etc.). Invalid specs raise errors with descriptive
+messages.
+
+The host, version, path, method, response, action and security levels, and the
+`defaults` of the host, a version and a path, accept only the keys their spec
+declares, under any of its names. Any other key raises `{unsupported_keys,
+Where, Keys}`, where `Where` names the level (`{action, Type}` for an action,
+`{security, Type}` for a security scheme, `{defaults, Level}` for a `defaults`
+map), so a misspelt setting is refused rather than replaced by its default, and
+a setting the gateway does not implement, such as OAuth2 `scopes`, is refused
+rather than ignored. `bondy_http_api_gateway_SUITE` checks each level.
+
+The `info` map of a version or a method is free-form: no setting reads it, so
+the parser checks only that it is a map and keeps its keys
+(`info_is_free_form_test`).
+
+## Error URI → HTTP status code mapping
+
+The spec supports a `status_codes` map at the host and version levels
+that maps error URIs to HTTP status codes. It is merged over the
+defaults from `bondy_http_utils:default_status_codes/0`, which are
+derived from the error catalogue (e.g. `bondy.error.not_found` → 404,
+`wamp.error.not_authorized` → 403). Operator-supplied entries win.
+""".
+
+-include_lib("kernel/include/logger.hrl").
+
+%% Exported for `bondy_gateway_error_exposure_test`: the lint's rule is the
+%% part worth pinning, and reaching it through the log record would test the
+%% logger instead. Both are pure.
+-export([mops_expressions/1]).
+-export([exposing_refs/2]).
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("http_api.hrl").
+-include("bondy.hrl").
+-include("bondy_uris.hrl").
+
+-define(VARS_KEY, <<"variables">>).
+-define(DEFAULTS_KEY, <<"defaults">>).
+-define(STATUS_CODES_KEY, <<"status_codes">>).
+-define(LANGUAGES_KEY, <<"languages">>).
+
+-define(DEFAULT_CONN_TIMEOUT, 8000).
+-define(DEFAULT_TIMEOUT, 60000).
+-define(DEFAULT_RETRIES, 0).
+-define(DEFAULT_RETRY_TIMEOUT, 5000).
+-define(DEFAULT_ACCEPTS, [<<"application/json">>, <<"application/msgpack">>]).
+-define(DEFAULT_PROVIDES, [<<"application/json">>, <<"application/msgpack">>]).
+-define(DEFAULT_HEADERS, #{}).
+-define(DEFAULT_SCHEMES, [<<"http">>]).
+
+%% MAP VALIDATION SPECS to use with maps_utils.erl
+-define(HTTP_METHODS, [
+    <<"delete">>,
+    <<"get">>,
+    <<"head">>,
+    <<"options">>,
+    <<"patch">>,
+    <<"post">>,
+    <<"put">>
+]).
+
+-define(MOPS_PROXY_FUN_TYPE, tuple).
+
+-define(API_HOST, #{
+    <<"id">> => #{
+        alias => id,
+        required => true,
+        allow_null => false,
+        allow_undefined => false,
+        datatype => binary
+    },
+    <<"name">> => #{
+        alias => id,
+        required => true,
+        allow_null => false,
+        allow_undefined => false,
+        datatype => binary
+    },
+    <<"host">> => #{
+        alias => host,
+        required => true,
+        allow_null => false,
+        datatype => binary,
+        validator => fun
+            %% Cowboy needs an atom
+            (<<"_">>) -> {ok, '_'};
+            (Val) -> {ok, Val}
+        end
+    },
+    <<"realm_uri">> => #{
+        alias => realm_uri,
+        required => true,
+        allow_null => false,
+        datatype => binary
+    },
+    <<"meta">> => #{
+        alias => meta,
+        required => false,
+        datatype => map
+    },
+    ?VARS_KEY => #{
+        alias => variables,
+        required => true,
+        allow_null => false,
+        default => #{},
+        datatype => map
+    },
+    ?DEFAULTS_KEY => #{
+        alias => defaults,
+        required => true,
+        allow_null => false,
+        %% `maps_utils` inserts a default without running the validator, so the
+        %% default is the validated empty map (`bondy_http_api_gateway_SUITE`,
+        %% `absent_host_defaults_parse_as_empty_test`).
+        default => fun() ->
+            validate_known({defaults, host}, #{}, ?DEFAULTS_SPEC)
+        end,
+        datatype => map,
+        validator => fun(V) ->
+            {ok, validate_known({defaults, host}, V, ?DEFAULTS_SPEC)}
+        end
+    },
+    ?STATUS_CODES_KEY => #{
+        alias => paths,
+        required => true,
+        allow_null => false,
+        allow_undefined => false,
+        datatype => map,
+        default => #{}
+    },
+    <<"versions">> => #{
+        alias => versions,
+        required => true,
+        allow_null => false,
+        datatype => map
+    }
+}).
+
+-define(API_VERSION, #{
+    <<"base_path">> => #{
+        alias => base_path,
+        required => true,
+        allow_null => false,
+        datatype => binary
+    },
+    <<"is_active">> => #{
+        alias => is_active,
+        required => true,
+        allow_null => false,
+        default => true,
+        datatype => boolean
+    },
+    <<"is_deprecated">> => #{
+        alias => is_deprecated,
+        required => true,
+        allow_null => false,
+        default => false,
+        datatype => boolean
+    },
+    <<"pool_size">> => #{
+        alias => pool_size,
+        required => true,
+        allow_null => false,
+        default => 200,
+        datatype => pos_integer
+    },
+    <<"info">> => #{
+        alias => info,
+        required => false,
+        datatype => map
+    },
+    ?VARS_KEY => #{
+        alias => variables,
+        required => true,
+        allow_null => false,
+        default => #{},
+        datatype => map
+    },
+    ?DEFAULTS_KEY => #{
+        alias => defaults,
+        required => true,
+        allow_null => false,
+        default => #{},
+        datatype => map,
+        validator => fun(V) ->
+            {ok, only_known({defaults, version}, V, ?DEFAULTS_SPEC)}
+        end
+    },
+    ?STATUS_CODES_KEY => #{
+        alias => paths,
+        required => true,
+        allow_null => false,
+        allow_undefined => false,
+        datatype => map,
+        default => #{}
+    },
+    ?LANGUAGES_KEY => #{
+        alias => languages,
+        required => true,
+        allow_null => false,
+        allow_undefined => false,
+        default => [<<"en">>],
+        datatype => {list, binary}
+    },
+    <<"paths">> => #{
+        alias => paths,
+        required => true,
+        allow_null => false,
+        datatype => map,
+        validator => fun(M1) ->
+            Inner = fun
+                (<<"/">> = P, _) ->
+                    error({invalid_path, P});
+                (<<"/ws">> = P, _) ->
+                    error({reserved_path, P});
+                (_, Val) ->
+                    Val
+            end,
+            {ok, maps:map(Inner, M1)}
+        end
+    }
+}).
+
+-define(DEFAULTS_SPEC, #{
+    <<"schemes">> => #{
+        alias => schemes,
+        required => true,
+        default => ?DEFAULT_SCHEMES
+    },
+    <<"security">> => #{
+        alias => security,
+        required => true,
+        allow_null => false,
+        default => #{}
+    },
+    <<"body_max_bytes">> => #{
+        alias => body_max_bytes,
+        required => true,
+        datatype => pos_integer,
+        default => 25000000
+    },
+    <<"body_read_bytes">> => #{
+        alias => body_read_bytes,
+        required => true,
+        datatype => pos_integer,
+        %% 8MB is Cowboy 2 default
+        default => 8000000
+    },
+    <<"body_read_seconds">> => #{
+        alias => body_read_seconds,
+        required => true,
+        datatype => pos_integer,
+        %% 15 secs is Cowboy 2 default
+        default => 15000
+    },
+    <<"timeout">> => #{
+        alias => timeout,
+        required => true,
+        default => ?DEFAULT_TIMEOUT
+    },
+    <<"connect_timeout">> => #{
+        alias => connect_timeout,
+        required => true,
+        default => ?DEFAULT_CONN_TIMEOUT
+    },
+    <<"retries">> => #{
+        alias => retries,
+        required => true,
+        default => ?DEFAULT_RETRIES
+    },
+    <<"retry_timeout">> => #{
+        alias => retry_timeout,
+        required => true,
+        default => ?DEFAULT_RETRY_TIMEOUT
+    },
+    <<"accepts">> => #{
+        alias => accepts,
+        required => true,
+        allow_null => false,
+        default => ?DEFAULT_ACCEPTS
+    },
+    <<"provides">> => #{
+        alias => provides,
+        required => true,
+        allow_null => false,
+        default => ?DEFAULT_PROVIDES
+    },
+    <<"headers">> => #{
+        alias => headers,
+        required => true,
+        allow_null => false,
+        default => ?DEFAULT_HEADERS
+    }
+}).
+
+-define(BASIC, #{
+    <<"type">> => #{
+        alias => type,
+        required => true,
+        allow_null => false,
+        default => <<"basic">>,
+        datatype => {in, [<<"basic">>]}
+    },
+    <<"schemes">> => #{
+        alias => schemes,
+        required => true,
+        allow_null => false,
+        default => ?DEFAULT_SCHEMES,
+        datatype => {list, binary}
+    }
+}).
+
+-define(APIKEY, #{
+    <<"type">> => #{
+        alias => type,
+        required => true,
+        allow_null => false,
+        default => <<"api_key">>,
+        datatype => {in, [<<"api_key">>]}
+    },
+    <<"schemes">> => #{
+        alias => schemes,
+        required => true,
+        allow_null => false,
+        default => ?DEFAULT_SCHEMES,
+        datatype => {list, binary}
+    },
+    <<"header_name">> => #{
+        alias => header_name,
+        required => true,
+        allow_null => false,
+        default => <<"authorization">>,
+        datatype => binary
+    }
+}).
+
+-define(OIDC_SPEC, #{
+    <<"type">> => #{
+        alias => type,
+        required => true,
+        allow_null => false,
+        datatype => {in, [<<"oidc">>]}
+    },
+    <<"provider">> => #{
+        alias => provider,
+        required => true,
+        allow_null => false,
+        datatype => binary
+    },
+    <<"verify_path">> => #{
+        alias => verify_path,
+        required => false,
+        datatype => binary
+    },
+    <<"description">> => #{
+        alias => description,
+        required => false,
+        datatype => binary
+    }
+}).
+
+-define(OAUTH2_SPEC, #{
+    <<"type">> => #{
+        alias => type,
+        required => true,
+        allow_null => false,
+        datatype => {in, [<<"oauth2">>]}
+    },
+    <<"schemes">> => #{
+        alias => scheme,
+        required => true,
+        allow_null => false,
+        default => ?DEFAULT_SCHEMES,
+        datatype => {list, binary}
+    },
+    <<"flow">> => #{
+        alias => flow,
+        required => true,
+        default => null,
+        datatype =>
+            {in, [
+                <<"authorization_code">>,
+                <<"implicit">>,
+                <<"resource_owner_password_credentials">>,
+                <<"client_credentials">>
+            ]}
+    },
+    <<"token_path">> => #{
+        alias => token_path,
+        required => false,
+        datatype => binary
+    },
+    <<"revoke_token_path">> => #{
+        alias => revoke_token_path,
+        required => false,
+        datatype => binary
+    },
+    <<"verify_path">> => #{
+        alias => verify_path,
+        required => false,
+        datatype => binary
+    },
+    <<"description">> => #{
+        alias => description,
+        required => false,
+        datatype => binary
+    }
+}).
+
+-define(DEFAULT_PATH, #{
+    <<"variables">> => #{},
+    <<"defaults">> => #{},
+    <<"is_collection">> => false,
+    <<"accepts">> => <<"{{defaults.accepts}}">>,
+    <<"provides">> => <<"{{defaults.provides}}">>,
+    <<"schemes">> => <<"{{defaults.schemes}}">>,
+    <<"security">> => <<"{{defaults.security}}">>
+}).
+
+-define(API_PATH, #{
+    <<"is_collection">> => #{
+        alias => is_collection,
+        required => true,
+        allow_null => false,
+        datatype => boolean
+    },
+    ?VARS_KEY => #{
+        alias => variables,
+        required => true,
+        datatype => map
+    },
+    ?DEFAULTS_KEY => #{
+        alias => defaults,
+        required => true,
+        allow_null => false,
+        datatype => map
+    },
+    <<"accepts">> => #{
+        alias => accepts,
+        required => true,
+        allow_null => false,
+        datatype => {list, binary}
+    },
+    <<"provides">> => #{
+        alias => provides,
+        required => true,
+        allow_null => false,
+        datatype => {list, binary}
+    },
+    <<"schemes">> => #{
+        alias => schemes,
+        required => true,
+        allow_null => false,
+        datatype => {list, binary}
+    },
+    <<"security">> => #{
+        alias => security,
+        required => true,
+        allow_null => false,
+        datatype => [map, binary, ?MOPS_PROXY_FUN_TYPE],
+        validator => fun
+            (#{<<"type">> := <<"oauth2">> = T} = V) ->
+                {ok, validate_known({security, T}, V, ?OAUTH2_SPEC)};
+            (#{<<"type">> := <<"oidc">> = T} = V) ->
+                {ok, validate_known({security, T}, V, ?OIDC_SPEC)};
+            (#{<<"type">> := <<"basic">> = T} = V) ->
+                {ok, validate_known({security, T}, V, ?BASIC)};
+            (#{<<"type">> := <<"api_key">> = T} = V) ->
+                {ok, validate_known({security, T}, V, ?APIKEY)};
+            (V) ->
+                #{} =:= V
+        end
+    },
+    <<"delete">> => #{
+        alias => delete,
+        required => false,
+        %% To support mop expressions
+        datatype => [binary, map]
+    },
+    <<"get">> => #{
+        alias => get,
+        required => false,
+        %% To support mop expressions
+        datatype => [binary, map]
+    },
+    <<"head">> => #{
+        alias => head,
+        required => false,
+        %% To support mop expressions
+        datatype => [binary, map]
+    },
+    <<"options">> => #{
+        alias => options,
+        required => false,
+        %% To support mop expressions
+        datatype => [binary, map]
+    },
+    <<"patch">> => #{
+        alias => patch,
+        required => false,
+        %% To support mop expressions
+        datatype => [binary, map]
+    },
+    <<"post">> => #{
+        alias => post,
+        required => false,
+        %% To support mop expressions
+        datatype => [binary, map]
+    },
+    <<"put">> => #{
+        alias => put,
+        required => false,
+        %% To support mop expressions
+        datatype => [binary, map]
+    },
+    <<"summary">> => #{
+        alias => summary,
+        required => false,
+        datatype => binary
+    },
+    <<"description">> => #{
+        alias => description,
+        required => false,
+        datatype => binary
+    }
+}).
+
+-define(PATH_DEFAULTS, #{
+    <<"schemes">> => #{
+        alias => schemes,
+        required => true,
+        default => <<"{{defaults.schemes}}">>
+    },
+    <<"security">> => #{
+        alias => security,
+        required => true,
+        allow_null => false,
+        datatype => map
+    },
+    <<"body_max_bytes">> => #{
+        alias => body_max_bytes,
+        required => true,
+        datatype => pos_integer,
+        default => 25000000
+    },
+    <<"body_read_bytes">> => #{
+        alias => body_read_bytes,
+        required => true,
+        datatype => pos_integer,
+        %% 8MB is Cowboy 2 default
+        default => 8000000
+    },
+    <<"body_read_seconds">> => #{
+        alias => body_read_seconds,
+        required => true,
+        datatype => pos_integer,
+        %% 15 secs is Cowboy 2 default
+        default => 15000
+    },
+    <<"timeout">> => #{
+        alias => timeout,
+        required => true,
+        datatype => timeout
+    },
+    <<"connect_timeout">> => #{
+        alias => connect_timeout,
+        required => true,
+        datatype => timeout
+    },
+    <<"retries">> => #{
+        alias => retries,
+        required => true,
+        datatype => integer
+    },
+    <<"retry_timeout">> => #{
+        alias => retry_timeout,
+        required => true,
+        datatype => integer
+    },
+    <<"accepts">> => #{
+        alias => accepts,
+        required => true,
+        allow_null => false,
+        datatype => {list, binary}
+    },
+    <<"provides">> => #{
+        alias => provides,
+        required => true,
+        allow_null => false,
+        datatype => {list, binary}
+    },
+    <<"headers">> => #{
+        alias => headers,
+        required => true,
+        allow_null => false
+    }
+}).
+
+-define(DEFAULT_REQ, #{
+    <<"body_max_bytes">> => <<"{{defaults.body_max_bytes}}">>,
+    <<"body_read_bytes">> => <<"{{defaults.body_read_bytes}}">>,
+    <<"body_read_seconds">> => <<"{{defaults.body_read_seconds}}">>
+}).
+
+-define(REQ_SPEC, #{
+    <<"info">> => #{
+        alias => info,
+        required => false,
+        datatype => map
+    },
+    <<"body_max_bytes">> => #{
+        alias => body_max_bytes,
+        required => true,
+        datatype => [pos_integer, binary, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"body_read_bytes">> => #{
+        alias => body_read_bytes,
+        required => true,
+        datatype => [pos_integer, binary, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"body_read_seconds">> => #{
+        alias => body_read_seconds,
+        required => true,
+        datatype => [pos_integer, binary, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"action">> => #{
+        alias => action,
+        required => true,
+        allow_null => false,
+        validator => fun
+            (#{<<"type">> := <<"wamp_call">>} = V) ->
+                {ok, maps_utils:validate(V, ?WAMP_RPC_ACTION_SPEC)};
+            (#{<<"type">> := <<"wamp_publish">>} = V) ->
+                {ok, maps_utils:validate(V, ?WAMP_PUBSUB_ACTION_SPEC)};
+            (#{<<"type">> := <<"static">>} = V) ->
+                {ok, maps_utils:validate(V, ?STATIC_ACTION_SPEC)};
+            (#{<<"type">> := <<"forward">>} = V) ->
+                {ok, maps_utils:validate(V, ?FWD_ACTION_SPEC)};
+            (V) ->
+                #{} =:= V
+        end
+    },
+    <<"response">> => #{
+        alias => response,
+        required => true,
+        allow_null => false
+    }
+}).
+
+-define(BODY_ALL_DATATYPES, [
+    binary,
+    boolean,
+    list,
+    map,
+    number,
+    string,
+    ?MOPS_PROXY_FUN_TYPE
+]).
+
+-define(DEFAULT_STATIC_ACTION, #{
+    <<"body">> => <<>>,
+    <<"headers">> => #{}
+}).
+
+-define(STATIC_ACTION_SPEC, #{
+    <<"type">> => #{
+        alias => type,
+        required => true,
+        allow_null => false,
+        datatype => {in, [<<"static">>]}
+    },
+    <<"headers">> => #{
+        alias => headers,
+        required => true,
+        datatype => [map, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"body">> => #{
+        alias => body,
+        required => true,
+        datatype => ?BODY_ALL_DATATYPES
+    }
+}).
+
+-define(DEFAULT_FWD_ACTION, #{
+    <<"path">> => <<"{{request.path}}">>,
+    <<"query_string">> => <<"{{request.query_string}}">>,
+    <<"headers">> => <<"{{request.headers}}">>,
+    <<"body">> => <<"{{request.body}}">>,
+    <<"timeout">> => <<"{{defaults.timeout}}">>,
+    <<"connect_timeout">> => <<"{{defaults.connect_timeout}}">>,
+    <<"retries">> => <<"{{defaults.retries}}">>,
+    <<"retry_timeout">> => <<"{{defaults.retry_timeout}}">>
+}).
+
+-define(FWD_ACTION_SPEC, #{
+    <<"type">> => #{
+        alias => type,
+        required => true,
+        allow_null => false,
+        datatype => {in, [<<"forward">>]}
+    },
+    <<"http_method">> => #{
+        alias => host,
+        required => false,
+        allow_null => false,
+        datatype =>
+            {in, [
+                <<"delete">>,
+                <<"get">>,
+                <<"head">>,
+                <<"options">>,
+                <<"patch">>,
+                <<"post">>,
+                <<"put">>
+            ]}
+    },
+    <<"host">> => #{
+        alias => host,
+        required => true,
+        allow_null => false,
+        datatype => binary
+    },
+    <<"path">> => #{
+        alias => path,
+        required => true,
+        datatype => [binary, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"query_string">> => #{
+        alias => query_string,
+        required => true,
+        datatype => [binary, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"headers">> => #{
+        alias => headers,
+        required => true,
+        datatype => [map, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"body">> => #{
+        alias => body,
+        required => true,
+        datatype => ?BODY_ALL_DATATYPES
+    },
+    <<"timeout">> => #{
+        alias => timeout,
+        required => true,
+        datatype => [timeout, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"connect_timeout">> => #{
+        alias => connect_timeout,
+        required => true,
+        datatype => [timeout, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"retries">> => #{
+        alias => retries,
+        required => true,
+        datatype => [non_neg_integer, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"retry_timeout">> => #{
+        alias => retry_timeout,
+        required => true,
+        datatype => [non_neg_integer, ?MOPS_PROXY_FUN_TYPE]
+    }
+}).
+
+-define(DEFAULT_WAMP_PUBLISH_ACTION, #{
+    <<"options">> => #{},
+    <<"args">> => [],
+    <<"kwargs">> => #{},
+    <<"timeout">> => <<"{{defaults.timeout}}">>
+}).
+
+-define(DEFAULT_WAMP_CALL_ACTION, #{
+    <<"options">> => #{},
+    <<"args">> => [],
+    <<"kwargs">> => #{},
+    <<"timeout">> => <<"{{defaults.timeout}}">>,
+    <<"retries">> => <<"{{defaults.retries}}">>
+}).
+
+-define(WAMP_RPC_ACTION_SPEC, #{
+    <<"type">> => #{
+        alias => type,
+        required => true,
+        allow_null => false,
+        datatype =>
+            {in, [
+                <<"wamp_call">>
+            ]}
+    },
+    <<"timeout">> => #{
+        alias => timeout,
+        required => true,
+        datatype => [timeout, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"retries">> => #{
+        alias => retries,
+        required => true,
+        datatype => [non_neg_integer, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"procedure">> => #{
+        alias => procedure,
+        required => true,
+        allow_null => false,
+        datatype => [binary, ?MOPS_PROXY_FUN_TYPE],
+        validator => fun
+            (X) when is_binary(X) -> bondy_wamp_uri:is_valid(X);
+            (X) -> mops:is_proxy(X)
+        end
+    },
+    <<"options">> => #{
+        alias => options,
+        required => true,
+        allow_null => true,
+        datatype => [map, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"args">> => #{
+        aliases => [args, <<"arguments">>, arguments],
+        required => true,
+        allow_null => true,
+        datatype => [list, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"kwargs">> => #{
+        aliases => [kwargs, <<"arguments_kw">>, arguments_kw],
+        required => true,
+        allow_null => true,
+        datatype => [map, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"payload">> => #{
+        aliases => [payload],
+        required => false,
+        allow_null => true,
+        datatype => [binary, ?MOPS_PROXY_FUN_TYPE]
+    }
+}).
+
+-define(WAMP_PUBSUB_ACTION_SPEC, #{
+    <<"type">> => #{
+        alias => type,
+        required => true,
+        allow_null => false,
+        datatype =>
+            {in, [
+                <<"wamp_publish">>
+            ]}
+    },
+    <<"timeout">> => #{
+        alias => timeout,
+        required => true,
+        datatype => [timeout, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"topic">> => #{
+        alias => procedure,
+        required => true,
+        allow_null => false,
+        datatype => [binary, ?MOPS_PROXY_FUN_TYPE],
+        validator => fun
+            (X) when is_binary(X) -> bondy_wamp_uri:is_valid(X);
+            (X) -> mops:is_proxy(X)
+        end
+    },
+    <<"options">> => #{
+        alias => options,
+        required => true,
+        allow_null => true,
+        datatype => [map, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"args">> => #{
+        aliases => [args, <<"arguments">>, arguments],
+        required => true,
+        allow_null => true,
+        datatype => [list, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"kwargs">> => #{
+        aliases => [kwargs, <<"arguments_kw">>, arguments_kw],
+        required => true,
+        allow_null => true,
+        datatype => [map, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"payload">> => #{
+        aliases => [payload],
+        required => false,
+        allow_null => true,
+        datatype => [binary, ?MOPS_PROXY_FUN_TYPE]
+    }
+}).
+
+-define(DEFAULT_RESPONSE, #{
+    <<"headers">> => <<"{{defaults.headers}}">>,
+    <<"body">> => <<>>
+}).
+
+-define(RESPONSE_SPEC, #{
+    <<"headers">> => #{
+        alias => headers,
+        required => true,
+        allow_null => false,
+        datatype => [map, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"body">> => #{
+        alias => body,
+        required => true,
+        allow_null => false,
+        datatype => ?BODY_ALL_DATATYPES
+    },
+    <<"status_code">> => #{
+        alias => status_code,
+        required => false,
+        allow_null => false,
+        datatype => [integer, binary, ?MOPS_PROXY_FUN_TYPE]
+    },
+    <<"uri">> => #{
+        alias => uri,
+        required => false,
+        allow_null => false,
+        datatype => [binary, ?MOPS_PROXY_FUN_TYPE]
+    }
+}).
+
+-define(VAR(Term), {var, Term}).
+
+-define(SCHEME_HEAD, {
+    ?VAR(scheme),
+    ?VAR(host),
+    ?VAR(realm),
+    ?VAR(path),
+    ?VAR(mod),
+    ?VAR(state)
+}).
+
+-type scheme_rule() :: {
+    Scheme :: binary(),
+    Host :: route_match(),
+    Realm :: binary(),
+    Path :: route_match(),
+    Handler :: module(),
+    Opts :: any()
+}.
+%% Cowboy types
+-type route_path() :: {
+    Path :: route_match(),
+    Handler :: module(),
+    Opts :: any()
+}.
+-type route_rule() :: {Host :: route_match(), Paths :: [route_path()]}.
+-type route_match() :: '_' | iodata().
+
+-export([from_file/1]).
+-export([parse/1]).
+-export([dispatch_table/1]).
+-export([dispatch_table/2]).
+-export([is_realm_available/1]).
+
+-ifdef(TEST).
+%% Exposed so the error body it builds can be driven directly, without
+%% standing up a whole API spec whose evaluation fails.
+-export([mops_eval/2]).
+-endif.
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-doc """
+Reads a JSON API spec from `Filename` and parses it.
+
+Returns `{ok, ParsedSpec}` on success, or `{error, Reason}` if the file
+cannot be read, contains invalid JSON, or the spec fails validation.
+""".
+-spec from_file(file:filename()) -> {ok, any()} | {error, any()}.
+
+from_file(Filename) ->
+    case bondy_router_utils:json_consult(Filename) of
+        {ok, Spec} when is_map(Spec) ->
+            {ok, parse(Spec, get_context_proxy())};
+        {ok, _} ->
+            {error, invalid_specification_format};
+        {error, Reason} ->
+            ?LOG_WARNING(#{
+                description =>
+                    "Error while parsing API Gateway Specification file",
+                filename => Filename,
+                reason => Reason
+            }),
+            {error, invalid_json_format}
+    end.
+
+-doc """
+Parses a JSON API spec map into the internal representation.
+
+Applies all defaults, resolves `variables` and `defaults` inheritance
+across the host → version → path hierarchy, evaluates MOPS expressions,
+and validates every section against its schema. Returns the fully parsed
+spec map on success.
+
+Runtime MOPS expressions (those referencing `request`, `action`, or
+`security`) are compiled into proxy funs rather than eagerly evaluated.
+
+Raises on invalid specs. Returns `{error, invalid_specification_format}`
+if the argument is not a map.
+""".
+-spec parse(Spec :: map()) ->
+    map() | {error, invalid_specification_format} | no_return().
+
+parse(Spec) when is_map(Spec) ->
+    parse(Spec, get_context_proxy());
+parse(_) ->
+    {error, invalid_specification_format}.
+
+-doc """
+Generates a Cowboy dispatch table from one or more parsed API specs.
+
+Accepts a single parsed spec map or a list of them (as returned by
+`parse/1`). Returns a list of `{Scheme, [route_rule()]}` tuples — one
+entry per scheme (`<<"http">>`, `<<"https">>`) — ready to be compiled
+with `cowboy_router:compile/1`.
+
+Equivalent to `dispatch_table(Specs, [])` (no additional base routes).
+""".
+-spec dispatch_table([map()] | map()) ->
+    [{Scheme :: binary(), [route_rule()]}] | no_return().
+
+dispatch_table(API) when is_map(API) ->
+    dispatch_table([API]);
+dispatch_table(Specs) when is_list(Specs) ->
+    %% Validation path (user-initiated create): STRICT — a route targeting a
+    %% realm that does not exist is an error the caller must see.
+    build_dispatch_table(Specs, [], error).
+
+-doc """
+Generates a Cowboy dispatch table, merging in additional base routes.
+
+Like `dispatch_table/1`, but appends `RulesToAdd` (a list of Cowboy
+route rules, e.g. `[{'_', [{Path, Handler, Opts}]}]`) to every scheme
+in the result. This is used to ensure base routes like the `/ws`
+WebSocket endpoint are always present.
+
+The resulting dispatch table is **not** installed into Cowboy — the
+caller must compile it with `cowboy_router:compile/1` and update the
+listener environment.
+""".
+-spec dispatch_table([map()] | map(), [route_rule()]) ->
+    [{Scheme :: binary(), [route_rule()]}] | no_return().
+
+dispatch_table(API, RulesToAdd) when is_map(API) ->
+    dispatch_table([API], RulesToAdd);
+dispatch_table(L, RulesToAdd) when is_list(L), is_list(RulesToAdd) ->
+    %% Rebuild path (`bondy_http_gateway:load_dispatch_tables/0` calls
+    %% `dispatch_table/2`), which
+    %% which runs on every anti-entropy change: LENIENT — a spec can be replicated
+    %% via AAE before the realm it targets, so skip routes whose realm does not
+    %% exist and rebuild later (the api_gateway reactor / realm lifecycle
+    %% re-trigger `rebuild_dispatch_tables/0`) rather than crash the gateway under
+    %% `bondy_router_sup`.
+    build_dispatch_table(L, RulesToAdd, skip).
+
+%% @private
+%% Builds the scheme/route dispatch table. `OnMissingRealm` selects what happens
+%% to a route whose realm is absent: `error` (strict — user-initiated create)
+%% raises so the caller sees it; `skip` (lenient — AAE-driven rebuild) drops the
+%% route and logs, so a spec that arrived before its realm cannot crash-loop the
+%% gateway.
+build_dispatch_table(L, RulesToAdd, OnMissingRealm) ->
+    SchemeRules0 = lists:flatten([do_dispatch_table(X) || X <- L]),
+    SchemeRules = handle_missing_realms(SchemeRules0, OnMissingRealm),
+    R0 = leap_relation:relation(?SCHEME_HEAD, SchemeRules),
+
+    %% We add the additional rules
+    Schemes = leap_relation:tuples(leap_relation:project(R0, [{var, scheme}])),
+    A0 = leap_relation:relation(?SCHEME_HEAD, [
+        {S, H, undefined, P, M, O}
+     || {H, HRules} <- RulesToAdd,
+        {P, M, O} <- HRules,
+        {S} <- Schemes
+    ]),
+    R1 = leap_relation:union(R0, A0),
+
+    PMS = {function, collect, [?VAR(path), ?VAR(mod), ?VAR(state)]},
+    Proj1 = {?VAR(scheme), ?VAR(host), {as, PMS, ?VAR(pms)}},
+
+    %% [{scheme, host, [{path, mode, state}]}]
+    R2 = leap_relation:summarize(R1, Proj1, #{}),
+    HPMS = {function, collect, [?VAR(host), ?VAR(pms)]},
+    Proj2 = {?VAR(scheme), {as, HPMS, ?VAR(hpms)}},
+    SHP = leap_relation:summarize(R2, Proj2, #{}),
+    leap_relation:tuples(SHP).
+
+%% @private
+%% `error`: assert every targeted realm exists (strict; user create).
+%% `skip`: drop routes whose realm is absent and log once (lenient; AAE rebuild).
+handle_missing_realms(Rules, error) ->
+    _ = [
+        check_realm_exists(element(3, Rule))
+     || Rule <- Rules, element(3, Rule) =/= undefined
+    ],
+    Rules;
+handle_missing_realms(Rules, skip) ->
+    {Keep, Drop} = lists:partition(
+        fun(Rule) ->
+            Realm = element(3, Rule),
+            Realm =:= undefined orelse is_realm_available(Realm)
+        end,
+        Rules
+    ),
+    _ =
+        case Drop of
+            [] ->
+                ok;
+            _ ->
+                ?LOG_WARNING(#{
+                    description =>
+                        "Skipping API Gateway routes whose realm does not "
+                        "exist yet (e.g. the spec replicated via anti-entropy "
+                        "before its realm). They load on the next rebuild once "
+                        "the realm is present.",
+                    realms => lists:usort([element(3, R) || R <- Drop])
+                })
+        end,
+    Keep.
+
+-doc """
+Returns `true` when `Realm` exists on this node, the condition under which
+`dispatch_table/2` installs a route targeting it.
+
+An unavailable realm table counts as an absent realm: a degraded boot whose
+main database failed to open must still build its listeners' dispatch tables
+(`bondy_degraded_boot_SUITE` boots through this path), and the routes load on
+the next rebuild once the store is back.
+""".
+-spec is_realm_available(uri()) -> boolean().
+
+is_realm_available(Realm) ->
+    try
+        bondy_realm:exists(Realm)
+    catch
+        error:bondy_realm_table_unavailable ->
+            false
+    end.
+
+%% =============================================================================
+%% PRIVATE: PARSING THE API SPECIFICATION
+%% =============================================================================
+
+%% @private
+-spec parse(Spec :: map(), Ctxt :: map()) ->
+    NewSpec :: map() | {error, invalid_specification_format} | no_return().
+
+parse(Spec, Ctxt) when is_map(Spec) ->
+    parse_host(validate_known(host, Spec, ?API_HOST), Ctxt);
+parse(_, _) ->
+    {error, invalid_specification_format}.
+
+%% @private
+-spec parse_host(map(), map()) -> map().
+parse_host(Host0, Ctxt0) ->
+    {Vars, Host1} = maps:take(?VARS_KEY, Host0),
+    {Defs, Host2} = maps:take(?DEFAULTS_KEY, Host1),
+    {Codes, Host3} = maps:take(?STATUS_CODES_KEY, Host2),
+
+    Ctxt1 = Ctxt0#{
+        ?VARS_KEY => Vars,
+        ?DEFAULTS_KEY => Defs,
+        %% Operator-supplied codes override the defaults, matching both
+        %% the documented behaviour and the version-level merge below.
+        ?STATUS_CODES_KEY => maps:merge(
+            bondy_http_utils:default_status_codes(), Codes
+        )
+    },
+
+    Vs0 = maps:get(<<"versions">>, Host3),
+    Fun = fun(_, V) -> parse_version(V, Ctxt1) end,
+    Vs1 = maps:map(Fun, Vs0),
+    Host4 = maps:without([?VARS_KEY, ?DEFAULTS_KEY], Host3),
+    maps:update(<<"versions">>, Vs1, Host4).
+
+%% @private
+-spec parse_version(map(), map()) -> map().
+parse_version(V0, Ctxt0) ->
+    {V1, Ctxt1} = merge_eval_vars(V0, Ctxt0),
+    V2 = validate_known(version, V1, ?API_VERSION),
+    %% We merge again in case the validation added defaults
+    {V3, Ctxt2} = merge_eval_vars(V2, Ctxt1),
+    {Codes1, V4} = maps:take(?STATUS_CODES_KEY, V3),
+    Codes0 = maps:get(?STATUS_CODES_KEY, Ctxt1),
+    Ctxt3 = maps:put(?STATUS_CODES_KEY, maps:merge(Codes0, Codes1), Ctxt2),
+
+    Fun = fun(Uri, P) ->
+        try
+            parse_path(P, Ctxt3)
+        catch
+            error:{badkey, Key} ->
+                error({
+                    badarg,
+                    <<"The key '", Key/binary, "' does not exist in path '",
+                        Uri/binary, "'.">>
+                })
+        end
+    end,
+    V5 = maps:without([?VARS_KEY, ?DEFAULTS_KEY], V4),
+
+    %% The security scheme endpoints (`/oauth/token`, `/oidc/login`, `verify`)
+    %% belong to the API version, not to any individual path, so
+    %% `dispatch_table_version/3` needs the version's resolved `security` and
+    %% `schemes`. We cannot read them back off `V5`: `eval_vars/2` narrows a
+    %% spec's own `defaults` to the keys that level declared, so a version that
+    %% inherits `security` from the API level has no copy of it. The
+    %% accumulated context does have the merged and evaluated value.
+    Defaults = maps:get(?DEFAULTS_KEY, Ctxt3, #{}),
+    V6 = V5#{
+        <<"security">> => maps:get(<<"security">>, Defaults, #{}),
+        <<"schemes">> => maps:get(<<"schemes">>, Defaults, ?DEFAULT_SCHEMES)
+    },
+
+    maps:update(
+        <<"paths">>, maps:map(Fun, maps:get(<<"paths">>, V6)), V6
+    ).
+
+%% @private
+parse_path(P0, Ctxt0) ->
+    %% The path should have at least one HTTP method
+    %% otherwise this will fail with an error
+    L = allowed_methods(P0),
+    P1 = maps:merge(?DEFAULT_PATH, P0),
+    {P2, Ctxt1} = merge_eval_vars(P1, eval_vars(Ctxt0)),
+
+    Ctxt2 = Ctxt1,
+    P3 = P2#{
+        ?DEFAULTS_KEY := validate_known(
+            {defaults, path}, maps:get(?DEFAULTS_KEY, P2), ?PATH_DEFAULTS
+        )
+    },
+
+    P4 = parse_path_elements(P3, Ctxt2),
+
+    P5 = validate_known(path, P4, ?API_PATH),
+    %% HTTP (and COWBOY) requires uppercase method names
+    P6 = maps:put(<<"allowed_methods">>, to_uppercase(L), P5),
+    P7 = maps:without([?VARS_KEY, ?DEFAULTS_KEY], P6),
+
+    PFun = fun(Method, IPath) ->
+        Sec0 = maps:get(Method, IPath),
+        try
+            Sec1 = parse_request_method(Method, Sec0, Ctxt2),
+            Sec2 = validate_known(method, Sec1, ?REQ_SPEC),
+            maps:update(Method, Sec2, IPath)
+        catch
+            error:{badkey, Key} ->
+                error(
+                    {badarg,
+                        <<"The key '", Key/binary,
+                            "' does not exist in path method section '",
+                            Method/binary, $'>>}
+                )
+        end
+    end,
+    lists:foldl(PFun, P7, L).
+
+%% @private
+parse_path_elements(Path, Ctxt) ->
+    L = [
+        <<"accepts">>,
+        <<"provides">>,
+        <<"schemes">>,
+        <<"security">>
+    ],
+    parse_path_elements(L, Path, Ctxt).
+
+%% @private
+parse_path_elements([H | T], P0, Ctxt) ->
+    P1 =
+        case maps:is_key(H, P0) of
+            true ->
+                P0;
+            false ->
+                %% We assign a default and fail if none exists
+                case maps:find(H, maps:get(?DEFAULTS_KEY, Ctxt)) of
+                    {ok, Val} ->
+                        maps:put(H, Val, P0);
+                    error ->
+                        error({
+                            badarg,
+                            <<"The key ", H/binary, " does not exist in path.">>
+                        })
+                end
+        end,
+    Eval = fun(V) -> mops_eval(V, Ctxt) end,
+    P2 = maps:update_with(H, Eval, P1),
+    parse_path_elements(T, P2, Ctxt);
+parse_path_elements([], Path, _) ->
+    Path.
+
+%% @private
+parse_request_method(Method, Spec, Ctxt) when is_binary(Spec) ->
+    parse_request_method(Method, mops_eval(Spec, Ctxt), Ctxt);
+parse_request_method(Method, Spec0, Ctxt) ->
+    Spec1 = maps:merge(?DEFAULT_REQ, Spec0),
+    #{
+        <<"action">> := Act,
+        <<"response">> := Resp,
+        <<"body_max_bytes">> := MB,
+        <<"body_read_bytes">> := BL,
+        <<"body_read_seconds">> := SL
+    } = Spec1,
+    Spec1#{
+        <<"action">> => parse_action(Method, Act, Ctxt),
+        <<"response">> => parse_response(Method, Resp, Ctxt),
+        <<"body_max_bytes">> => mops_eval(MB, Ctxt),
+        <<"body_read_bytes">> => mops_eval(BL, Ctxt),
+        <<"body_read_seconds">> => mops_eval(SL, Ctxt)
+    }.
+
+%% @private
+-doc """
+Parses a path action section definition. Before applying validations
+this function applies defaults values and evaluates all terms
+(using `mops:eval/2`).
+If the action type provided is not recognised it fails with
+`{unsupported_action_type, Type}`.
+A key that the action type does not declare fails with
+`{unsupported_keys, {action, Type}, Keys}`.
+If an action type is not provided if fails with `action_type_missing`.
+""".
+-spec parse_action(binary(), map(), map()) -> map().
+
+parse_action(_, #{<<"type">> := <<"wamp_call">>} = Spec, Ctxt) ->
+    validate_action(
+        Spec, ?DEFAULT_WAMP_CALL_ACTION, ?WAMP_RPC_ACTION_SPEC, Ctxt
+    );
+parse_action(_, #{<<"type">> := <<"wamp_publish">>} = Spec, Ctxt) ->
+    validate_action(
+        Spec, ?DEFAULT_WAMP_PUBLISH_ACTION, ?WAMP_PUBSUB_ACTION_SPEC, Ctxt
+    );
+parse_action(_, #{<<"type">> := <<"forward">>} = Spec, Ctxt) ->
+    validate_action(Spec, ?DEFAULT_FWD_ACTION, ?FWD_ACTION_SPEC, Ctxt);
+parse_action(_, #{<<"type">> := <<"static">>} = Spec, Ctxt) ->
+    validate_action(Spec, ?DEFAULT_STATIC_ACTION, ?STATIC_ACTION_SPEC, Ctxt);
+parse_action(_, #{<<"type">> := Type}, _) ->
+    error({unsupported_action_type, Type});
+parse_action(<<"options">>, Spec, _) ->
+    Spec;
+parse_action(_, _, _) ->
+    error(action_type_missing).
+
+%% A default gives way to a key given under any of its names, or it would shadow
+%% an alias.
+validate_action(#{<<"type">> := Type} = Spec, Defaults, ActionSpec, Ctxt) ->
+    Given = [
+        K
+     || K := Ns <- key_names(ActionSpec),
+        lists:any(fun(N) -> maps:is_key(N, Spec) end, Ns)
+    ],
+    validate_known(
+        {action, Type},
+        mops_eval(maps:merge(maps:without(Given, Defaults), Spec), Ctxt),
+        ActionSpec
+    ).
+
+%% `maps_utils:validate/2` drops the keys a spec does not declare, so the check
+%% for them runs first.
+validate_known(Where, Map, Spec) ->
+    maps_utils:validate(only_known(Where, Map, Spec), Spec).
+
+only_known(Where, Map, Spec) ->
+    Known = lists:append(maps:values(key_names(Spec))),
+    case lists:sort(maps:keys(maps:without(Known, Map))) of
+        [] -> Map;
+        Keys -> error({unsupported_keys, Where, Keys})
+    end.
+
+key_names(Spec) ->
+    #{
+        K => [K | maps:get(aliases, V, [])] ++
+            maps:values(maps:with([alias], V))
+     || K := V <- Spec
+    }.
+
+parse_response(Method, Spec0, Ctxt) ->
+    OR0 = maps:get(<<"on_result">>, Spec0, ?DEFAULT_RESPONSE),
+    OE0 = maps:get(<<"on_error">>, Spec0, ?DEFAULT_RESPONSE),
+    %% Linted BEFORE `mops_eval/2`: an expression that cannot be resolved at
+    %% spec time — which every `action.*` and `security.*` reference is — comes
+    %% back a proxy fun, and a fun cannot be read. This is the author's own
+    %% text.
+    ok = lint_response_exposure(Method, <<"on_result">>, OR0),
+    ok = lint_response_exposure(Method, <<"on_error">>, OE0),
+    [OR1, OE1] = [
+        validate_known(
+            response,
+            mops_eval(maps:merge(?DEFAULT_RESPONSE, X), Ctxt),
+            ?RESPONSE_SPEC
+        )
+     || X <- [OR0, OE0]
+    ],
+    #{
+        <<"on_result">> => OR1,
+        <<"on_error">> => OE1
+    }.
+
+%% @private
+%% Warns when a response body would hand an HTTP client something written for
+%% an operator.
+%%
+%% Two references do that. `{{action.error}}` renders the WHOLE upstream error
+%% — its URI, args and kwargs, or an upstream service's response body — and is
+%% the obvious thing to write while debugging an endpoint, works, and survives
+%% into production because nothing objects. `{{security.*}}` renders the
+%% caller's `authid`, `groups` and `meta`.
+%%
+%% A WARNING, not a refusal. Publishing a specification is control-plane
+%% authority — someone who can do it can do worse than leak an error string —
+%% so this is not a privilege boundary; the gap it closes is that the safe
+%% thing and the easy thing were not the same thing, and it closes it at the
+%% moment the author can still act. `{{action.error.id}}` is the alternative,
+%% and it names a log record carrying the whole error (see
+%% `bondy_http_gateway_rest_handler:log_action_error/3`).
+%%
+%% NARROWED references pass: `{{action.error.message}}` names one leaf the
+%% author chose. `{{action.error}}` alone does not.
+%%
+%% `security` is linted on BOTH responses; `action.error` only where it
+%% resolves. The default response body is `<<>>`, so a specification that says
+%% nothing about errors exposes nothing and is never warned about.
+lint_response_exposure(Method, Which, Spec) ->
+    Refs = lists:usort(
+        [
+            R
+         || Expr <- mops_expressions(Spec),
+            R <- exposing_refs(Which, Expr)
+        ]
+    ),
+    Refs == [] orelse
+        ?LOG_WARNING(#{
+            description =>
+                "API Gateway response body exposes internal detail to HTTP "
+                "clients; render `{{action.error.id}}` and read the logged "
+                "record instead",
+            method => Method,
+            response => Which,
+            references => Refs
+        }),
+    ok.
+
+%% @private
+%% Every `{{ ... }}` in the term, wherever it is nested. Matching the whole
+%% binary instead would fire on the word "security" in a literal message.
+mops_expressions(Term) when is_binary(Term) ->
+    case
+        re:run(Term, "\\{\\{(.*?)\\}\\}", [
+            global, dotall, {capture, all_but_first, binary}
+        ])
+    of
+        {match, Groups} -> lists:append(Groups);
+        nomatch -> []
+    end;
+mops_expressions(Term) when is_map(Term) ->
+    mops_expressions(maps:values(Term));
+mops_expressions(Term) when is_list(Term) ->
+    lists:append([mops_expressions(E) || E <- Term]);
+mops_expressions(_) ->
+    [].
+
+%% @private
+exposing_refs(Which, Expr) ->
+    Whole =
+        Which == <<"on_error">> andalso
+            re:run(Expr, "\\baction\\.error\\b(?!\\.)", [
+                {capture, none}
+            ]) == match,
+    Security = re:run(Expr, "\\bsecurity\\b", [{capture, none}]) == match,
+    [~"action.error" || Whole] ++ [~"security" || Security].
+
+%% @private
+-doc "Lower level variables and defaults override previous ones.".
+merge_eval_vars(Spec0, Ctxt0) ->
+    VVars = maps:get(?VARS_KEY, Spec0, #{}),
+    MVars = maps:merge(maps:get(?VARS_KEY, Ctxt0), VVars),
+    VDefs = maps:get(?DEFAULTS_KEY, Spec0, #{}),
+    MDefs = maps:merge(maps:get(?DEFAULTS_KEY, Ctxt0), VDefs),
+
+    Spec1 = Spec0#{?VARS_KEY => MVars, ?DEFAULTS_KEY => MDefs},
+    %% We also update the ctxt as we use it as an accumulator
+    Ctxt1 = maps:update(?VARS_KEY, MVars, Ctxt0),
+    Ctxt2 = maps:update(?DEFAULTS_KEY, MDefs, Ctxt1),
+    eval_vars(Spec1, Ctxt2).
+
+%% @private
+eval_vars(Ctxt) ->
+    element(1, eval_vars(Ctxt, Ctxt)).
+
+%% @private
+-doc """
+We assume Ctxt0 has been previously evaluated.
+Variables are evaluated before defaults
+
+If at level 1 we have:
+```
+a = b
+b = 1
+c = 2
+```
+After eval we get:
+```
+a = 1
+b = 1
+c = 2
+```
+
+If at level 2 we have:
+```
+a = 2
+c = b
+```
+After eval we get:
+```
+a = 2
+b = 1
+c = 1
+```
+""".
+eval_vars(S0, Ctxt0) ->
+    Vars = maps:get(?VARS_KEY, S0, #{}),
+    Defs = maps:get(?DEFAULTS_KEY, S0, #{}),
+    %% We evaluate variables by iterating over each
+    %% updating the context in each turn as we might have interdependencies
+    %% amongst them
+    VFun = fun(Var, Val, ICtxt) ->
+        IVars1 = maps:update(
+            Var, mops_eval(Val, ICtxt), maps:get(?VARS_KEY, ICtxt)
+        ),
+        maps:update(?VARS_KEY, IVars1, ICtxt)
+    end,
+    Ctxt1 = maps:fold(VFun, Ctxt0, Vars),
+
+    DFun = fun(Var, Val, ICtxt) ->
+        IDefs1 = maps:update(
+            Var, mops_eval(Val, ICtxt), maps:get(?DEFAULTS_KEY, ICtxt)
+        ),
+        maps:update(?DEFAULTS_KEY, IDefs1, ICtxt)
+    end,
+    Ctxt2 = maps:fold(DFun, Ctxt1, Defs),
+    S1 = S0#{
+        ?VARS_KEY => maps:with(maps:keys(Vars), maps:get(?VARS_KEY, Ctxt2)),
+        ?DEFAULTS_KEY => maps:with(
+            maps:keys(Defs), maps:get(?DEFAULTS_KEY, Ctxt2)
+        )
+    },
+    {S1, Ctxt2}.
+
+%% @private
+to_uppercase(L) when is_list(L) ->
+    [to_uppercase(M) || M <- L];
+to_uppercase(<<"delete">>) ->
+    <<"DELETE">>;
+to_uppercase(<<"get">>) ->
+    <<"GET">>;
+to_uppercase(<<"head">>) ->
+    <<"HEAD">>;
+to_uppercase(<<"options">>) ->
+    <<"OPTIONS">>;
+to_uppercase(<<"patch">>) ->
+    <<"PATCH">>;
+to_uppercase(<<"post">>) ->
+    <<"POST">>;
+to_uppercase(<<"put">>) ->
+    <<"PUT">>.
+
+%% @private
+allowed_methods(Path) ->
+    L = sets:to_list(
+        sets:intersection(
+            sets:from_list(?HTTP_METHODS),
+            sets:from_list(maps:keys(Path))
+        )
+    ),
+    case L of
+        [] ->
+            error(
+                {missing_required_key,
+                    <<"At least one request method should be specified">>}
+            );
+        _ ->
+            L
+    end.
+
+%% =============================================================================
+%% PRIVATE: GENERATING DISPATCH TABLE
+%% =============================================================================
+
+-spec do_dispatch_table(map()) -> [scheme_rule()].
+
+do_dispatch_table(API) ->
+    #{
+        <<"host">> := Host,
+        <<"realm_uri">> := Realm,
+        <<"versions">> := Vers
+    } = API,
+
+    lists:append([
+        dispatch_table_version(Host, Realm, V)
+     || V <- maps:to_list(Vers)
+    ]).
+
+-spec dispatch_table_version(binary(), binary(), tuple()) ->
+    [scheme_rule()] | no_return().
+
+dispatch_table_version(_, _, {_, #{<<"is_active">> := false}}) ->
+    [];
+dispatch_table_version(Host, Realm, {_Name, Version}) ->
+    #{
+        <<"base_path">> := BasePath,
+        <<"is_deprecated">> := Deprecated,
+        <<"paths">> := Paths
+    } = Version,
+
+    %% The security scheme endpoints are a property of the version, so they
+    %% are emitted here: a version declaring no paths (an API that exists
+    %% only to expose `/oidc/login` and the verify endpoint, see
+    %% `examples/config/oidc_api_spec.json`) would otherwise mount nothing.
+    %% `dispatch_table_path/6` emits them too for a path that overrides
+    %% `security`; identical rules collapse in the `leap_relation` set.
+    Sec = maps:get(<<"security">>, Version, #{}),
+    Schemes = maps:get(<<"schemes">>, Version, ?DEFAULT_SCHEMES),
+    SecurityRules = [
+        security_scheme_rules(S, Host, BasePath, Realm, Sec)
+     || S <- Schemes
+    ],
+
+    [
+        SecurityRules
+        | [
+            dispatch_table_path(Host, BasePath, Deprecated, Realm, P, Version)
+         || P <- maps:to_list(Paths)
+        ]
+    ].
+
+-spec dispatch_table_path(
+    binary(), binary(), boolean(), binary(), tuple(), map()
+) ->
+    [scheme_rule()] | no_return().
+
+dispatch_table_path(
+    Host, BasePath, Deprecated, Realm, {Path, Spec0}, Version
+) ->
+    AbsPath = <<BasePath/binary, Path/binary>>,
+    {Accepts, Spec1} = maps:take(<<"accepts">>, Spec0),
+    {Provides, Spec2} = maps:take(<<"provides">>, Spec1),
+    Spec3 = Spec2#{
+        <<"content_types_accepted">> => content_types_accepted(Accepts),
+        <<"content_types_provided">> => content_types_provided(Provides)
+    },
+
+    Schemes = maps:get(<<"schemes">>, Spec3),
+    Sec = maps:get(<<"security">>, Spec3),
+    Mod = bondy_http_gateway_rest_handler,
+    %% Args required by bondy_http_gateway_rest_handler
+    Languages = [string:lowercase(X) || X <- maps:get(?LANGUAGES_KEY, Version)],
+    Args = #{
+        api_spec => Spec3,
+        realm_uri => Realm,
+        deprecated => Deprecated,
+        security => Sec,
+        languages => Languages,
+        %% The route TEMPLATE (bounded cardinality), used as the `route`
+        %% label of the per-request HTTP metrics.
+        route => AbsPath
+    },
+    lists:flatten([
+        [
+            {S, Host, Realm, AbsPath, Mod, Args},
+            security_scheme_rules(S, Host, BasePath, Realm, Sec)
+        ]
+     || S <- Schemes
+    ]).
+
+%% @private
+%% The OAUTH2 spec requires the scheme to be HTTPS but we
+%% will enable it anyway as we assume BONDY would be behind
+%% an HTTPS load balancer
+security_scheme_rules(
+    S,
+    Host,
+    BasePath,
+    Realm,
+    #{
+        <<"type">> := <<"oauth2">>,
+        <<"flow">> := _Any
+    } = Sec
+) ->
+    Token = get_token_path(Sec),
+    Revoke = get_revoke_path(Sec),
+    Verify = get_verify_path(Sec, <<"/oauth/verify">>),
+
+    St = #{
+        realm_uri => Realm,
+        token_path => Token,
+        revoke_path => Revoke
+    },
+
+    Mod = bondy_oauth2_rest_handler,
+    [
+        {S, Host, Realm, <<BasePath/binary, Token/binary>>, Mod, St},
+        %% Revoke is secured
+        {S, Host, Realm, <<BasePath/binary, Revoke/binary>>, Mod, St},
+        %% Json Web Key Set path, in which we publish the public
+        {S, Host, Realm, <<BasePath/binary, "/oauth/jwks">>, Mod, St},
+        %% Credential verification, e.g. for an NGINX `auth_request`
+        {S, Host, Realm, <<BasePath/binary, Verify/binary>>,
+            bondy_http_verify_handler, verify_state(Realm)}
+    ];
+security_scheme_rules(
+    S,
+    Host,
+    BasePath,
+    Realm,
+    #{<<"type">> := <<"oidc">>, <<"provider">> := Provider} = Sec
+) ->
+    Verify = get_verify_path(Sec, <<"/oidc/verify">>),
+
+    St = #{
+        realm_uri => Realm,
+        provider => Provider,
+        base_path => BasePath
+    },
+
+    Mod = bondy_oidc_handler,
+    [
+        {S, Host, Realm, <<BasePath/binary, "/oidc/login">>, Mod, St#{
+            action => login
+        }},
+        {S, Host, Realm,
+            <<BasePath/binary, "/oidc/", Provider/binary, "/callback">>, Mod,
+            St#{action => callback}},
+        {S, Host, Realm, <<BasePath/binary, "/oidc/logout">>, Mod, St#{
+            action => logout
+        }},
+        %% Credential verification, e.g. for an NGINX `auth_request`
+        {S, Host, Realm, <<BasePath/binary, Verify/binary>>,
+            bondy_http_verify_handler, verify_state(Realm)}
+    ];
+security_scheme_rules(_, _, _, _, _) ->
+    %% TODO for other types
+    [].
+
+%% @private
+get_token_path(#{<<"token_path">> := Token}) ->
+    validate_rel_path(Token);
+get_token_path(_) ->
+    <<"/oauth/token">>.
+
+%% @private
+get_revoke_path(#{<<"revoke_token_path">> := Token}) ->
+    validate_rel_path(Token);
+get_revoke_path(_) ->
+    <<"/oauth/revoke">>.
+
+%% @private
+get_verify_path(#{<<"verify_path">> := Path}, _Default) ->
+    validate_rel_path(Path);
+get_verify_path(_, Default) ->
+    Default.
+
+%% @private
+%% Kept free of per-path and per-provider data on purpose: identical rules are
+%% collapsed by the `leap_relation` in `build_dispatch_table/3`, so any field
+%% that varies between paths would multiply this route instead of deduplicating
+%% it.
+verify_state(Realm) ->
+    #{realm_uri => Realm}.
+
+%% @private
+validate_rel_path(<<$/, _Rest/binary>> = Val) ->
+    remove_trailing_slash(Val);
+validate_rel_path(Val) ->
+    error({invalid_path, Val}).
+
+%% @private
+remove_trailing_slash(Bin) ->
+    case binary:last(Bin) of
+        $/ -> binary:part(Bin, 0, byte_size(Bin) - 1);
+        _ -> Bin
+    end.
+
+%% @private
+-doc """
+Returns a context where all keys have been assigned funs that take
+a context as an argument.
+""".
+get_context_proxy() ->
+    %% We cannot used funs as they will break when we run the
+    %% parse transform, so we use mops:proxy()
+    #{
+        <<"request">> => mops:proxy(),
+        <<"action">> => mops:proxy(),
+        <<"security">> => mops:proxy()
+    }.
+
+%% @private
+content_types_accepted(L) when is_list(L) ->
+    [content_types_accepted(T) || T <- L];
+content_types_accepted(<<"application/json; charset=utf-8">>) ->
+    {
+        {<<"application">>, <<"json">>, [{<<"charset">>, <<"utf-8">>}]},
+        from_json
+    };
+content_types_accepted(<<"application/json">>) ->
+    {
+        {<<"application">>, <<"json">>, '*'},
+        from_json
+    };
+content_types_accepted(<<"application/msgpack; charset=utf-8">>) ->
+    {
+        {<<"application">>, <<"msgpack">>, [{<<"charset">>, <<"utf-8">>}]},
+        from_msgpack
+    };
+content_types_accepted(<<"application/msgpack">>) ->
+    {{<<"application">>, <<"msgpack">>, '*'}, from_msgpack};
+content_types_accepted(<<"application/x-www-form-urlencoded">>) ->
+    {
+        {<<"application">>, <<"x-www-form-urlencoded">>, '*'},
+        from_form_urlencoded
+    };
+content_types_accepted(Bin) ->
+    {Bin, accept}.
+
+%% @private
+content_types_provided(L) when is_list(L) ->
+    [X || {_, X} <- lists:ukeysort(1, [content_types_provided(T) || T <- L])];
+content_types_provided(<<"application/json">>) ->
+    T = {
+        {<<"application">>, <<"json">>, '*'},
+        to_json
+    },
+    %% We force JSON to have the priority as Cowboy chooses based on the order
+    %% when no content-type was requested by the user
+    {1, T};
+content_types_provided(<<"application/json; charset=utf-8">>) ->
+    T = {
+        {<<"application">>, <<"json">>, [{<<"charset">>, <<"utf-8">>}]},
+        to_json
+    },
+    %% We force JSON to have the priority as Cowboy chooses based on the order
+    %% when no content-type was requested by the user
+    {1, T};
+content_types_provided(<<"application/msgpack">>) ->
+    T = {{<<"application">>, <<"msgpack">>, '*'}, to_msgpack},
+    {2, T};
+content_types_provided(<<"application/msgpack; charset=utf-8">>) ->
+    T = {
+        {<<"application">>, <<"msgpack">>, [{<<"charset">>, <<"utf-8">>}]},
+        to_msgpack
+    },
+    {2, T};
+content_types_provided(Bin) ->
+    {3, {Bin, provide}}.
+
+%% @TODO Avoid doing this and require the user to setup the environment first!
+check_realm_exists(Uri) ->
+    case bondy_realm:lookup(Uri) of
+        {ok, _} ->
+            ok;
+        {error, not_found} ->
+            Reason = {
+                badarg,
+                <<"There is no realm named '", Uri/binary, "'">>
+            },
+            error(Reason)
+    end.
+
+mops_eval(Expr, Ctxt) ->
+    try
+        mops:eval(Expr, Ctxt)
+    catch
+        error:{invalid_expression, [Expr, Term]} ->
+            throw(#{
+                <<"code">> => ?BONDY_ERROR_HTTP_API_GATEWAY_INVALID_EXPR,
+                %% Both fragments are untrusted: `Term` is whatever the action
+                %% returned and `Expr` is echoed by `mops`. Each is made UTF-8
+                %% on its own (`bondy_connect_error:format_term/1` and
+                %% `to_binary/1`), so the frame stays readable text when one
+                %% fragment is bad. Pinned by `bondy_gateway_error_utf8_test`.
+                <<"message">> => iolist_to_binary([
+                    <<"There was an error evaluating the MOPS expression '">>,
+                    bondy_connect_error:to_binary(Expr),
+                    "' with value '",
+                    bondy_connect_error:format_term(Term),
+                    "'"
+                ]),
+                <<"description">> =>
+                    <<"This might be due to an error in the action expression (mops) itself or as a result of a key missing in the response to a gateway action (WAMP or HTTP call).">>
+            });
+        error:{badkey, Key} ->
+            throw(#{
+                <<"code">> => ?BONDY_ERROR_HTTP_API_GATEWAY_INVALID_EXPR,
+                <<"message">> =>
+                    <<"There is no value for key '", Key/binary,
+                        "' in the HTTP Request context.">>,
+                <<"description">> =>
+                    <<"This might be due to an error in the action expression (mops) itself or as a result of a key missing in the response to a gateway action (WAMP or HTTP call).">>
+            });
+        error:{badkeypath, Path} ->
+            throw(#{
+                <<"code">> => ?BONDY_ERROR_HTTP_API_GATEWAY_INVALID_EXPR,
+                <<"message">> =>
+                    <<"There is no value for path '", Path/binary,
+                        "' in the HTTP Request context.">>,
+                <<"description">> =>
+                    <<"This might be due to an error in the action expression (mops) itself or as a result of a key missing in the response to a gateway action (WAMP or HTTP call).">>
+            })
+    end.

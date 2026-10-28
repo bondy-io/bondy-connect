@@ -1,0 +1,1241 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_registry).
+-behaviour(gen_server).
+
+-moduledoc """
+An in-memory registry for PubSub subscriptions and Routed RPC registrations,
+providing pattern matching capabilities including support for WAMP's
+version 2.0 match policies (exact, prefix and wildcard).
+
+Entries are stored in the ephemeral `registry` bondy_db (an in-RAM, memory
+topology DB — no durable / on-disk backing, provisioned by
+`m:bondy_namespace_catalog`). The registry also maintains in-memory indices
+as a materialised view: ETS bags for exact matching, and lock-free persistent
+ART tries (`m:bondy_registry_ptrie`) for prefix and wildcard matching.
+
+This module also provides a singleton server that rebuilds the indices from
+the bondy_db store on startup (a no-op on a fresh boot, since the ephemeral
+store does not survive a restart).
+
+The registry consists of this server and a pool of `bondy_registry_partition`
+workers; each partition owns its own slice of the indices.
+
+The server restates this node's RIB cells (`bondy_registry_rib:restore/0`)
+each time it starts. Its supervisor restarts it with every partition, so a
+restore that ran while the partitions were down is repeated once they are
+back (`bondy_registry_SUITE:rib_restored_after_registry_restart_during_reopen`).
+""".
+
+-include_lib("kernel/include/logger.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("bondy.hrl").
+-include("bondy_db_tables.hrl").
+-include("bondy_registry.hrl").
+
+-record(state, {
+    start_ts :: pos_integer()
+}).
+
+-type task() :: fun((entry(), bondy_context:t()) -> ok).
+
+%% Aliases
+-type entry() :: bondy_registry_entry:t().
+-type entry_type() :: bondy_registry_entry:entry_type().
+-type entry_key() :: bondy_registry_entry:key().
+-type continuation() :: bondy_registry_partition:continuation().
+-type eot() :: bondy_registry_partition:eot().
+
+-export_type([continuation/0]).
+-export_type([eot/0]).
+
+%% SERVER API
+-export([start_link/0]).
+-export([partitions/0]).
+-export([pick_partition/1]).
+-export([init_indices/0]).
+-export([format_error/2]).
+-export([info/0]).
+
+%% CRUD API
+-export([add/1]).
+-export([add/4]).
+-export([add/5]).
+-export([entries/1]).
+-export([entries/2]).
+-export([entries/3]).
+-export([entries/4]).
+-export([lookup/2]).
+-export([lookup/3]).
+-export([remove/1]).
+-export([remove/3]).
+-export([remove/4]).
+-export([remove_all/2]).
+-export([remove_all/3]).
+-export([remove_all/4]).
+
+%% INDEX BASED MATCHING API
+-export([has_matches/3]).
+-export([list_local/4]).
+-export([match/1]).
+-export([match/3]).
+-export([match/4]).
+-export([find_matches/1]).
+-export([find_matches/3]).
+-export([find_matches/4]).
+
+%% GEN_SERVER CALLBACKS
+-export([code_change/3]).
+-export([handle_call/3]).
+-export([handle_cast/2]).
+-export([handle_continue/2]).
+-export([handle_info/2]).
+-export([init/1]).
+-export([terminate/2]).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-doc """
+Starts the registry server.
+
+The server owns two things, and only these two: `init_indices/0` (rebuilding
+the partitions' in-memory indices from the bondy_db store) and the periodic
+RIB consistency sweep scheduled by `init/1`.
+
+It does not observe cluster membership: nothing here reacts to a peer joining
+or departing. Before it compares the two views, the consistency sweep deletes
+stub rows with no backing cell (`bondy_registry_rib:reap_orphan_stubs/1`),
+which is what a departed node leaves once its cells are reaped. See
+`m:bondy_registry_rib`'s "Departure" section for how a departed node's cells
+and stubs are reclaimed.
+""".
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+-doc """
+Rebuilds the partitions' in-memory match indices from the entries in the
+bondy_db `registry` store.
+""".
+init_indices() ->
+    gen_server:call(?MODULE, init_indices, timer:minutes(10)).
+
+-doc """
+Returns the partitions connected to the registry pool, as `{Name, Pid}` pairs
+where `Name` is `{bondy_registry_partition, Index}`.
+""".
+-spec partitions() -> [{{bondy_registry_partition, integer()}, pid()}].
+
+partitions() ->
+    gproc_pool:active_workers(?REGISTRY_POOL).
+
+-doc """
+Returns the partition that holds the entries of a realm. `Arg` is the realm
+URI, or an entry or entry key of the realm; see
+`bondy_registry_partition:pick/1`.
+""".
+-spec pick_partition(Arg :: binary() | entry()) -> pid().
+
+pick_partition(Arg) ->
+    bondy_registry_partition:pick(Arg).
+
+-doc """
+Returns the registry's `size` and `memory`, summed over all partitions; see
+`bondy_registry_store:info/1` for what each counts.
+""".
+-spec info() -> #{size => non_neg_integer(), memory => non_neg_integer()}.
+
+info() ->
+    {Size, Mem} = lists:foldl(
+        fun(Partition, {S, M}) ->
+            {{bondy_registry_partition, _N}, Pid} = Partition,
+            #{
+                size := Size,
+                memory := Mem
+            } = bondy_registry_partition:info(Pid),
+
+            {S + Size, M + Mem}
+        end,
+        {0, 0},
+        partitions()
+    ),
+    #{size => Size, memory => Mem}.
+
+-doc """
+Used for adding proxy entries only as it skips all checks.
+Fails with `badarg` if  `Entry` is not a proxy entry.
+""".
+-spec add(entry()) ->
+    {ok, entry()}
+    | {error, already_exists}
+    | no_return().
+
+add(Entry) ->
+    bondy_registry_entry:is_proxy(Entry) orelse
+        ?ERROR(badarg, [Entry], #{
+            1 => "is not a proxy entry()"
+        }),
+
+    Partition = pick_partition(Entry),
+    bondy_registry_partition:add(Partition, Entry).
+
+-doc "See `add/5`.".
+-spec add(
+    Type :: entry_type(),
+    RegUri :: uri(),
+    Opts :: map(),
+    Ctxt :: bondy_context:t()
+) ->
+    {ok, entry()}
+    | {error, {already_exists, entry()} | any()}.
+
+add(Type, Uri, Opts, Ctxt) when is_map(Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    Ref = bondy_context:ref(Ctxt),
+    add(Type, RealmUri, Uri, Opts, Ref).
+
+-doc """
+Adds an entry to the registry.
+
+Adding an already existing entry is treated differently based on whether the
+entry is a `registration` or a `subscription`.
+
+According to the WAMP specification, in the case of a subscription that was
+already added before by the same _Subscriber_, the _Broker_ should not fail
+and answer with a `SUBSCRIBED` message, containing the existing
+`Subscription|id`. So in this case this function returns
+`{ok, {entry(), boolean()}}`.
+
+In case of a registration, as a default, only a single Callee may
+register a procedure for an URI. However, when shared registrations are
+supported, then the first Callee to register a procedure for a particular URI
+MAY determine that additional registrations for this URI are allowed, and
+what Invocation Rules to apply in case such additional registrations are
+made.
+
+This is configured through the `invoke` option.
+When invoke is not `single`, Dealer MUST fail all subsequent attempts to
+register a procedure for the URI where the value for the invoke option does
+not match that of the initial registration. Accordingly this function might
+return an error tuple.
+
+> #### {.notice}
+> At the moment this logic is implemented here but it should really be the
+> responsibility of `bondy_dealer` and `bondy_broker`.
+""".
+-spec add(
+    Type :: entry_type(),
+    RealmUri :: uri(),
+    Uri :: uri(),
+    Opts :: map(),
+    Ref :: bondy_ref:t()
+) ->
+    {ok, entry()}
+    | {error, {already_exists, entry()} | any()}.
+
+add(Type, RealmUri, Uri, Opts, Ref) ->
+    Partition = pick_partition(RealmUri),
+    maybe_add(Type, RealmUri, Uri, Opts, Ref, Partition).
+
+-doc "Removes (deletes) an entry from the registry.".
+-spec remove(entry()) -> ok | {error, any()}.
+
+remove(Entry) ->
+    bondy_registry_partition:remove(pick_partition(Entry), Entry).
+
+-spec remove(entry_type(), id(), bondy_context:t()) ->
+    ok | {error, not_found}.
+
+remove(Type, EntryId, Ctxt) ->
+    remove(Type, EntryId, Ctxt, undefined).
+
+-spec remove(
+    Type :: entry_type(),
+    EntryId :: id(),
+    Ctxt :: bondy_context:t(),
+    Task :: optional(task())
+) -> ok | {error, any()}.
+
+remove(Type, EntryId, Ctxt, Task) when
+    Task == undefined orelse is_function(Task, 1)
+->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    SessionId = bondy_context:session_id(Ctxt),
+    Pattern = bondy_registry_entry:key_pattern(RealmUri, SessionId, EntryId),
+    FindOpts = [{limit, 1}],
+    Partition = pick_partition(RealmUri),
+
+    %% We should match at most one entry for the {RealmUri, SessionId, EntryId}
+    %% combination.
+    case bondy_registry_partition:find(Partition, Type, Pattern, FindOpts) of
+        ?EOT ->
+            ok;
+        {[{_Key, Entry}], _Cont} ->
+            maybe
+                ok ?= bondy_registry_partition:remove(Partition, Entry),
+                maybe_execute(maybe_fun(Task, Ctxt), Entry)
+            end
+    end.
+
+-doc """
+Removes all entries of type `Type` matching the context's realm and
+session_id.
+
+Same as calling `remove_all(Type, Ctxt, undefined)`.
+""".
+-spec remove_all(entry_type(), bondy_context:t()) -> ok.
+
+remove_all(Type, Ctxt) ->
+    remove_all(Type, Ctxt, undefined).
+
+-doc """
+Removes all entries of type `Type` matching the context's realm and
+session_id.
+
+If `Task` is defined, it executes the task passing the removed entry as
+argument.
+""".
+-spec remove_all(entry_type(), bondy_context:t(), task() | undefined) -> ok.
+
+remove_all(Type, Ctxt, Task) when
+    Task == undefined orelse
+        is_function(Task, 1) orelse is_function(Task, 2)
+->
+    case bondy_context:session_id(Ctxt) of
+        undefined ->
+            ?LOG_DEBUG(#{
+                description => "Failed to remove registry contents",
+                reason => no_session_id
+            }),
+            ok;
+        SessionId ->
+            RealmUri = bondy_context:realm_uri(Ctxt),
+            Partition = pick_partition(RealmUri),
+            Pattern = bondy_registry_entry:key_pattern(
+                RealmUri, SessionId, '_'
+            ),
+            MaybeFun = maybe_fun(Task, Ctxt),
+            %% `limit` selects the RETURN SHAPE, it does not bound the page —
+            %% see `do_remove_all/3`.
+            MatchOpts = [{limit, 100}],
+            Matches = bondy_registry_partition:find(
+                Partition, Type, Pattern, MatchOpts
+            ),
+            do_remove_all(Partition, Matches, MaybeFun)
+    end.
+
+-doc """
+Removes all registry entries of type `Type` for a `{RealmUri, SessionId}`
+relation. `SessionId` may be `'_'`, which removes every entry in the realm
+including those owned by session-less refs (internal callbacks); that is how
+`bondy_realm:teardown/1` purges a realm.
+""".
+-spec remove_all(
+    Type :: entry_type(),
+    RealmUri :: uri(),
+    SessionId :: id() | '_',
+    Task :: task() | undefined
+) -> ok.
+
+remove_all(Type, RealmUri, SessionId, Task) when
+    Task == undefined orelse is_function(Task, 1)
+->
+    Pattern = bondy_registry_entry:key_pattern(RealmUri, SessionId, '_'),
+
+    %% `limit` selects the RETURN SHAPE, it does not bound the page — see
+    %% `do_remove_all/3`.
+    MatchOpts = [{limit, 100}],
+    Partition = pick_partition(RealmUri),
+    Matches = bondy_registry_partition:find(
+        Partition, Type, Pattern, MatchOpts
+    ),
+    do_remove_all(Partition, Matches, Task).
+
+-doc """
+Looks up a registration / subscription entry by its key.
+""".
+-spec lookup(Type :: entry_type(), Key :: entry_key()) ->
+    {ok, entry()} | {error, not_found}.
+
+lookup(Type, EntryKey) ->
+    Partition = pick_partition(EntryKey),
+    bondy_registry_partition:lookup(Partition, Type, EntryKey).
+
+lookup(Type, RealmUri, EntryId) when is_integer(EntryId) ->
+    Partition = pick_partition(RealmUri),
+    bondy_registry_partition:lookup(Partition, Type, RealmUri, EntryId).
+
+-doc """
+Continues returning the list of entries owned by a session started with
+`entries/4`.
+
+The next chunk of the size specified in the initial `entries/4` call is
+returned together with a new Continuation, which can be used in subsequent
+calls to this function.
+
+When there are no more objects in the table, `{[], '$end_of_table'}` is
+returned.
+""".
+-spec entries(continuation()) ->
+    {[entry()], continuation() | eot()} | eot().
+
+entries(?EOT) ->
+    ?EOT;
+entries(Cont0) ->
+    %% We need to add back the resolver strategy
+    case bondy_registry_partition:find(Cont0) of
+        ?EOT ->
+            ?EOT;
+        {L, ContOrEOT} ->
+            {[V || {_, V} <- L], ContOrEOT}
+    end.
+
+-doc """
+Returns the list of entries owned by the active session.
+
+This function is equivalent to calling `entries/2` with the RealmUri
+and SessionId extracted from the Context.
+""".
+-spec entries(entry_type(), bondy_context:t()) -> [entry()].
+
+entries(Type, Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    SessionId = bondy_context:session_id(Ctxt),
+    entries(Type, RealmUri, SessionId).
+
+-doc """
+Returns the complete list of entries owned by a session matching
+RealmUri and SessionId.
+
+Use `entries/3` and `entries/1` to limit the number
+of entries returned.
+""".
+-spec entries(Type :: entry_type(), RealmUri :: uri(), SessionId :: id()) ->
+    [entry()].
+
+entries(Type, RealmUri, SessionId) ->
+    entries(Type, RealmUri, SessionId, infinity).
+
+-doc """
+Works like `entries/3`, but only returns a limited (Limit) number of
+entries. Term Continuation can then be used in subsequent calls to `entries/1`
+to get the next chunk of entries.
+""".
+-spec entries(
+    Type :: entry_type(),
+    Realm :: uri(),
+    SessionId :: id() | '_',
+    Limit :: pos_integer() | infinity
+) ->
+    [entry()] | {[entry()], continuation() | eot()} | eot().
+
+entries(Type, RealmUri, SessionId, Limit) ->
+    Partition = pick_partition(RealmUri),
+    Pattern = bondy_registry_entry:key_pattern(RealmUri, SessionId, '_'),
+    Opts =
+        case Limit of
+            infinity ->
+                [];
+            N when is_integer(N), N > 0 ->
+                [{limit, Limit}]
+        end,
+
+    case bondy_registry_partition:find(Partition, Type, Pattern, Opts) of
+        ?EOT ->
+            ?EOT;
+        {L, ?EOT} ->
+            {[V || {_, V} <- L], ?EOT};
+        {L, NewCont} ->
+            {[V || {_, V} <- L], {Type, NewCont}};
+        L when is_list(L) ->
+            [V || {_, V} <- L]
+    end.
+
+-doc "Continues a match started with `match/3` or `match/4`.".
+-spec match(continuation() | eot()) ->
+    Registrations ::
+        [entry()]
+        | {Registrations :: [entry()], continuation() | eot()}
+        | Subscriptions ::
+        {[entry()], [node()]}
+        | {Subscriptions :: {[entry()], [node()]}, continuation() | eot()}
+        | eot().
+
+match(?EOT) ->
+    ?EOT;
+match(Cont0) ->
+    #{type := Type} = bondy_registry_partition:continuation_info(Cont0),
+    sort(Type, do_match(Cont0)).
+
+-doc """
+Returns `true` iff at least one stored entry (local or remote, any
+match policy) subsumes `Uri` — the boolean form of `find_matches/3`
+(the routing direction), answered fail-fast in the calling process
+(no partition server round-trip).
+
+This is the demand predicate for WAMP meta events: emitters call it
+before constructing a meta-event publication so that, in the common
+case of zero meta-topic subscribers, no work is done at all (see
+METRICS_GAP_ANALYSIS.md Part III).
+""".
+-spec has_matches(Type :: entry_type(), RealmUri :: uri(), Uri :: uri()) ->
+    boolean().
+
+has_matches(Type, RealmUri, Uri) ->
+    Store = bondy_registry_partition:store(RealmUri),
+    bondy_registry_store:has_matches(Store, Type, RealmUri, Uri) orelse
+        rib_has_matches(Type, RealmUri, Uri).
+
+-doc """
+A keyset page of THIS node's entries of `Type` in `RealmUri`, in ascending
+`EntryId` order: up to `Limit` entries whose id is strictly greater than
+`AfterId` (all of them when `AfterId` is `undefined`, the first page).
+
+This is the node-local leg of the distributed introspection walk in
+`bondy_registry_meta` — it reads only local full entries (never the RIB), so a
+coordinator pages each node's own registrations/subscriptions and merges the
+per-node pages across the cluster.
+""".
+-spec list_local(
+    Type :: entry_type(),
+    RealmUri :: uri(),
+    AfterId :: id() | undefined,
+    Limit :: pos_integer()
+) -> [entry()].
+
+list_local(Type, RealmUri, AfterId, Limit) ->
+    Partition = pick_partition(RealmUri),
+    bondy_registry_partition:list_local(
+        Partition, Type, RealmUri, AfterId, Limit
+    ).
+
+%% @private
+%% Demand from remote nodes: full entries are not replicated, so a matching
+%% registration or subscription owned by a peer is visible here only as a RIB
+%% summary. Consult the stub view so the demand predicate stays true when the
+%% only matching peer lives on another node.
+rib_has_matches(subscription, RealmUri, Uri) ->
+    bondy_registry_rib:subscription_nodes(RealmUri, Uri, #{}) =/= [];
+rib_has_matches(registration, RealmUri, Uri) ->
+    bondy_registry_rib:match_stubs(RealmUri, Uri) =/= [].
+
+-doc "Calls `match/4`".
+-spec match
+    (subscription, RealmUri :: uri(), uri()) ->
+        {[entry()], [node()]};
+    (registration, RealmUri :: uri(), uri()) ->
+        [entry()].
+
+match(Type, RealmUri, Uri) ->
+    match(Type, RealmUri, Uri, #{}).
+
+-doc """
+Returns the entries matching either a topic or procedure Uri according to
+each entry's configured match specification.
+
+This function is used by the Broker to return all subscriptions that match a
+topic. And in case of registrations it is used by the Dealer to return all
+registrations matching a procedure.
+""".
+-spec match
+    (subscription, RealmUri :: uri(), uri(), map()) ->
+        {[entry()], [node()]}
+        | {{[entry()], [node()]}, continuation() | eot()}
+        | eot();
+    (registration, RealmUri :: uri(), uri(), map()) ->
+        [entry()]
+        | {[entry()], continuation() | eot()}
+        | eot().
+
+match(Type, RealmUri, Uri, Opts) ->
+    sort(Type, do_match(Type, RealmUri, Uri, Opts)).
+
+-doc "Continues a match started with `find_matches/3` or `find_matches/4`.".
+-spec find_matches(continuation() | eot()) ->
+    Registrations ::
+        [entry()]
+        | {Registrations :: [entry()], continuation() | eot()}
+        | Subscriptions ::
+        {[entry()], [node()]}
+        | {Subscriptions :: {[entry()], [node()]}, continuation() | eot()}
+        | eot().
+
+find_matches(?EOT) ->
+    ?EOT;
+find_matches(Cont0) ->
+    #{type := Type} = bondy_registry_partition:continuation_info(Cont0),
+    sort(Type, do_find_matches(Cont0)).
+
+-doc "Calls `find_matches/4`".
+-spec find_matches
+    (subscription, RealmUri :: uri(), uri()) ->
+        {[entry()], [node()]};
+    (registration, RealmUri :: uri(), uri()) ->
+        [entry()].
+
+find_matches(Type, RealmUri, Uri) ->
+    find_matches(Type, RealmUri, Uri, #{}).
+
+-doc """
+Returns the entries matching either a topic or procedure Uri according to
+each entry's configured match specification.
+
+This function is used by the Broker to return all subscriptions that match a
+topic. And in case of registrations it is used by the Dealer to return all
+registrations matching a procedure.
+""".
+-spec find_matches
+    (subscription, RealmUri :: uri(), uri(), map()) ->
+        {[entry()], [node()]}
+        | {{[entry()], [node()]}, continuation() | eot()}
+        | eot();
+    (registration, RealmUri :: uri(), uri(), map()) ->
+        [entry()]
+        | {[entry()], continuation() | eot()}
+        | eot().
+
+find_matches(Type, RealmUri, Uri, Opts) ->
+    sort(Type, do_find_matches(Type, RealmUri, Uri, Opts)).
+
+format_error(Reason, StackTrace) ->
+    bondy_connect_error:format_error(Reason, StackTrace).
+
+%% =============================================================================
+%% GEN_SERVER CALLBACKS
+%% =============================================================================
+
+init([]) ->
+    %% Periodic RIB consistency sweep: compares the replicated routing
+    %% summaries against the ground truth per realm
+    %% (`bondy_registry_rib:check/1`) and logs any divergence — the
+    %% production form of the gate the test suites assert on.
+    ok = schedule_rib_check(),
+
+    State = #state{
+        start_ts = erlang:system_time(millisecond)
+    },
+
+    {ok, State, {continue, restore_rib}}.
+
+handle_continue(restore_rib, State) ->
+    ok = bondy_registry_rib:restore(),
+    {noreply, State}.
+
+handle_call(init_indices, _From, State) ->
+    Res = init_indices(State),
+    {reply, Res, State};
+handle_call(Event, From, State) ->
+    ?LOG_WARNING(#{
+        reason => unsupported_event,
+        event => Event,
+        from => From
+    }),
+    {reply, {error, {unsupported_call, Event}}, State}.
+
+handle_cast(Event, State) ->
+    ?LOG_WARNING(#{
+        reason => unsupported_event,
+        event => Event
+    }),
+    {noreply, State}.
+
+handle_info(rib_check = Event, State) ->
+    %% A storage DB that is closed, reopening or idle skips this sweep; the
+    %% next interval retries.
+    ?LOG_DEBUG(#{event => Event}),
+    _ =
+        try
+            rib_check()
+        catch
+            error:{registry_not_provisioned, _} = Reason:Stacktrace ->
+                log_rib_check_skipped(Reason, Stacktrace);
+            error:bondy_realm_table_unavailable = Reason:Stacktrace ->
+                log_rib_check_skipped(Reason, Stacktrace);
+            error:{badmatch, {error, _}} = Reason:Stacktrace ->
+                log_rib_check_skipped(Reason, Stacktrace);
+            error:{projection_closed, _} = Reason:Stacktrace ->
+                log_rib_check_skipped(Reason, Stacktrace)
+        end,
+    ok = schedule_rib_check(),
+    {noreply, State};
+handle_info(Info, State) ->
+    ?LOG_DEBUG(#{
+        reason => unexpected_event,
+        event => Info
+    }),
+    {noreply, State}.
+
+terminate(normal, _State) ->
+    ok;
+terminate(shutdown, _State) ->
+    ok;
+terminate({shutdown, _}, _State) ->
+    ok;
+terminate(_Reason, _State) ->
+    %% TODO publish metaevent
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% -----------------------------------------------------------------------------
+%% @private
+%% Adds an entry to the registry.
+%%
+%% Adding an already existing entry is treated differently based on whether the
+%% entry is a registration or a subscription.
+%%
+%% According to the WAMP specification, in the case of a subscription that was
+%% already added before by the same _Subscriber_, the _Broker_ should not fail
+%% and answer with a "SUBSCRIBED" message, containing the existing
+%% "Subscription|id". So in this case this function returns
+%% {ok, entry(), boolean()}.
+%%
+%% In case of a registration, as a default, only a single Callee may
+%% register a procedure for an URI. However, when shared registrations are
+%% supported, then the first Callee to register a procedure for a particular URI
+%% MAY determine that additional registrations for this URI are allowed, and
+%% what Invocation Rules to apply in case such additional registrations are
+%% made.
+%%
+%% This is configured through the 'invoke' options.
+%% When invoke is not 'single', Dealer MUST fail all subsequent attempts to
+%% register a procedure for the URI where the value for the invoke option does
+%% not match that of the initial registration. Accordingly this function might
+%% return an error tuple.
+%% -----------------------------------------------------------------------------
+maybe_add(registration, RealmUri, Uri, Opts, Ref, Partition) ->
+    case bondy_ref:target_type(Ref) of
+        callback ->
+            add_callback_registration(RealmUri, Uri, Opts, Ref, Partition);
+        _ ->
+            maybe_add_registration(RealmUri, Uri, Opts, Ref, Partition)
+    end;
+maybe_add(subscription = Type, RealmUri, Uri, Opts, Ref, Partition) ->
+    MP = maps:get(match, Opts, ?EXACT_MATCH),
+
+    case bondy_ref:session_id(Ref) of
+        undefined ->
+            maybe_add_sessionless_subscription(
+                RealmUri, Uri, MP, Opts, Ref, Partition
+            );
+        SessionId ->
+            %% The idempotent-SUBSCRIBE check: a session already holding a
+            %% subscription for `(Uri, MP)` gets the existing entry back. A
+            %% bounded session-index probe: its cost must not depend on how
+            %% many subscriptions the session holds, or a subscribe burst
+            %% turns quadratic (this runs per SUBSCRIBE in the caller).
+            case
+                bondy_registry_partition:find_session_entry(
+                    Partition, Type, RealmUri, SessionId, Uri, MP
+                )
+            of
+                {ok, Entry} ->
+                    {error, {already_exists, Entry}};
+                {error, not_found} ->
+                    RegId = subscription_id(RealmUri, Opts),
+                    Entry = bondy_registry_entry:new(
+                        Type, RegId, RealmUri, Ref, Uri, Opts
+                    ),
+                    bondy_registry_partition:add(Partition, Entry)
+            end
+    end.
+
+%% @private
+%% A session-less (internal / callback) subscriber has no session-index
+%% rows, so the duplicate check scans the realm's session-less entries —
+%% a rare path (internal subscribers only), preserved as a fold: the same
+%% process reference re-subscribing to `(Uri, MP)` is idempotent; a
+%% DIFFERENT process subscribing to the same topic gets its own entry.
+maybe_add_sessionless_subscription(RealmUri, Uri, MP, Opts, Ref, Partition) ->
+    Type = subscription,
+
+    Fun = fun({_, E} = KV, Acc) ->
+        Matches =
+            Uri == bondy_registry_entry:uri(E) andalso
+                MP == bondy_registry_entry:match_policy(E) andalso
+                Ref == bondy_registry_entry:ref(E),
+
+        case Matches of
+            false ->
+                Acc;
+            true ->
+                throw({break, [KV | Acc]})
+        end
+    end,
+
+    KeyPattern = bondy_registry_entry:key_pattern(RealmUri, undefined, '_'),
+    FoldOpts = [{match, KeyPattern}],
+    FoldResult = bondy_registry_partition:fold(
+        Partition, Type, RealmUri, Fun, [], FoldOpts
+    ),
+
+    case FoldResult of
+        [] ->
+            RegId = subscription_id(RealmUri, Opts),
+            Entry = bondy_registry_entry:new(
+                Type, RegId, RealmUri, Ref, Uri, Opts
+            ),
+            bondy_registry_partition:add(Partition, Entry);
+        [{_EntryKey, Entry} | _] ->
+            {error, {already_exists, Entry}}
+    end.
+
+%% -----------------------------------------------------------------------------
+%% @private
+%% -----------------------------------------------------------------------------
+add_callback_registration(RealmUri, Uri, Opts0, Ref, Partition) ->
+    {callback, MF} = bondy_ref:target(Ref),
+    Args = maps:get(callback_args, Opts0, []),
+
+    case bondy_wamp_callback:validate_target(MF, Args) of
+        true ->
+            Opts1 = maps:without([callback_args], Opts0),
+            %% In the case of callbacks we do not allow shared
+            %% registrations.
+            %% This means we cannot have multiple registrations for the
+            %% same URI associated to the same Target.
+            Opts = Opts1#{
+                invoke => ?INVOKE_SINGLE,
+                callback_args => Args
+            },
+            maybe_add_registration(RealmUri, Uri, Opts, Ref, Partition);
+        false ->
+            {error, {invalid_callback, erlang:append_element(MF, Args)}}
+    end.
+
+%% -----------------------------------------------------------------------------
+%% @private
+%% -----------------------------------------------------------------------------
+maybe_add_registration(RealmUri, Uri, Opts, Ref, Partition) ->
+    Invoke = maps:get(invoke, Opts, ?INVOKE_SINGLE),
+    Shared = maps:get(shared_registration, Opts, false),
+
+    try
+        Invoke == ?INVOKE_SINGLE orelse Shared == true orelse
+            throw(shared_registration_disabled),
+
+        add_registration(RealmUri, Uri, Opts, Ref, Partition)
+    catch
+        throw:Reason ->
+            {error, Reason}
+    end.
+
+%% -----------------------------------------------------------------------------
+%% @private
+%% Shared Registration (WAMP RFC 13.3.9): the first Callee to register a URI
+%% decides whether more registrations are allowed and their Invocation Rules.
+%% The check and the insert run in the partition process, so concurrent
+%% registrations of a URI are serialised
+%% (`bondy_registry_SUITE:concurrent_single_registrations_admit_one`). `Add`
+%% runs in the partition and must not call it.
+%% -----------------------------------------------------------------------------
+add_registration(RealmUri, Uri, Opts, Ref, Partition) ->
+    Entry = new_registration(RealmUri, Ref, Uri, Opts),
+    MatchOpts = #{
+        match => maps:get(match, Opts, ?EXACT_MATCH),
+        invoke => '_'
+    },
+    Invoke = maps:get(invoke, Opts, ?INVOKE_SINGLE),
+    SessionId = bondy_ref:session_id(Ref),
+    Add = fun() ->
+        L = bondy_registry_partition:match(
+            Partition, registration, RealmUri, Uri, MatchOpts
+        ),
+        Policies = lists:usort([
+            bondy_registry_entry:invocation_policy(E)
+         || E <- L
+        ]),
+        Conflicts =
+            case Policies =:= [Invoke] andalso Invoke =/= ?INVOKE_SINGLE of
+                true ->
+                    find_registration_duplicates(L, SessionId);
+                false ->
+                    sort_registration_matches(L)
+            end,
+        maybe
+            ok ?= resolve_existing(Conflicts),
+            bondy_registry_partition:add(Partition, Entry)
+        end
+    end,
+    bondy_registry_partition:execute(Partition, Add).
+
+%% -----------------------------------------------------------------------------
+%% @private
+%% Sort registration `proc()' index entries by time
+%% -----------------------------------------------------------------------------
+-spec sort_registration_matches(
+    [bondy_registry_partition:reg_match()]
+) ->
+    [bondy_registry_partition:reg_match()].
+
+sort_registration_matches(L) ->
+    lists:sort(
+        fun(A, B) ->
+            bondy_registry_entry:created(A) =< bondy_registry_entry:created(B)
+        end,
+        L
+    ).
+
+%% @private
+-spec find_registration_duplicates(
+    Triples :: [bondy_registry_partition:reg_match()],
+    SessionId :: bondy_session_id:t()
+) -> Duplicates :: [bondy_registry_partition:reg_match()].
+
+find_registration_duplicates([], _) ->
+    [];
+find_registration_duplicates(_, undefined) ->
+    %% Undefined is used for internal callees and we allow duplicates
+    [];
+find_registration_duplicates(Entries, SessionId) ->
+    %% Proxy entries can have duplicates, this is
+    %% because the handler (proxy) is registering
+    %% the entries for multiple remote handlers,
+    %% so we filter them out
+    [
+        Entry
+     || Entry <- Entries,
+        false == bondy_registry_entry:is_proxy(Entry),
+        SessionId == bondy_registry_entry:session_id(Entry)
+    ].
+
+%% @private
+%% The first live entry refuses the registration; a dead one does not count.
+-spec resolve_existing([bondy_registry_partition:reg_match()]) ->
+    ok | {error, {already_exists, entry()}}.
+
+resolve_existing([]) ->
+    ok;
+resolve_existing([H | T]) ->
+    case bondy_registry_entry:is_alive(H) of
+        true ->
+            {error, {already_exists, H}};
+        false ->
+            resolve_existing(T)
+    end.
+
+%% @private
+new_registration(RealmUri, Ref, Uri, Opts) ->
+    RegId = registration_id(RealmUri, Opts),
+    bondy_registry_entry:new(
+        registration, RegId, RealmUri, Ref, Uri, Opts
+    ).
+
+%% @private
+registration_id(_, #{registration_id := Val}) ->
+    Val;
+registration_id(RealmUri, _) ->
+    bondy_message_id:router(RealmUri).
+
+%% @private
+subscription_id(_, #{subscription_id := Val}) ->
+    Val;
+subscription_id(Uri, _) ->
+    bondy_message_id:router(Uri).
+
+%% @private
+do_match(?EOT) ->
+    ?EOT;
+do_match(Cont) ->
+    bondy_registry_partition:find_matches(Cont).
+
+%% @private
+do_match(Type, RealmUri, Uri, Opts0) ->
+    Partition = pick_partition(RealmUri),
+    Opts = Opts0#{sort => bondy_registry_entry:mg_comparator()},
+    bondy_registry_partition:match(Partition, Type, RealmUri, Uri, Opts).
+
+%% @private
+do_find_matches(?EOT) ->
+    ?EOT;
+do_find_matches(Cont) ->
+    bondy_registry_partition:find_matches(Cont).
+
+%% @private
+do_find_matches(Type, RealmUri, Uri, Opts0) ->
+    Partition = pick_partition(RealmUri),
+    Opts = Opts0#{sort => bondy_registry_entry:mg_comparator()},
+    bondy_registry_partition:find_matches(Partition, Type, RealmUri, Uri, Opts).
+
+%% @private
+%% Rebuilds the in-memory match indices (trie / ETS) from the durable
+%% (ephemeral, in-RAM) bondy_db store, per realm, sweeping any stale entry left
+%% by a previous incarnation of THIS node (same nodestring, created before this
+%% boot). With the registry on a memory topology and AAE off, a fresh node boot
+%% finds an empty store — nothing survives a restart — so this only does real
+%% work on a registry-process restart while bondy_db stays up.
+init_indices(State) ->
+    ?LOG_NOTICE(#{
+        description =>
+            "Rebuilding in-memory registry indices from the bondy_db store."
+    }),
+
+    Now = State#state.start_ts,
+    Node = bondy_config:nodestring(),
+
+    ok = rebuild_indices(registration, Now, Node),
+    ok = rebuild_indices(subscription, Now, Node).
+
+%% @private
+rebuild_indices(Type, Now, Node) ->
+    case bondy_namespace_catalog:table(?BONDY_DB_REGISTRATION_RIB_TAB) of
+        undefined ->
+            %% Registry not provisioned (e.g. the catalogue is idle) — nothing
+            %% to rebuild.
+            ok;
+        _Table ->
+            _ = [
+                rebuild_realm_indices(Type, RealmUri, Now, Node)
+             || Realm <- bondy_realm:list(),
+                RealmUri <- [bondy_realm:uri(Realm)],
+                RealmUri =/= undefined
+            ],
+            ok
+    end.
+
+%% @private
+%% Enumeration goes through the store so it reads whichever entry backend
+%% the store runs on (bondy_db, or partition-local ETS under RIB `write`
+%% mode).
+rebuild_realm_indices(Type, RealmUri, Now, Node) ->
+    Partition = pick_partition(RealmUri),
+    case bondy_registry_partition:store(Partition) of
+        undefined ->
+            ok;
+        Store ->
+            bondy_registry_store:foreach(
+                Store,
+                Type,
+                RealmUri,
+                fun({_Key, Entry}) ->
+                    maybe_restore_index(Partition, Entry, Now, Node)
+                end,
+                []
+            )
+    end.
+
+%% @private
+maybe_restore_index(Partition, Entry, Now, Node) ->
+    EntryNode = bondy_registry_entry:nodestring(Entry),
+    Created = bondy_registry_entry:created(Entry),
+
+    %% IMPORTANT We assume nodes keep their names forever.
+    case Node == EntryNode andalso Created < Now of
+        true ->
+            %% A stale entry from a previous incarnation of this node — it
+            %% should have been deleted on crash/shutdown.
+            ?LOG_DEBUG(#{
+                description => "Removing stale registry entry",
+                entry => Entry
+            }),
+            _ = bondy_registry_partition:remove(Partition, Entry),
+            ok;
+        false ->
+            _ = bondy_registry_partition:add_indices(Partition, Entry),
+            ok
+    end.
+
+%% @private
+maybe_fun(undefined, _) ->
+    undefined;
+maybe_fun(Fun, _) when is_function(Fun, 1) ->
+    Fun;
+maybe_fun(Fun, Ctxt) when is_function(Fun, 2) ->
+    fun(Entry) -> Fun(Entry, Ctxt) end.
+
+%% @private
+maybe_execute(undefined, _) ->
+    ok;
+maybe_execute(Fun, Entry) when is_function(Fun, 1) ->
+    try
+        _ = Fun(Entry),
+        ok
+    catch
+        Class:Reason:Stacktrace ->
+            ?LOG_ERROR(#{
+                description => "Error while executing user function",
+                class => Class,
+                reason => Reason,
+                stacktrace => Stacktrace
+            }),
+            ok
+    end.
+
+%% @private
+%% Removes every matched entry from `Partition`, then runs `Fun` over them.
+%%
+%% Two phases on purpose: the removals write the art tries, so the task runs
+%% once they are all done rather than interleaved with them, to minimise trie
+%% concurrency access.
+%%
+%% `Matches` is what `bondy_registry_store:find/4` answers a `{limit, _}`
+%% request with: the WHOLE match set in one page, plus an already-exhausted
+%% continuation — bondy_db reads materialise the bounded set in one shot and
+%% `find/1` returns `?EOT` unconditionally. Asserting that shape rather than
+%% looping over the continuation is the point: should the store regain real
+%% paging, this raises a `function_clause` instead of quietly removing only the
+%% first page. Pinned by
+%% `bondy_registry_SUITE:remove_all_runs_task_once_per_entry`, which removes
+%% more entries than the limit it asks for.
+%%
+%% `find_pairs/5` also applies the pattern's `session_id` exactly — by point
+%% read, by session index, or by an explicit session-less filter — so the
+%% entries arrive already narrowed to the session and there is nothing to
+%% re-filter here.
+do_remove_all(_Partition, ?EOT, _Fun) ->
+    ok;
+do_remove_all(Partition, {Pairs, ?EOT}, Fun) ->
+    Entries = [Entry || {_EntryKey, Entry} <- Pairs],
+
+    %% Deletes the entry from the bondy_db store and its in-memory indices
+    %% (cross-node convergence rides AAE).
+    ok = lists:foreach(
+        fun(Entry) ->
+            ok = bondy_registry_partition:remove(Partition, Entry)
+        end,
+        Entries
+    ),
+
+    lists:foreach(fun(Entry) -> maybe_execute(Fun, Entry) end, Entries).
+
+%% @private
+%% Runs the RIB consistency check for every realm, logs each divergent one
+%% (realm, divergence count and a bounded sample) and gauges the node-wide
+%% total.
+rib_check() ->
+    Total = lists:foldl(
+        fun(RealmUri, Acc) ->
+            %% Reclamation BEFORE measurement, in that order deliberately: a
+            %% departed node's cell is removed by the membership-driven origin
+            %% reap, but that is a local `stabilize` discard rather than an
+            %% apply, so no merge event fires and the stub it summarises is
+            %% left behind. Dropping those first means `check/1` compares two
+            %% views that have both been told the node is gone, instead of
+            %% reporting the orphan as a divergence for one interval.
+            _ = rib_reap_orphan_stubs(RealmUri),
+            case bondy_registry_rib:check(RealmUri) of
+                [] ->
+                    Acc;
+                Divergences ->
+                    ?LOG_WARNING(#{
+                        description =>
+                            "Registry RIB summaries diverge from "
+                            "the ground truth for realm",
+                        realm_uri => RealmUri,
+                        count => length(Divergences),
+                        sample => lists:sublist(Divergences, 3)
+                    }),
+                    Acc + length(Divergences)
+            end
+        end,
+        0,
+        rib_check_realms()
+    ),
+    registry_metric(gauge, #{
+        name => bondy_registry_rib_divergences, value => Total
+    }).
+
+%% @private
+log_rib_check_skipped(Reason, Stacktrace) ->
+    ?LOG_WARNING(#{
+        description => "Registry RIB consistency sweep failed",
+        class => error,
+        reason => Reason,
+        stacktrace => Stacktrace
+    }).
+
+%% @private
+%% `bondy_cluster:members/0` raises `membership_unavailable` until the
+%% membership is first set; the reap then waits for the next sweep.
+rib_reap_orphan_stubs(RealmUri) ->
+    try bondy_registry_rib:reap_orphan_stubs(RealmUri) of
+        0 ->
+            0;
+        N when is_integer(N) ->
+            ?LOG_INFO(#{
+                description =>
+                    "Dropped registry RIB stubs with no backing cell "
+                    "(their owner's cell was reclaimed after it left the "
+                    "cluster)",
+                realm_uri => RealmUri,
+                count => N
+            }),
+            N
+    catch
+        error:membership_unavailable:Stacktrace ->
+            ?LOG_WARNING(#{
+                description => "Registry RIB orphan-stub reap failed",
+                realm_uri => RealmUri,
+                class => error,
+                reason => membership_unavailable,
+                stacktrace => Stacktrace
+            }),
+            0
+    end.
+
+%% @private
+%% Record a metric; a missing metrics subsystem must not take the registry
+%% server down. `bondy_metrics` raises `badarg` while its ETS table is absent.
+registry_metric(Type, Spec) ->
+    try
+        case Type of
+            gauge -> bondy_metrics:gauge(Spec);
+            histogram -> bondy_metrics:histogram(Spec)
+        end
+    catch
+        error:badarg ->
+            ok
+    end.
+
+%% @private
+%% The realms the sweep must inspect: every realm this node KNOWS, plus every
+%% realm it holds RIB CELLS for.
+%%
+%% The second half is not redundancy. Realm records are replicated state in
+%% `main` and nothing orders that bootstrap before the `registry` one, so a
+%% node can hold cells for a realm it has no record of. Driving the sweep from
+%% `bondy_realm:list/0` alone made it blind in precisely the case it exists to
+%% catch — the gauge reads 0 while the stub view is missing and routing is
+%% wrong.
+%%
+%% The first half is not redundant either: a realm with local entries but no
+%% cells yet is a divergence the cell-derived set cannot see.
+rib_check_realms() ->
+    Known = [bondy_realm:uri(R) || R <- bondy_realm:list()],
+    lists:usort(Known ++ bondy_registry_rib:realms()).
+
+%% @private
+%% Arms the next RIB consistency sweep. `registry.rib.check_interval`
+%% (default 5 min); `0` disables the sweep.
+schedule_rib_check() ->
+    case rib_check_interval_ms() of
+        0 ->
+            ok;
+        Interval when is_integer(Interval), Interval > 0 ->
+            _ = erlang:send_after(Interval, self(), rib_check),
+            ok
+    end.
+
+%% @private
+rib_check_interval_ms() ->
+    application:get_env(
+        bondy_router, registry_rib_check_interval, timer:minutes(5)
+    ).
+
+sort(_, ?EOT) ->
+    ?EOT;
+sort(registration, L) when is_list(L) ->
+    lists:sort(bondy_registry_entry:mg_comparator(), L);
+sort(registration, {L, C}) when is_list(L) ->
+    {lists:sort(bondy_registry_entry:mg_comparator(), L), C};
+sort(subscription, Term) ->
+    Term.

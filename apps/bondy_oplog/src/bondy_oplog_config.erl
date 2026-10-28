@@ -1,0 +1,685 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_oplog_config).
+-moduledoc """
+The public configuration surface for the `bondy_oplog` layer.
+
+This module is the single source of truth for `bondy_oplog`'s tunable
+application-environment values: each key's **default lives here, once**, in its
+accessor — so the same default cannot drift between read sites, which is what
+a literal repeated at every call site invites. The export list is, in effect,
+the layer's config schema.
+
+Value tunables that operators change at runtime expose a `set_*/1` write-through
+next to their accessor (e.g. `aae_load_adaptive/0` ↔ `set_aae_load_adaptive/1`).
+Keeping the read, the write, and the default in one place is what makes the
+default a single source of truth: a setter cannot restate — and so cannot drift
+from — the accessor's default.
+
+## Live reads, not a cached snapshot
+
+Each accessor reads `application:get_env(bondy_oplog, Key, Default)` directly, and
+each setter is the symmetric `application:set_env(bondy_oplog, Key, Value)`, so a
+value set at boot (by the release/cuttlefish schema) **or** changed at runtime
+(via a `set_*/1`, as tests and operators do) takes effect on the next read. This
+is deliberately NOT the `app_config`/`persistent_term` snapshot pattern used by
+`bondy_mst_config`: that caches the env at init, which would silently ignore a
+post-boot write — exactly the override the test harness and operators rely on
+here.
+
+## What is intentionally NOT here
+
+- **Pluggable-implementation hooks** — `gc_trigger`, `sync_dispatch`,
+  `peer_source`. These select a *module/fun* and fall back to a layer-local
+  default implementation (`default_dispatch/2` etc.); they are not value
+  tunables and their fallback belongs next to the implementation it names.
+- **Per-instance keys** — `{validator_crypto, InstanceId}`. Instance-scoped
+  state, not a global tunable.
+""".
+
+-define(APP, bondy_oplog).
+
+%% SCHEDULERS
+-export([sync_scheduler_enabled/0]).
+-export([sync_interval_ms/0]).
+-export([frontier_hole_alarm_ms/0]).
+-export([gc_scheduler_enabled/0]).
+-export([origin_retirement_enabled/0]).
+-export([origin_retirement_interval_ms/0]).
+-export([reclaim_enabled/0]).
+-export([reclaim_interval_ms/0]).
+-export([reclaim_batch_cells/0]).
+-export([gc_interval_ms/0]).
+-export([gc_max_concurrency/0]).
+
+%% PACK STORE (DURABLE MST)
+-export([pack_auto_seal_bytes/0]).
+-export([pack_seal_mode/0]).
+
+%% WAL (WRITE-AHEAD LOG)
+-export([wal_fsync_mode/0]).
+-export([wal_max_segment_bytes/0]).
+-export([wal_batched_fsync_interval_ms/0]).
+-export([wal_batched_fsync_bytes/0]).
+
+%% LIVE-SYNC THROTTLE
+-export([live_sync_adaptive/0]).
+-export([set_live_sync_adaptive/1]).
+-export([live_sync_base_ms/0]).
+-export([set_live_sync_base_ms/1]).
+-export([live_sync_max_ms/0]).
+-export([set_live_sync_max_ms/1]).
+
+%% PEERS / BOOTSTRAP
+-export([bootstrap_peer_strategy/0]).
+-export([set_bootstrap_peer_strategy/1]).
+-export([max_inflight_bootstraps/0]).
+-export([set_max_inflight_bootstraps/1]).
+-export([bootstrap_retry_base_ms/0]).
+-export([set_bootstrap_retry_base_ms/1]).
+-export([bootstrap_retry_max_ms/0]).
+-export([set_bootstrap_retry_max_ms/1]).
+-export([bootstrap_retry_jitter/0]).
+-export([set_bootstrap_retry_jitter/1]).
+
+%% AAE / SYNC SESSION
+-export([aae_fence_on_isolation/0]).
+-export([sync_session_opts/0]).
+-export([aae_max_concurrency/0]).
+-export([set_aae_max_concurrency/1]).
+-export([aae_max_pages_in_flight/0]).
+-export([aae_pages_per_round/0]).
+-export([sync_max_response_bytes/0]).
+-export([sync_response_headroom/0]).
+-export([partisan_max_message_size/0]).
+-export([aae_load_adaptive/0]).
+-export([set_aae_load_adaptive/1]).
+-export([aae_load_run_queue_threshold/0]).
+-export([set_aae_load_run_queue_threshold/1]).
+
+%% INSTANCE HEAP MONITOR
+-export([instance_gc_interval_ms/0]).
+-export([instance_gc_heap_delta_bytes/0]).
+
+%% OBSERVABILITY / MISC
+-export([catalogue_cursor_ttl_ms/0]).
+-export([metrics_interval_ms/0]).
+-export([oplog_latency_opts/0]).
+-export([latency_probe/0]).
+
+%% =============================================================================
+%% API — SCHEDULERS
+%% =============================================================================
+
+-doc "Whether the periodic AAE sync scheduler ticks (default `true`).".
+-spec sync_scheduler_enabled() -> boolean().
+
+sync_scheduler_enabled() ->
+    application:get_env(?APP, sync_scheduler, true).
+
+-doc "Sync scheduler tick interval in milliseconds (default `500`).".
+-spec sync_interval_ms() -> non_neg_integer().
+
+sync_interval_ms() ->
+    application:get_env(?APP, sync_interval_ms, 500).
+
+-doc """
+How long an instance may carry a per-origin contiguity hole in its applied
+frontier before the node raises `{bondy_oplog_frontier_hole, InstanceId}`
+(default 5 minutes; `0` disables the detector and clears whatever it raised).
+
+A hole is a seq run this replica never received, with later seqs of the same
+origin already folded above it (`bondy_oplog_registry:pending/1`). Short-lived
+holes are ROUTINE — a local WAL commit landing out of seq order, a burned seq
+waiting for its `seq_fill` backfill, a peer round away — so the alarm is on the
+AGE of the condition, not its occurrence. The threshold is minutes rather than
+seconds because the mechanisms that close a hole are themselves paced in
+rounds: the default AAE tick is `sync_interval_ms` and a catalogue
+re-bootstrap streams a whole projection.
+
+Measured by `bondy_oplog_sync_scheduler`'s own periodic hole tick, which runs
+independently of `sync_scheduler_enabled/0` — a node with AAE off is MORE
+likely to carry a standing hole, not less.
+""".
+-spec frontier_hole_alarm_ms() -> non_neg_integer().
+
+frontier_hole_alarm_ms() ->
+    application:get_env(?APP, frontier_hole_alarm_ms, 300_000).
+
+-doc "Whether the periodic compaction (GC) scheduler ticks (default `true`).".
+-spec gc_scheduler_enabled() -> boolean().
+
+gc_scheduler_enabled() ->
+    application:get_env(?APP, gc_scheduler, true).
+
+-doc """
+Whether origin retirement auto-reacts to membership removals and runs its
+periodic pass (default `true`). The pass is meant to be idempotent and
+fail-closed. Disable it only to pin retirement to explicit operator runs
+(`bondy_oplog_origin_retirement:run/0`).
+""".
+-spec origin_retirement_enabled() -> boolean().
+
+origin_retirement_enabled() ->
+    application:get_env(?APP, origin_retirement, true).
+
+-doc """
+Periodic origin-retirement pass interval in milliseconds (default
+`600_000`). Membership events remain the primary trigger; the periodic pass
+covers origin-epoch turnover WITHOUT a membership change — e.g. a K8s
+StatefulSet pod that loses its volume and rejoins under the same name.
+The pass is meant to be idempotent and fail-closed.
+""".
+-spec origin_retirement_interval_ms() -> non_neg_integer().
+
+origin_retirement_interval_ms() ->
+    application:get_env(?APP, origin_retirement_interval_ms, 600_000).
+
+-doc """
+Whether the projection-cell reclamation scheduler ticks (default `true`).
+When disabled, deletes still converge and tombstones are retained
+indefinitely — reclamation is the space-return mechanism, not the deletion
+semantics.
+""".
+-spec reclaim_enabled() -> boolean().
+
+reclaim_enabled() ->
+    application:get_env(?APP, reclaim_enabled, true).
+
+-doc """
+Reclamation scheduler tick interval in milliseconds (default `60_000` —
+deliberately much larger than `gc_interval_ms`'s 1000; reclamation is a
+space concern, not a liveness one).
+""".
+-spec reclaim_interval_ms() -> non_neg_integer().
+
+reclaim_interval_ms() ->
+    application:get_env(?APP, reclaim_interval_ms, 60_000).
+
+-doc """
+Cells per bounded sweep call during a reclamation pass (default `500`).
+The sweep runs inside the applier — the sole projection writer — so this is
+the cap on how long a single pass batch can stall a concurrent write; the
+pass loops batches to completion, letting writes interleave between them.
+""".
+-spec reclaim_batch_cells() -> pos_integer().
+
+reclaim_batch_cells() ->
+    application:get_env(?APP, reclaim_batch_cells, 500).
+
+-doc "GC scheduler tick interval in milliseconds (default `1000`).".
+-spec gc_interval_ms() -> non_neg_integer().
+
+gc_interval_ms() ->
+    application:get_env(?APP, gc_interval_ms, 1000).
+
+-doc "Maximum concurrent compaction cycles in flight (default `4`).".
+-spec gc_max_concurrency() -> pos_integer().
+
+gc_max_concurrency() ->
+    application:get_env(?APP, gc_max_concurrency, 4).
+
+%% =============================================================================
+%% API — PACK STORE (DURABLE MST)
+%% =============================================================================
+
+-doc """
+`incoming.pack` byte threshold at which the durable pack-store MST seals it
+into a sealed pack (default 2 MiB, the `db.pack_auto_seal_bytes` default).
+See `db.pack_auto_seal_bytes` for the trade-off.
+""".
+-spec pack_auto_seal_bytes() -> pos_integer().
+
+pack_auto_seal_bytes() ->
+    application:get_env(?APP, pack_auto_seal_bytes, 2_097_152).
+
+-doc """
+Seal driver for the durable pack-store MST instances (default `async`).
+
+`async` rolls `incoming.pack` aside at the commit barrier and rewrites it into
+a sealed pack in a monitored worker process, so the rewrite does not block the
+instance's apply pipeline. Durable write throughput is bounded by disk fsync
+bandwidth either way.
+
+`sync` seals inline: the store seals on `put` when the threshold is crossed.
+Affects only durable (pack-store) instances; ephemeral (ets/map) backends never
+seal.
+""".
+-spec pack_seal_mode() -> sync | async.
+
+pack_seal_mode() ->
+    case application:get_env(?APP, pack_seal_mode, async) of
+        async -> async;
+        sync -> sync;
+        _ -> async
+    end.
+
+%% =============================================================================
+%% API — WAL (WRITE-AHEAD LOG)
+%% =============================================================================
+
+-doc """
+Fsync driver for the durable WAL writer (default `per_write`).
+
+`per_write` fsyncs every `append/2`, bounding the writer to the storage
+device's fsync rate (~6k ops/s on typical NVMe) but guaranteeing each write
+is durable before it returns — required for security-class namespaces
+(grants, tickets, users) that rely on the "on disk before `append/2`
+returns" contract.
+
+`batched` defers fsync to a size or time boundary (`wal_batched_fsync_bytes/0`,
+`wal_batched_fsync_interval_ms/0`) and exposes durability via
+`bondy_oplog_wal:durable_position/1` / `await_durable/3` instead of the
+return of `append/2`. It reaches roughly two orders of magnitude higher
+throughput (~200k events/s under concurrent appenders) at the cost of a
+bounded durability window. Affects only the durable (disk) WAL backend;
+the ephemeral (`registry`) in-memory WAL never fsyncs.
+""".
+-spec wal_fsync_mode() -> per_write | batched.
+
+wal_fsync_mode() ->
+    case application:get_env(?APP, wal_fsync_mode, per_write) of
+        batched -> batched;
+        _ -> per_write
+    end.
+
+-doc """
+Rotation threshold, in bytes, for the durable WAL's head segment (default
+`67_108_864`, 64 MiB). The writer rotates to a fresh segment once the next
+frame would push the head past this size; rotation fsyncs the sealed
+segment and advances `durable_position/1`.
+""".
+-spec wal_max_segment_bytes() -> pos_integer().
+
+wal_max_segment_bytes() ->
+    application:get_env(?APP, wal_max_segment_bytes, 64 * 1024 * 1024).
+
+-doc """
+Batched-mode fsync time trigger in milliseconds (default `50`): the writer
+fsyncs at most this long after the first un-fsynced append. Only consulted
+when `wal_fsync_mode/0` is `batched`.
+""".
+-spec wal_batched_fsync_interval_ms() -> pos_integer().
+
+wal_batched_fsync_interval_ms() ->
+    application:get_env(?APP, wal_batched_fsync_interval_ms, 50).
+
+-doc """
+Batched-mode fsync size trigger in bytes (default `1_048_576`, 1 MiB): the
+writer fsyncs once accumulated un-fsynced bytes exceed this threshold. Only
+consulted when `wal_fsync_mode/0` is `batched`.
+""".
+-spec wal_batched_fsync_bytes() -> pos_integer().
+
+wal_batched_fsync_bytes() ->
+    application:get_env(?APP, wal_batched_fsync_bytes, 1024 * 1024).
+
+%% =============================================================================
+%% API — LIVE-SYNC THROTTLE
+%% =============================================================================
+
+-doc "Whether a converged instance backs its live-sync cadence off (default `true`).".
+-spec live_sync_adaptive() -> boolean().
+
+live_sync_adaptive() ->
+    application:get_env(?APP, live_sync_adaptive, true).
+
+-doc "Sets `live_sync_adaptive/0` at runtime.".
+-spec set_live_sync_adaptive(boolean()) -> ok.
+
+set_live_sync_adaptive(B) when is_boolean(B) ->
+    application:set_env(?APP, live_sync_adaptive, B).
+
+-doc """
+Base live-sync cadence in milliseconds: the cadence while the local root is
+moving. Defaults to `sync_interval_ms/0` (the scheduler tick).
+""".
+-spec live_sync_base_ms() -> non_neg_integer().
+
+live_sync_base_ms() ->
+    application:get_env(?APP, live_sync_base_ms, sync_interval_ms()).
+
+-doc "Sets `live_sync_base_ms/0` at runtime.".
+-spec set_live_sync_base_ms(non_neg_integer()) -> ok.
+
+set_live_sync_base_ms(Ms) when is_integer(Ms), Ms >= 0 ->
+    application:set_env(?APP, live_sync_base_ms, Ms).
+
+-doc "Maximum (backed-off) live-sync poll window in milliseconds (default `5000`).".
+-spec live_sync_max_ms() -> non_neg_integer().
+
+live_sync_max_ms() ->
+    application:get_env(?APP, live_sync_max_ms, 5000).
+
+-doc "Sets `live_sync_max_ms/0` at runtime.".
+-spec set_live_sync_max_ms(non_neg_integer()) -> ok.
+
+set_live_sync_max_ms(Ms) when is_integer(Ms), Ms >= 0 ->
+    application:set_env(?APP, live_sync_max_ms, Ms).
+
+%% =============================================================================
+%% API — PEERS / BOOTSTRAP
+%% =============================================================================
+
+-doc "Bootstrap peer-selection strategy (default `first`).".
+-spec bootstrap_peer_strategy() -> atom().
+
+bootstrap_peer_strategy() ->
+    application:get_env(?APP, bootstrap_peer_strategy, first).
+
+-doc "Sets `bootstrap_peer_strategy/0` at runtime. Takes effect on the next tick.".
+-spec set_bootstrap_peer_strategy(first | random | round_robin) -> ok.
+
+set_bootstrap_peer_strategy(S) when
+    S =:= first; S =:= random; S =:= round_robin
+->
+    application:set_env(?APP, bootstrap_peer_strategy, S).
+
+-doc "Maximum concurrent bootstrap sessions in flight (default `4`).".
+-spec max_inflight_bootstraps() -> pos_integer().
+
+max_inflight_bootstraps() ->
+    application:get_env(?APP, max_inflight_bootstraps, 4).
+
+-doc """
+Sets `max_inflight_bootstraps/0` at runtime; `0` quiesces new bootstrap
+dispatch (in-flight sessions drain naturally).
+""".
+-spec set_max_inflight_bootstraps(non_neg_integer()) -> ok.
+
+set_max_inflight_bootstraps(N) when is_integer(N), N >= 0 ->
+    application:set_env(?APP, max_inflight_bootstraps, N).
+
+-doc "Bootstrap retry backoff base in milliseconds (default `500`).".
+-spec bootstrap_retry_base_ms() -> non_neg_integer().
+
+bootstrap_retry_base_ms() ->
+    application:get_env(?APP, bootstrap_retry_base_ms, 500).
+
+-doc "Sets `bootstrap_retry_base_ms/0` at runtime.".
+-spec set_bootstrap_retry_base_ms(non_neg_integer()) -> ok.
+
+set_bootstrap_retry_base_ms(Ms) when is_integer(Ms), Ms >= 0 ->
+    application:set_env(?APP, bootstrap_retry_base_ms, Ms).
+
+-doc "Bootstrap retry backoff ceiling in milliseconds (default `30000`).".
+-spec bootstrap_retry_max_ms() -> non_neg_integer().
+
+bootstrap_retry_max_ms() ->
+    application:get_env(?APP, bootstrap_retry_max_ms, 30000).
+
+-doc "Sets `bootstrap_retry_max_ms/0` at runtime.".
+-spec set_bootstrap_retry_max_ms(non_neg_integer()) -> ok.
+
+set_bootstrap_retry_max_ms(Ms) when is_integer(Ms), Ms >= 0 ->
+    application:set_env(?APP, bootstrap_retry_max_ms, Ms).
+
+-doc "Whether bootstrap retry backoff is jittered (default `true`).".
+-spec bootstrap_retry_jitter() -> boolean().
+
+bootstrap_retry_jitter() ->
+    application:get_env(?APP, bootstrap_retry_jitter, true).
+
+-doc "Sets `bootstrap_retry_jitter/0` at runtime.".
+-spec set_bootstrap_retry_jitter(boolean()) -> ok.
+
+set_bootstrap_retry_jitter(B) when is_boolean(B) ->
+    application:set_env(?APP, bootstrap_retry_jitter, B).
+
+%% =============================================================================
+%% API — AAE / SYNC SESSION
+%% =============================================================================
+
+-doc """
+The AE-fence policy when this node is an isolated, non-solo minority
+(`refuse | proceed | quorum`; default `refuse`).
+""".
+-spec aae_fence_on_isolation() -> atom().
+
+aae_fence_on_isolation() ->
+    application:get_env(?APP, aae_fence_on_isolation, refuse).
+
+-doc "Extra options threaded into each sync session (default `#{}`).".
+-spec sync_session_opts() -> map().
+
+sync_session_opts() ->
+    application:get_env(?APP, sync_session_opts, #{}).
+
+-doc """
+Maximum number of AAE sync sessions allowed to run concurrently on this node
+(default `3`).
+
+AAE is background work subordinate to routing — this cap keeps it from
+saturating the node. It governs *speed and fairness*, never the memory ceiling:
+the per-round page batch is `aae_max_pages_in_flight/0 ÷` this value
+(`aae_pages_per_round/0`), so raising concurrency shrinks each session's batch
+and the node-wide page budget stays fixed. More concurrency therefore means
+more peers/shards make progress at once (no shard starves behind a single
+serial sync), at the cost of each session running slower — NOT more RAM. `1`
+serialises AAE (simplest, but a busy node may never schedule some shards); `3`
+is a sane fairness default.
+""".
+-spec aae_max_concurrency() -> pos_integer().
+
+aae_max_concurrency() ->
+    max(1, application:get_env(?APP, aae_max_concurrency, 3)).
+
+-doc "Sets `aae_max_concurrency/0` at runtime. Takes effect on the next tick.".
+-spec set_aae_max_concurrency(pos_integer()) -> ok.
+
+set_aae_max_concurrency(N) when is_integer(N), N >= 1 ->
+    application:set_env(?APP, aae_max_concurrency, N).
+
+-doc """
+Node-wide budget, in MST pages, for AAE reconciliation in flight at any instant
+(default `2048`).
+
+This budget bounds AAE's peak memory. A sync session pulls missing pages from
+its peer in rounds, and each of the `aae_max_concurrency/0` sessions fetches at
+most `aae_pages_per_round/0` pages per round, so total in-flight pages stay
+close to this budget regardless of concurrency or dataset size. A larger budget
+syncs faster but raises the peak; a smaller budget is gentler on RAM and slower.
+""".
+-spec aae_max_pages_in_flight() -> pos_integer().
+
+aae_max_pages_in_flight() ->
+    max(1, application:get_env(?APP, aae_max_pages_in_flight, 2048)).
+
+-doc """
+The per-round page batch a single AAE session may pull, derived as
+`aae_max_pages_in_flight/0 ÷ aae_max_concurrency/0` (at least `1`).
+
+This is the value the sync session uses to bound `get_pages`. Dividing the
+node-wide budget by the concurrency is what makes the memory ceiling
+independent of how many sessions run: 1 session pulls big batches; 3 sessions
+each pull a third — same node-wide peak, three-way fairness, each a bit slower.
+""".
+-spec aae_pages_per_round() -> pos_integer().
+
+aae_pages_per_round() ->
+    max(1, aae_max_pages_in_flight() div aae_max_concurrency()).
+
+-doc """
+The Partisan inter-node frame cap (`max_message_size`), read live so the sync
+ceiling below tracks it. A peer frame over this cap is rejected before decode
+(`emsgsize`) and the peer is dropped. Falls back to Partisan's own default if
+the config is not yet readable.
+""".
+-spec partisan_max_message_size() -> pos_integer().
+
+partisan_max_message_size() ->
+    partisan_config:get(max_message_size, 67108864).
+
+-doc """
+Fraction of the Partisan frame cap a single AAE sync response may fill (default
+`0.8`). This is the headroom that keeps a packed response under
+`max_message_size` after the overhead the packer does NOT measure — the response
+map's keys and slots, the sync-protocol envelope, and Partisan's own framing. It
+is therefore capped at `0.95`: a value of `1.0` would leave no room for that
+overhead and could push the serialized frame past `max_message_size`, causing
+the `emsgsize` peer-drop this whole mechanism exists to prevent. Values `> 0.95`
+are clamped to `0.95`; non-positive / non-numeric values fall back to the
+default.
+""".
+-spec sync_response_headroom() -> float().
+
+sync_response_headroom() ->
+    case application:get_env(?APP, sync_response_headroom, 0.8) of
+        F when is_number(F) andalso F > 0 -> min(float(F), 0.95);
+        _ -> 0.8
+    end.
+
+-doc """
+The byte ceiling for a single AAE sync response — a `get_pages` page map or a
+catalogue-snapshot cell batch. Derived from `partisan_max_message_size/0` times
+`sync_response_headroom/0`, so it moves in lockstep with the transport frame
+cap: the responder packs a response up to this size and leaves the remainder for
+the next round, and never emits a frame Partisan would reject. An explicit
+`sync_max_response_bytes` env overrides the derivation.
+""".
+-spec sync_max_response_bytes() -> pos_integer().
+
+sync_max_response_bytes() ->
+    case application:get_env(?APP, sync_max_response_bytes, undefined) of
+        N when is_integer(N) andalso N > 0 ->
+            N;
+        _ ->
+            max(
+                1,
+                round(partisan_max_message_size() * sync_response_headroom())
+            )
+    end.
+
+-doc """
+Whether AAE yields its throttleable dispatches while the node is busy (default
+`false` — opt-in).
+
+The node-wide concurrency cap (`aae_max_concurrency/0`) bounds AAE in aggregate;
+this lever adds the *temporal* dimension — even within the cap, a routing load
+spike transiently defers AAE so background reconciliation never steals scheduler
+time from the node's real job. It is a soft, per-tick yield read from a smoothed
+node-load signal (`aae_load_run_queue_threshold/0`): in-flight sessions are never
+aborted and the deferred shards retry on the next quiet tick. Instances that back
+the authentication freshness fence are exempt (as they are from the cap), so the
+yield never affects auth availability.
+
+Off by default because the load signal is environment-sensitive and the cap plus
+the live throttle already keep AAE subordinate to routing; enable it where a
+node's routing latency is sensitive to AAE scheduler pressure under load.
+""".
+-spec aae_load_adaptive() -> boolean().
+
+aae_load_adaptive() ->
+    application:get_env(?APP, aae_load_adaptive, false).
+
+-doc "Sets `aae_load_adaptive/0` at runtime.".
+-spec set_aae_load_adaptive(boolean()) -> ok.
+
+set_aae_load_adaptive(B) when is_boolean(B) ->
+    application:set_env(?APP, aae_load_adaptive, B).
+
+-doc """
+Run-queue length per online scheduler — EWMA-smoothed — at or above which AAE
+yields its throttleable dispatches for a tick (default `2.0`).
+
+The signal is `erlang:statistics(run_queue) ÷ schedulers_online`: the average
+number of *ready* processes waiting behind the one running on each scheduler. A
+healthy node hovers near `0`–`1`; a sustained value of `2`+ means work is
+queuing faster than the schedulers drain it — the node is backlogged and AAE
+should step aside. Smoothing (a fixed EWMA over the scheduler ticks) gives the
+threshold hysteresis so a momentary burst does not flap the yield. Lower yields
+AAE sooner (more protective of routing latency, slower convergence under load);
+higher lets AAE keep working closer to saturation. Only consulted when
+`aae_load_adaptive/0` is on.
+""".
+-spec aae_load_run_queue_threshold() -> float().
+
+aae_load_run_queue_threshold() ->
+    case application:get_env(?APP, aae_load_run_queue_threshold, 2.0) of
+        N when is_float(N) -> N;
+        N when is_integer(N) -> float(N);
+        _ -> 2.0
+    end.
+
+-doc """
+Sets `aae_load_run_queue_threshold/0` at runtime. Accepts an integer or float;
+stored as a float.
+""".
+-spec set_aae_load_run_queue_threshold(number()) -> ok.
+
+set_aae_load_run_queue_threshold(N) when is_number(N), N >= 0 ->
+    application:set_env(?APP, aae_load_run_queue_threshold, float(N)).
+
+%% =============================================================================
+%% API — INSTANCE HEAP MONITOR
+%% =============================================================================
+
+-doc """
+Interval in milliseconds at which each `bondy_oplog_instance` checks its own
+heap and fullsweep-hibernates if it has grown past
+`instance_gc_heap_delta_bytes/0` (default `2000`).
+
+The monitor reclaims the transient apply/AAE garbage a long-lived instance
+process retains until the next major GC — most visibly during a solo import
+(no peers), where the AAE-driven hibernate never fires and the heap would
+otherwise climb unbounded. `0` disables the monitor.
+""".
+-spec instance_gc_interval_ms() -> non_neg_integer().
+
+instance_gc_interval_ms() ->
+    application:get_env(?APP, instance_gc_interval_ms, 2000).
+
+-doc """
+Heap-growth threshold, in bytes, above an instance's post-GC baseline at which
+the periodic monitor fullsweep-hibernates it (default `16_777_216`, 16 MiB).
+
+Keying on *growth over the live baseline* — not absolute heap size — is what
+keeps an instance with a large live MST from being GC-thrashed: the monitor
+fires once per ~this-many bytes of accumulated garbage, capping the transient
+per-instance peak at roughly `live + this`, then settles. Lower trades a touch
+more fullsweep work for a tighter memory ceiling.
+""".
+-spec instance_gc_heap_delta_bytes() -> pos_integer().
+
+instance_gc_heap_delta_bytes() ->
+    max(1, application:get_env(?APP, instance_gc_heap_delta_bytes, 16_777_216)).
+
+%% =============================================================================
+%% API — OBSERVABILITY / MISC
+%% =============================================================================
+
+-doc "Catalogue-snapshot cursor TTL in milliseconds (default `60000`).".
+-spec catalogue_cursor_ttl_ms() -> non_neg_integer().
+
+catalogue_cursor_ttl_ms() ->
+    application:get_env(?APP, catalogue_cursor_ttl_ms, 60_000).
+
+-doc """
+Core-metrics reporting interval in milliseconds (default `1000`), read from the
+`interval_ms` field of the `metrics` map env value when present.
+""".
+-spec metrics_interval_ms() -> non_neg_integer().
+
+metrics_interval_ms() ->
+    case application:get_env(?APP, metrics) of
+        {ok, M} when is_map(M) -> maps:get(interval_ms, M, 1000);
+        _ -> 1000
+    end.
+
+-doc "Write→readable latency-sampling options map (default `#{}`).".
+-spec oplog_latency_opts() -> map().
+
+oplog_latency_opts() ->
+    case application:get_env(?APP, oplog_latency) of
+        {ok, M} when is_map(M) -> M;
+        _ -> #{}
+    end.
+
+-doc "The latency-probe config, or `undefined` when probing is disabled.".
+-spec latency_probe() -> term().
+
+latency_probe() ->
+    application:get_env(?APP, latency_probe, undefined).

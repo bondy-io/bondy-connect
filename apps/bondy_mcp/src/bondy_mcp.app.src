@@ -1,0 +1,42 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+{application, bondy_mcp, [
+    {description,
+        "MCP (Model Context Protocol) gateway: serves MCP endpoints on "
+        "listeners that declare the mcp service, translating MCP requests "
+        "into WAMP routing."
+    },
+    {vsn, "0.1.0"},
+    {registered, [bondy_mcp_sup, bondy_mcp_gateway]},
+    {mod, {bondy_mcp_app, []}},
+    %% `bondy_router' is a runtime dependency but is deliberately NOT listed:
+    %% `bondy_router_app:start/2' starts this application mid-boot, before its own
+    %% start has returned, so listing it would make that call try to start an
+    %% application that is already starting. `bondy_http_connector' and
+    %% `bondy_mail' follow the same rule for the same reason.
+    {applications, [
+        kernel,
+        stdlib,
+        cowboy,
+        telemetry,
+        bondy_metrics,
+        bondy_json_rpc
+    ]},
+    %% Defaults mirror `schema/bondy_mcp.schema` — in a released node the
+    %% schema default is authoritative and these are dead; keep the two
+    %% equal so a schema-less boot (tests, `rebar3 shell`) behaves the same.
+    {env, [
+        {manifest_mode, curated},
+        {manifest_cache_ttl, 60000},
+        {manifest_rebuild_debounce, 1000},
+        {request_state_ttl, 300000},
+        {request_state_max_size, 65536},
+        {metrics_label_by_name, false}
+    ]},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+]}.

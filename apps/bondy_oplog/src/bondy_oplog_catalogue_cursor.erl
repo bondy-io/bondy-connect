@@ -1,0 +1,492 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_oplog_catalogue_cursor).
+
+-behaviour(gen_server).
+
+-include_lib("kernel/include/logger.hrl").
+-include("bondy_oplog.hrl").
+
+-moduledoc #{format => "text/markdown"}.
+-moduledoc """
+Node-shared cursor table for catalogue-snapshot bootstrap sessions.
+
+The bootstrap protocol pulls a peer's catalogue projection in batches.
+Each session is paged on
+the peer side by an opaque cursor; this module owns the cursor table.
+
+## Lifecycle
+
+1. **`mint/5`** — the peer-side responder mints a cursor at the start
+   of a bootstrap session. The cursor captures the
+   `(instance, ns, index, shard, bucket, watermark)` and an initial
+   `last_key = undefined` (start from the lowest key in the bucket).
+2. **`lookup/1`** — the responder resolves the cursor on each
+   `get_catalogue_snapshot_next` request.
+3. **`advance/2`** — after returning a batch the responder advances
+   `last_key` to the last-returned key. Expiry deadline is bumped on
+   every advance so an in-flight session never times out under its own
+   activity.
+4. **`discard/1`** — explicit cleanup when the responder hits end of
+   keyspace; the cursor row is dropped immediately.
+
+Expired cursors are lazily reaped on access (a `lookup/1` of an
+expired row returns `expired` *and* deletes the row). A periodic sweep
+also runs every `?GC_INTERVAL_MS` to bound table growth when sessions
+abandon their cursors silently.
+
+## Concurrency
+
+The ETS table is `public` so `mint/5`, `lookup/1`, `advance/2`, and
+`discard/1` are direct ETS ops — no gen_server roundtrip per batch.
+This keeps multiple bootstrap sessions on the same peer fully parallel.
+The owning gen_server only creates the table on init and runs the
+periodic GC sweep.
+
+## Failure mode
+
+Cursors live only in memory. If the peer crashes mid-bootstrap the
+initiator's next request finds `not_found` and must retry from
+`get_catalogue_snapshot_init`. This is the correct semantics — the
+snapshot is a moving target across peer restarts.
+""".
+
+%% Public ETS table; rows are direct-write from the responder so
+%% multiple in-flight sessions do not serialise on the gen_server.
+-define(TABLE, bondy_oplog_catalogue_cursor_tab).
+
+%% Cursor lifetime budget per individual request. Refreshed on every
+%% `advance/2`. A bootstrap session that pulls a batch every < 60s
+%% never expires; a session that stalls is reclaimed.
+-define(DEFAULT_TTL_MS, 60_000).
+
+%% Periodic full-table sweep. Cheap — `ets:select_delete/2` with a
+%% match-spec, no copying.
+-define(GC_INTERVAL_MS, 30_000).
+
+-record(cursor, {
+    cursor :: cursor(),
+    instance_id :: instance_id(),
+    ns :: atom(),
+    index :: atom(),
+    shard :: non_neg_integer(),
+    bucket :: binary(),
+    last_key :: undefined | binary(),
+    watermark :: non_neg_integer(),
+    %% Remaining `(NS, Bucket)` targets still to walk after the current one.
+    %% A collapsed per-shard instance carries one target per table on the
+    %% shard (each its own entity-type bucket and, on a memory topology, its
+    %% own projection handle); `next_target/1` pops the head into the current
+    %% `ns`/`bucket` when the current target's keyspace is exhausted. Empty
+    %% for a single-target (`mint/6`) session.
+    remaining = [] :: [{atom(), binary()}],
+    %% Mid-cell resume point for a cell too large to frame whole (the
+    %% `bondy_oplog_catalogue_snapshot` cell cap): `{Key, Frame, PartBytes,
+    %% NextIdx}` means this key's frame ships in parts of PartBytes and the next
+    %% part to emit is NextIdx. PartBytes is pinned here, not recomputed per
+    %% round: it derives from `cluster.max_message_size`, which the oversized
+    %% alarm tells the operator to raise, and a changed part count mid-cell
+    %% would leave the receiver unable to complete the reassembly. The frame
+    %% is held because the range scan is live: a re-read could mix two frames.
+    pending =
+        undefined ::
+        undefined
+        | {binary(), binary(), pos_integer(), pos_integer()},
+    expires_at :: integer()
+}).
+
+-record(state, {
+    ttl_ms :: non_neg_integer()
+}).
+
+-type cursor() :: binary().
+-type cursor_state() :: #{
+    instance_id := instance_id(),
+    ns := atom(),
+    index := atom(),
+    shard := non_neg_integer(),
+    bucket := binary(),
+    last_key := undefined | binary(),
+    watermark := non_neg_integer(),
+    pending :=
+        undefined | {binary(), binary(), pos_integer(), pos_integer()}
+}.
+
+-export_type([cursor/0]).
+-export_type([cursor_state/0]).
+
+%% Lifecycle
+-export([start_link/0]).
+-export([start_link/1]).
+-export([child_spec/0]).
+-export([child_spec/1]).
+
+%% Cursor API (direct ETS, no gen_server roundtrip)
+-export([mint/6]).
+-export([mint/7]).
+-export([next_target/1]).
+-export([lookup/1]).
+-export([advance/2]).
+-export([set_pending/2]).
+-export([discard/1]).
+-export([discard_instance/1]).
+-export([any_open/1]).
+-export([info/0]).
+
+%% gen_server callbacks
+-export([init/1]).
+-export([handle_call/3]).
+-export([handle_cast/2]).
+-export([handle_info/2]).
+-export([terminate/2]).
+
+%% =============================================================================
+%% LIFECYCLE
+%% =============================================================================
+
+-spec start_link() -> {ok, pid()} | {error, term()}.
+
+start_link() ->
+    start_link(#{}).
+
+-spec start_link(map()) -> {ok, pid()} | {error, term()}.
+
+start_link(Opts) when is_map(Opts) ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, Opts, []).
+
+-spec child_spec() -> supervisor:child_spec().
+
+child_spec() ->
+    child_spec(#{}).
+
+-spec child_spec(map()) -> supervisor:child_spec().
+
+child_spec(Opts) ->
+    #{
+        id => ?MODULE,
+        start => {?MODULE, start_link, [Opts]},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [?MODULE]
+    }.
+
+%% =============================================================================
+%% CURSOR API
+%% =============================================================================
+
+-doc """
+Mints a new cursor for a catalogue-snapshot session against the given
+shard and bucket. Returns the opaque cursor token, which the caller
+returns to the peer in subsequent `get_catalogue_snapshot_next`
+requests.
+""".
+-spec mint(
+    instance_id(),
+    NS :: atom(),
+    Index :: atom(),
+    Shard :: non_neg_integer(),
+    Bucket :: binary(),
+    Watermark :: non_neg_integer()
+) -> cursor().
+
+mint(InstanceId, NS, Index, Shard, Bucket, Watermark) ->
+    mint(InstanceId, NS, Index, Shard, Bucket, Watermark, []).
+
+-doc """
+As `mint/6`, but seeds the cursor with `Remaining` additional `(NS, Bucket)`
+targets to walk after the current one — the multi-target walk a collapsed
+per-shard instance uses to stream every table on the shard through one
+session. `next_target/1` pops the head of `Remaining` into the current
+`ns`/`bucket` when the current target's keyspace is exhausted.
+""".
+-spec mint(
+    instance_id(),
+    NS :: atom(),
+    Index :: atom(),
+    Shard :: non_neg_integer(),
+    Bucket :: binary(),
+    Watermark :: non_neg_integer(),
+    Remaining :: [{atom(), binary()}]
+) -> cursor().
+
+mint(InstanceId, NS, Index, Shard, Bucket, Watermark, Remaining) when
+    is_binary(InstanceId),
+    is_atom(NS),
+    is_atom(Index),
+    is_integer(Shard),
+    Shard >= 0,
+    is_binary(Bucket),
+    is_integer(Watermark),
+    Watermark >= 0,
+    is_list(Remaining)
+->
+    Cursor = crypto:strong_rand_bytes(16),
+    Row = #cursor{
+        cursor = Cursor,
+        instance_id = InstanceId,
+        ns = NS,
+        index = Index,
+        shard = Shard,
+        bucket = Bucket,
+        last_key = undefined,
+        watermark = Watermark,
+        remaining = Remaining,
+        expires_at = erlang:monotonic_time(millisecond) + ttl_ms()
+    },
+    true = ets:insert(?TABLE, Row),
+    Cursor.
+
+-doc """
+Advance the cursor to its next `(NS, Bucket)` target: pops the head of
+`remaining` into the current `ns`/`bucket`, resets `last_key` to start the new
+target from its lowest key, and refreshes the expiry deadline. Returns the new
+cursor state, `done` when no targets remain (the whole shard has been walked),
+or `not_found` if the cursor was reaped. Keeps the same opaque cursor token —
+only its server-side state moves — so the initiator chains requests unchanged.
+""".
+-spec next_target(cursor()) -> {ok, cursor_state()} | done | not_found.
+
+next_target(Cursor) when is_binary(Cursor) ->
+    case ets:lookup(?TABLE, Cursor) of
+        [] ->
+            not_found;
+        [#cursor{remaining = []}] ->
+            done;
+        [#cursor{remaining = [{NS, Bucket} | Rest]} = Row] ->
+            Now = erlang:monotonic_time(millisecond),
+            NewRow = Row#cursor{
+                ns = NS,
+                bucket = Bucket,
+                last_key = undefined,
+                %% A target is only exhausted once its final part-shipped
+                %% cell completed, so this is already `undefined` here;
+                %% cleared explicitly so a future caller cannot carry one
+                %% target's resume point into another target's keyspace.
+                pending = undefined,
+                remaining = Rest,
+                expires_at = Now + ttl_ms()
+            },
+            true = ets:insert(?TABLE, NewRow),
+            {ok, row_to_map(NewRow)}
+    end.
+
+-doc """
+Resolves a cursor. Expired rows are eagerly deleted and reported as
+`expired`; unknown cursors return `not_found`. A successful lookup
+returns the cursor's current state as a map.
+""".
+-spec lookup(cursor()) -> {ok, cursor_state()} | expired | not_found.
+
+lookup(Cursor) when is_binary(Cursor) ->
+    case ets:lookup(?TABLE, Cursor) of
+        [] ->
+            not_found;
+        [#cursor{expires_at = ExpiresAt} = Row] ->
+            Now = erlang:monotonic_time(millisecond),
+            case Now >= ExpiresAt of
+                true ->
+                    true = ets:delete(?TABLE, Cursor),
+                    expired;
+                false ->
+                    {ok, row_to_map(Row)}
+            end
+    end.
+
+-doc """
+Advances `last_key` for the cursor and refreshes its expiry deadline.
+Returns `not_found` if the cursor was reaped or never existed.
+""".
+-spec advance(cursor(), NewLastKey :: binary()) -> ok | not_found.
+
+advance(Cursor, NewLastKey) when
+    is_binary(Cursor), is_binary(NewLastKey)
+->
+    Now = erlang:monotonic_time(millisecond),
+    NewExpiresAt = Now + ttl_ms(),
+    Updates = [
+        {#cursor.last_key, NewLastKey},
+        %% Advancing past a key ends any part-shipping for it: either every
+        %% part was emitted, or the key is being abandoned. Either way a
+        %% stale `pending` here would resume a cell the walk has left.
+        {#cursor.pending, undefined},
+        {#cursor.expires_at, NewExpiresAt}
+    ],
+    try ets:update_element(?TABLE, Cursor, Updates) of
+        true -> ok;
+        false -> not_found
+    catch
+        error:badarg -> not_found
+    end.
+
+-doc """
+Records the mid-cell resume point for a cell being shipped in parts, and
+refreshes the expiry deadline. `last_key` is deliberately NOT advanced: the
+walk has not passed this key until its final part has been emitted.
+""".
+-spec set_pending(
+    cursor(), {binary(), binary(), pos_integer(), pos_integer()}
+) -> ok | not_found.
+
+set_pending(Cursor, {Key, Frame, PartBytes, NextIdx} = Pending) when
+    is_binary(Cursor),
+    is_binary(Key),
+    is_binary(Frame),
+    is_integer(PartBytes),
+    PartBytes > 0,
+    is_integer(NextIdx),
+    NextIdx > 0
+->
+    Now = erlang:monotonic_time(millisecond),
+    Updates = [
+        {#cursor.pending, Pending},
+        {#cursor.expires_at, Now + ttl_ms()}
+    ],
+    try ets:update_element(?TABLE, Cursor, Updates) of
+        true -> ok;
+        false -> not_found
+    catch
+        error:badarg -> not_found
+    end.
+
+-doc """
+Drops the cursor immediately. Idempotent.
+""".
+-spec discard(cursor()) -> ok.
+
+discard(Cursor) when is_binary(Cursor) ->
+    true = ets:delete(?TABLE, Cursor),
+    ok.
+
+-doc """
+Drops every cursor open on `InstanceId`, so each session reading a snapshot
+of it gets `cursor_expired` on its next request and restarts from
+`get_catalogue_snapshot_init`. Called when the instance starts installing a
+snapshot of its own or restarts owing the replay of events its frontier does
+not claim, after which the cells those sessions are reading may no longer
+reflect the frontier they read at init (`bondy_oplog_instance:serving/1`).
+Idempotent.
+""".
+-spec discard_instance(instance_id()) -> ok.
+
+discard_instance(InstanceId) when is_binary(InstanceId) ->
+    _ = ets:select_delete(?TABLE, [
+        {#cursor{instance_id = InstanceId, _ = '_'}, [], [true]}
+    ]),
+    ok.
+
+-doc """
+Whether a cursor on `InstanceId` has not yet expired, so a session may still
+read it. An expired row still in the table is not counted, though `advance/2`
+would renew it; `bondy_oplog_instance:begin_install/3` deletes such rows with
+`discard_instance/1`.
+""".
+-spec any_open(instance_id()) -> boolean().
+
+any_open(InstanceId) when is_binary(InstanceId) ->
+    Now = erlang:monotonic_time(millisecond),
+    MS = [
+        {
+            #cursor{instance_id = InstanceId, expires_at = '$1', _ = '_'},
+            [{'>', '$1', Now}],
+            [true]
+        }
+    ],
+    ets:select(?TABLE, MS, 1) =/= '$end_of_table'.
+
+-doc """
+Returns operational diagnostics. Cheap.
+""".
+-spec info() -> map().
+
+info() ->
+    #{
+        table_size => ets:info(?TABLE, size),
+        memory_words => ets:info(?TABLE, memory),
+        ttl_ms => ttl_ms()
+    }.
+
+%% =============================================================================
+%% gen_server CALLBACKS
+%% =============================================================================
+
+init(Opts) ->
+    process_flag(trap_exit, true),
+    %% Streams catalogue-snapshot pages in bursts during bootstrap/sync;
+    %% off_heap mailbox so a page burst backlog isn't re-scanned by the GC.
+    process_flag(message_queue_data, off_heap),
+    _Tab = ets:new(?TABLE, [
+        named_table,
+        set,
+        public,
+        {keypos, #cursor.cursor},
+        {read_concurrency, true},
+        {write_concurrency, true}
+    ]),
+    schedule_gc(),
+    {ok, #state{ttl_ms = maps:get(ttl_ms, Opts, ?DEFAULT_TTL_MS)}}.
+
+handle_call(_Req, _From, State) ->
+    {reply, {error, badcall}, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(gc_tick, State) ->
+    _ = sweep_expired(),
+    schedule_gc(),
+    {noreply, State};
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+row_to_map(#cursor{
+    instance_id = Id,
+    ns = NS,
+    index = Index,
+    shard = Shard,
+    bucket = Bucket,
+    last_key = LastKey,
+    watermark = Watermark,
+    pending = Pending
+}) ->
+    #{
+        instance_id => Id,
+        ns => NS,
+        index => Index,
+        shard => Shard,
+        bucket => Bucket,
+        last_key => LastKey,
+        watermark => Watermark,
+        pending => Pending
+    }.
+
+%% @private
+ttl_ms() ->
+    bondy_oplog_config:catalogue_cursor_ttl_ms().
+
+%% @private
+schedule_gc() ->
+    erlang:send_after(?GC_INTERVAL_MS, self(), gc_tick).
+
+%% @private
+sweep_expired() ->
+    Now = erlang:monotonic_time(millisecond),
+    MatchSpec = [
+        {
+            #cursor{expires_at = '$1', _ = '_'},
+            [{'<', '$1', {const, Now}}],
+            [true]
+        }
+    ],
+    ets:select_delete(?TABLE, MatchSpec).

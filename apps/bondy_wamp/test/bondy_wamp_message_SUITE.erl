@@ -9,21 +9,15 @@
 -include_lib("eunit/include/eunit.hrl").
 -compile(export_all).
 
-
-
 all() ->
     common:all().
 
 groups() ->
     [{main, [parallel], common:tests(?MODULE)}].
 
-
-
-
 %% =============================================================================
 %% JSON
 %% =============================================================================
-
 
 init_per_suite(Config) ->
     _ = application:ensure_all_started(bondy_wamp),
@@ -33,15 +27,12 @@ init_per_suite(Config) ->
 end_per_suite(_) ->
     ok.
 
-
 abort_test(_) ->
     Uri = <<"com.example.foo">>,
     Details = #{bar => baz},
     Expected = #abort{reason_uri = Uri, details = Details},
 
     ?assertEqual(Expected, bondy_wamp_message:abort(Details, Uri)).
-
-
 
 call_test(_) ->
     Uri = <<"com.example.foo">>,
@@ -83,4 +74,76 @@ call_test(_) ->
             kwargs = undefined
         },
         bondy_wamp_message:call(1, Opts1, Uri, [<<>>])
+    ).
+
+yield_progress_test(_) ->
+    %% The progress option is part of the YIELD options vocabulary and
+    %% survives validation (both as atom and via its binary alias).
+    ?assertEqual(
+        #yield{
+            request_id = 1,
+            options = #{progress => true},
+            args = [<<"chunk">>],
+            kwargs = undefined
+        },
+        bondy_wamp_message:yield(1, #{progress => true}, [<<"chunk">>])
+    ),
+
+    ?assertEqual(
+        #yield{
+            request_id = 1,
+            options = #{progress => true},
+            args = undefined,
+            kwargs = undefined
+        },
+        bondy_wamp_message:yield(1, #{<<"progress">> => true})
+    ),
+
+    %% Unknown options are still stripped.
+    ?assertEqual(
+        #yield{
+            request_id = 1,
+            options = #{},
+            args = undefined,
+            kwargs = undefined
+        },
+        bondy_wamp_message:yield(1, #{frobnicate => true})
+    ).
+
+result_from_progress_test(_) ->
+    %% result_from/3 builds RESULT.Details from the YIELD options, so a
+    %% progressive YIELD produces a RESULT with Details.progress = true.
+    Yield = bondy_wamp_message:yield(
+        99, #{progress => true}, [<<"chunk">>]
+    ),
+    Result = bondy_wamp_message:result_from(Yield, 1, Yield#yield.options),
+
+    ?assertEqual(1, Result#result.request_id),
+    ?assertEqual(true, maps:get(progress, Result#result.details)),
+    ?assertEqual([<<"chunk">>], Result#result.args).
+
+%% An ERROR the router builds in reply to a Payload Passthru request carries a
+%% router payload (a message and an error map), so it is not itself passthru:
+%% building it must not raise, and its details carry no `ppt_*` attribute.
+error_from_passthru_request_test(_) ->
+    Opts = #{ppt_scheme => <<"x_custom">>, ppt_serializer => <<"cbor">>},
+    Sources = [
+        bondy_wamp_message:call(1, Opts, <<"com.example.p">>, [<<"o">>]),
+        bondy_wamp_message:publish(1, Opts, <<"com.example.t">>, [<<"o">>]),
+        bondy_wamp_message:invocation(1, 2, Opts, [<<"o">>])
+    ],
+    lists:foreach(
+        fun(Source) ->
+            #error{details = Details} = bondy_wamp_message:error_from(
+                Source,
+                #{},
+                <<"wamp.error.not_authorized">>,
+                [<<"denied">>],
+                #{<<"code">> => 1}
+            ),
+            ?assertEqual(
+                [], maps:keys(maps:with(?WAMP_PPT_ATTRS, Details))
+            )
+        end,
+        Sources
     ).

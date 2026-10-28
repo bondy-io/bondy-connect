@@ -1,0 +1,120 @@
+## =============================================================================
+## Bondy config -- M0 Fly fault-injection spike (harness/m0-fly-spike)
+## =============================================================================
+## Pinned tag: develop-perf.1 (4995ea12). Reconciled key-by-key against
+## schema/bondy.schema at the pinned tag
+## (every key/datatype/default below was verified to exist -- a wrong key fails
+## cuttlefish validation and the node never boots).
+##
+## ASCII ONLY, and no stray variable references anywhere. bin/replace-env-vars
+## expands every dollar-brace NAME token in the whole file (comments included)
+## before cuttlefish parses it; an undefined NAME aborts the node boot.
+##
+## Scope: M0 only needs a 3-node cluster that BOOTS and FORMS a full mesh so the
+## capability probe can inject faults. Client realms and load are out of scope
+## for M0 (they arrive at M2/M6).
+## =============================================================================
+
+## --- node identity / cluster (Fly 6PN DNS discovery, no seed node) ------------
+cluster.overlay.topology                    = fullmesh
+cluster.automatic_leave                     = off
+## M0 runs on Fly's private 6PN mesh with no cluster mTLS provisioned.
+## bondy_router_app:guard_peer_plane refuses to boot a discovering node on an insecure
+## peer plane unless this override is set. Real perf/correctness runs (M6) use
+## the production mTLS from deployment/fly/CLUSTER_MTLS.md instead.
+cluster.tls.allow_insecure                  = on
+cluster.peer_ip                             = ${FLY_PRIVATE_IP}
+cluster.peer_port                           = 18086
+cluster.peer_discovery.enabled              = on
+cluster.peer_discovery.type                 = dns
+cluster.peer_discovery.initial_delay        = 10s
+cluster.peer_discovery.polling_interval     = 10s
+cluster.peer_discovery.timeout              = 5s
+cluster.peer_discovery.config.record_type   = aaaa
+cluster.peer_discovery.config.query         = ${FLY_APP_NAME}.internal
+## node_basename is the part BEFORE @ in the Erlang node name. setup.sh sets
+## BONDY_ERL_NODENAME=bondy@<ip>, so this MUST be `bondy`, NOT ${FLY_APP_NAME}
+## (the app is bondy-perf-m0; using the app name would build wrong peer names).
+cluster.peer_discovery.config.node_basename = bondy
+cluster.peer_discovery.config.nameservers.1 = fdaa::3
+cluster.channels.wamp_relay.parallelism     = 2
+
+## --- anti-entropy: MUST be on (00 #3 landmine) -- 500ms sync tick -------------
+db.aae                                   = on
+db.aae.interval                          = 500ms
+
+## --- routing / ordering -------------------------------------------------------
+## Flow lanes (commit 9bc267e2) enforce per-pair FIFO independent of forward.ack,
+## so ack/retransmission stay off (flip on only to test retransmission).
+router.forward.ack                          = off
+router.forward.retransmission               = off
+load_regulation.router.flow_pool.capacity   = 100000
+
+## --- registry RIB: write-only architecture, no mode ladder --------------------
+## Routing is unconditional on summary stubs; full entries never replicate.
+registry.rib.check_interval                 = 5m
+
+## workload (clients must also announce the features in HELLO) ------------------
+
+## --- AAE reactor pool (gproc hash pool; per-key FIFO preserved) ---------------
+load_regulation.aae_reactor.pool.size       = 16
+
+## --- Partisan max message size ------------------------------------------------
+## A cell/frame over this ceiling is correctly skipped and never replicates
+## (a P3 "permanent divergence that is CORRECT" -- 05 R21). Default kept explicit.
+cluster.max_message_size                    = 64MB
+
+## --- rpc ----------------------------------------------------------------------
+wamp.call_timeout                           = 30s
+
+## --- listeners: WebSocket only (WAMP-TCP/TLS disabled) ------------------------
+## Admin API (18081) carries /metrics, /ping, /ready. Clients use /ws on 18080.
+## TLS/HTTPS listeners are simply not declared: no server certs are
+## provisioned for the spike (M0 is HTTP/WS only), which also avoids the
+## keycert.pem enoent warnings at boot.##
+## Declared under `listeners.*`. A listener that is not declared does not exist,
+## so WAMP-TCP/TLS and the HTTPS variants are absent rather than switched off.
+## `admin` is the reserved name for the administrable listener. Every option is
+## stated here because a listener's options are read under its CURRENT name.
+##
+## `http.idle_timeout` and `http.active_n` are restated because the legacy
+## mappings supplied them as schema defaults and Cowboy's own differ: 60s rather
+## than 15s, and `active_n` 1 rather than 100 (`cowboy_http.erl:214,336`).
+listeners.admin.transport                    = tcp
+listeners.admin.protocol                     = http
+listeners.admin.port                         = 18081
+listeners.admin.ip                           = 0.0.0.0
+listeners.admin.start_phase                  = early
+listeners.admin.services                     = admin_api, wamp_ws, admin, metrics
+listeners.admin.acceptors_pool_size          = 50
+listeners.admin.http.idle_timeout            = 15s
+listeners.admin.http.active_n                = 100
+
+listeners.api_gateway_http.transport         = tcp
+listeners.api_gateway_http.protocol          = http
+listeners.api_gateway_http.port              = 18080
+listeners.api_gateway_http.ip                = 0.0.0.0
+listeners.api_gateway_http.services          = api_gateway, wamp_ws, wamp_sse, wamp_longpoll
+listeners.api_gateway_http.acceptors_pool_size = 200
+listeners.api_gateway_http.max_connections   = 100000
+listeners.api_gateway_http.backlog           = 4096
+listeners.api_gateway_http.nodelay           = on
+listeners.api_gateway_http.http.idle_timeout = 15s
+listeners.api_gateway_http.http.active_n     = 100
+listeners.api_gateway_http.websocket.idle_timeout = 8h
+
+## --- data (durable core DB; ephemeral machine storage for M0) -----------------
+platform_data_dir                           = ${BONDY_DATA_DIR}
+
+## --- logging ------------------------------------------------------------------
+log.level                                   = info
+log.handlers.default.level                  = info
+
+## =============================================================================
+## FINDING (2026-07-27, code-verified): `registry_presence_evict_after` from
+## 03 #2 is NOT a cuttlefish key at the pinned tag (schema/bondy.schema has no
+## presence/evict mapping) -- so it is OMITTED (including it would fail boot).
+## EVICT grace stays at its code default (24h). Before any EVICT-dependent
+## milestone (M4/M5), locate the real override (code -define or advanced.config)
+## and correct 03 #2. See FLY_FAULT_CAPABILITY.md.
+## =============================================================================

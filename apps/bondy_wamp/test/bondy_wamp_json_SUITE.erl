@@ -9,7 +9,6 @@
 -include_lib("bondy_wamp.hrl").
 -compile(export_all).
 
-
 all() ->
     [
         test_encode_basic,
@@ -26,10 +25,9 @@ all() ->
         test_encode_with_tail,
         test_validate_opts,
         test_roundtrip,
-        test_error_cases
+        test_error_cases,
+        test_decode_invalid_json_is_badarg
     ].
-
-
 
 init_per_suite(Config) ->
     _ = application:ensure_all_started(bondy_wamp),
@@ -39,9 +37,7 @@ init_per_suite(Config) ->
 end_per_suite(_) ->
     ok.
 
-
 test_float(_) ->
-
     Default = [{float_format, [{decimals, 16}]}],
     ?assertEqual(
         bondy_wamp_json:encode(1.0),
@@ -90,9 +86,7 @@ test_float(_) ->
     ?assertEqual(<<"1.012e+00">>, bondy_wamp_json:encode(1.0123, Opts2)),
     ?assertEqual(<<"1.012e+00">>, bondy_wamp_json:encode(1.01234, Opts2)),
 
-
     ?assertError(badarg, bondy_wamp_json:encode(1.0, [{float_format, [foo]}])).
-
 
 test_datetime(_) ->
     %% Test basic datetime encoding (returns unquoted datetime string)
@@ -100,7 +94,6 @@ test_datetime(_) ->
     Expected1 = <<"2025-10-20T14:30:45Z">>,
     ?assertEqual(Expected1, bondy_wamp_json:encode(DT1)),
 
-    %% Test datetime with fractional seconds
     DT2 = {{2025, 1, 1}, {0, 0, 12.345}},
     Result2 = bondy_wamp_json:encode(DT2),
     ?assertEqual(<<"2025-01-01T00:00:12.345Z">>, Result2),
@@ -115,9 +108,7 @@ test_datetime(_) ->
     Expected4 = <<"0099-05-15T12:00:00Z">>,
     ?assertEqual(Expected4, bondy_wamp_json:encode(DT4)).
 
-
 test_encode_basic(_) ->
-    %% Basic types
     ?assertEqual(<<"1">>, bondy_wamp_json:encode(1)),
     ?assertEqual(<<"-42">>, bondy_wamp_json:encode(-42)),
     ?assertEqual(<<"\"hello\"">>, bondy_wamp_json:encode(<<"hello">>)),
@@ -127,7 +118,6 @@ test_encode_basic(_) ->
     ?assertEqual(<<"true">>, bondy_wamp_json:encode(true)),
     ?assertEqual(<<"false">>, bondy_wamp_json:encode(false)),
 
-    %% Arrays
     ?assertEqual(<<"[]">>, bondy_wamp_json:encode([])),
     ?assertEqual(<<"[1,2,3]">>, bondy_wamp_json:encode([1, 2, 3])),
     ?assertEqual(
@@ -135,16 +125,13 @@ test_encode_basic(_) ->
         bondy_wamp_json:encode([<<"a">>, <<"b">>, <<"c">>])
     ),
 
-    %% Objects (maps)
     ?assertEqual(<<"{}">>, bondy_wamp_json:encode(#{})),
     Obj = #{<<"key">> => <<"value">>},
     ?assertEqual(<<"{\"key\":\"value\"}">>, bondy_wamp_json:encode(Obj)),
 
-    %% Nested structures
     Nested = [1, #{<<"nested">> => [2, 3]}, 4],
     Result = bondy_wamp_json:encode(Nested),
     ?assertEqual(<<"[1,{\"nested\":[2,3]},4]">>, Result).
-
 
 test_encode_undefined(_) ->
     %% undefined should encode to null
@@ -156,13 +143,10 @@ test_encode_undefined(_) ->
         bondy_wamp_json:encode([1, undefined, 3])
     ),
 
-    %% undefined in maps
     Map = #{<<"key">> => undefined},
     ?assertEqual(<<"{\"key\":null}">>, bondy_wamp_json:encode(Map)).
 
-
 test_decode_basic(_) ->
-    %% Basic types
     ?assertEqual(1, bondy_wamp_json:decode(<<"1">>)),
     ?assertEqual(-42, bondy_wamp_json:decode(<<"-42">>)),
     ?assertEqual(<<"hello">>, bondy_wamp_json:decode(<<"\"hello\"">>)),
@@ -170,7 +154,6 @@ test_decode_basic(_) ->
     ?assertEqual(false, bondy_wamp_json:decode(<<"false">>)),
     ?assertEqual(undefined, bondy_wamp_json:decode(<<"null">>)),
 
-    %% Arrays
     ?assertEqual([], bondy_wamp_json:decode(<<"[]">>)),
     ?assertEqual([1, 2, 3], bondy_wamp_json:decode(<<"[1,2,3]">>)),
     ?assertEqual(
@@ -178,30 +161,28 @@ test_decode_basic(_) ->
         bondy_wamp_json:decode(<<"[\"a\",\"b\",\"c\"]">>)
     ),
 
-    %% Objects
     ?assertEqual(#{}, bondy_wamp_json:decode(<<"{}">>)),
     ?assertEqual(
         #{<<"key">> => <<"value">>},
         bondy_wamp_json:decode(<<"{\"key\":\"value\"}">>)
     ),
 
-    %% Nested structures
     ?assertEqual(
         [1, #{<<"nested">> => [2, 3]}, 4],
         bondy_wamp_json:decode(<<"[1,{\"nested\":[2,3]},4]">>)
     ).
 
-
 test_decode_with_opts(_) ->
     %% Test with custom decoders
     Opts = [{decoders, #{null => null_atom}}],
     ?assertEqual(null_atom, bondy_wamp_json:decode(<<"null">>, Opts)),
-    ?assertEqual([1, null_atom, 3], bondy_wamp_json:decode(<<"[1,null,3]">>, Opts)),
+    ?assertEqual(
+        [1, null_atom, 3], bondy_wamp_json:decode(<<"[1,null,3]">>, Opts)
+    ),
 
     %% Default decoder should return undefined for null
     ?assertEqual(undefined, bondy_wamp_json:decode(<<"null">>)),
     ?assertEqual([1, undefined, 3], bondy_wamp_json:decode(<<"[1,null,3]">>)).
-
 
 test_try_decode(_) ->
     %% Successful decode
@@ -212,30 +193,28 @@ test_try_decode(_) ->
         bondy_wamp_json:try_decode(<<"{\"key\":\"value\"}">>)
     ),
 
-    %% Failed decode
     {error, _} = bondy_wamp_json:try_decode(<<"{invalid json}">>),
     {error, _} = bondy_wamp_json:try_decode(<<"[1,2,">>),
 
-    %% With options
     Opts = [{decoders, #{null => my_null}}],
     ?assertEqual({ok, my_null}, bondy_wamp_json:try_decode(<<"null">>, Opts)).
-
 
 test_key_value_list(_) ->
     %% Key-value lists (proplists) should be encoded as objects
     KVList = [{<<"key1">>, <<"value1">>}, {<<"key2">>, <<"value2">>}],
     Result = bondy_wamp_json:encode(KVList),
 
-    %% Decode back and verify
     Decoded = bondy_wamp_json:decode(Result),
-    ?assertEqual(#{<<"key1">> => <<"value1">>, <<"key2">> => <<"value2">>}, Decoded),
+    ?assertEqual(
+        #{<<"key1">> => <<"value1">>, <<"key2">> => <<"value2">>}, Decoded
+    ),
 
-    %% Nested key-value lists
     NestedKV = [{<<"outer">>, [{<<"inner">>, <<"value">>}]}],
     NestedResult = bondy_wamp_json:encode(NestedKV),
     NestedDecoded = bondy_wamp_json:decode(NestedResult),
-    ?assertEqual(#{<<"outer">> => #{<<"inner">> => <<"value">>}}, NestedDecoded).
-
+    ?assertEqual(
+        #{<<"outer">> => #{<<"inner">> => <<"value">>}}, NestedDecoded
+    ).
 
 test_check_duplicate_keys(_) ->
     %% Without duplicate checking (default) - duplicates are allowed
@@ -253,22 +232,24 @@ test_check_duplicate_keys(_) ->
     ?assert(is_binary(Result2)),
 
     %% Verify option validation
-    ?assertError(badarg, bondy_wamp_json:encode([], [{check_duplicate_keys, not_boolean}])).
-
+    ?assertError(
+        badarg,
+        bondy_wamp_json:encode([], [{check_duplicate_keys, not_boolean}])
+    ).
 
 test_decode_head(_) ->
     %% Decode first 2 elements of a WAMP message
-    JSON = <<"[1,2,3,4,5]">>,
+    JSON = <<"[1,2,[3],{\"k\":4}]">>,
     {Elements, Tail} = bondy_wamp_json:decode_head(JSON, 2),
     ?assertEqual([1, 2], Elements),
     %% Note: Tail doesn't include leading comma (it's stripped during extraction)
-    ?assertEqual(<<"3,4,5]">>, Tail),
+    ?assertEqual(<<"[3],{\"k\":4}]">>, Tail),
 
     %% Decode first 3 elements
-    JSON2 = <<"[\"hello\",42,true,null,[1,2,3]]">>,
+    JSON2 = <<"[\"hello\",42,true,[1,2,3]]">>,
     {Elements2, Tail2} = bondy_wamp_json:decode_head(JSON2, 3),
     ?assertEqual([<<"hello">>, 42, true], Elements2),
-    ?assertEqual(<<"null,[1,2,3]]">>, Tail2),
+    ?assertEqual(<<"[1,2,3]]">>, Tail2),
 
     %% Decode all elements (tail should be just closing bracket)
     JSON3 = <<"[1,2,3]">>,
@@ -276,17 +257,20 @@ test_decode_head(_) ->
     ?assertEqual([1, 2, 3], Result3),
 
     %% Nested structures in head
-    JSON4 = <<"[{\"key\":\"value\"},[1,2],3,4]">>,
+    JSON4 = <<"[{\"key\":\"value\"},[1,2],[3,4]]">>,
     {Elements4, Tail4} = bondy_wamp_json:decode_head(JSON4, 2),
     ?assertEqual([#{<<"key">> => <<"value">>}, [1, 2]], Elements4),
-    ?assertEqual(<<"3,4]">>, Tail4),
+    ?assertEqual(<<"[3,4]]">>, Tail4),
 
     %% With whitespace
-    JSON5 = <<"[ 1 , 2 , 3 , 4 ]">>,
+    JSON5 = <<"[ 1 , 2 , [3] , {} ]">>,
     {Elements5, Tail5} = bondy_wamp_json:decode_head(JSON5, 2),
     ?assertEqual([1, 2], Elements5),
-    ?assertEqual(<<"3 , 4 ]">>, Tail5).
+    ?assertEqual(<<"[3] , {} ]">>, Tail5),
 
+    %% The rest must be a WAMP Arguments list and ArgumentsKw object
+    ?assertError(badarg, bondy_wamp_json:decode_head(<<"[1,2,3,4,5]">>, 2)),
+    ?assertError(badarg, bondy_wamp_json:decode_head(<<"[1,2,[3]]x">>, 2)).
 
 test_decode_tail(_) ->
     %% Decode tail with leading comma
@@ -314,9 +298,10 @@ test_decode_tail(_) ->
     Result4b = bondy_wamp_json:decode_tail(Tail4b),
     ?assertEqual([undefined, 5], Result4b),
 
-    %% Note: Tails with nested arrays (e.g., "null,[1,2,3]]") have an edge case
-    %% where binary:match finds the first ] instead of checking if tail ends with ]
-    %% This is a known limitation. Use the comma-prefixed version for nested arrays:
+    %% A tail produced by `decode_head/2` starts with the comma that
+    %% followed the last head element, or is the closing bracket alone.
+    %% A comma-less tail whose last element is itself an array is
+    %% ambiguous and is not a shape `decode_head/2` produces.
     Tail4c = <<",null,[1,2,3]]">>,
     Result4c = bondy_wamp_json:decode_tail(Tail4c),
     ?assertEqual([undefined, [1, 2, 3]], Result4c),
@@ -326,44 +311,51 @@ test_decode_tail(_) ->
     Result5 = bondy_wamp_json:decode_tail(Tail5),
     ?assertEqual([3, 4], Result5),
 
-    %% With custom options
     Opts = [{decoders, #{null => custom_null}}],
     Tail6 = <<",null,1]">>,
     Result6 = bondy_wamp_json:decode_tail(Tail6, Opts),
     ?assertEqual([custom_null, 1], Result6).
 
-
 test_encode_with_tail(_) ->
     %% Encode new elements with tail that has leading comma
     Elements1 = [1, 2],
     Tail1 = <<",3,4,5]">>,
-    Result1 = bondy_wamp_json:encode_with_tail(Elements1, Tail1),
+    Result1 = iolist_to_binary(
+        bondy_wamp_json:encode_with_tail(Elements1, Tail1)
+    ),
     ?assertEqual(<<"[1,2,3,4,5]">>, Result1),
 
     %% Encode with tail that is just closing bracket
     Elements2 = [1, 2, 3],
     Tail2 = <<"]">>,
-    Result2 = bondy_wamp_json:encode_with_tail(Elements2, Tail2),
+    Result2 = iolist_to_binary(
+        bondy_wamp_json:encode_with_tail(Elements2, Tail2)
+    ),
     ?assertEqual(<<"[1,2,3]">>, Result2),
 
     %% Encode with tail without leading comma (typical from decode_head)
     Elements3 = [<<"a">>, <<"b">>],
     Tail3 = <<"\"c\",\"d\"]">>,
-    Result3 = bondy_wamp_json:encode_with_tail(Elements3, Tail3),
+    Result3 = iolist_to_binary(
+        bondy_wamp_json:encode_with_tail(Elements3, Tail3)
+    ),
     ?assertEqual(<<"[\"a\",\"b\",\"c\",\"d\"]">>, Result3),
 
     %% Complex elements with tail with leading comma
     Elements4 = [#{<<"key">> => <<"value">>}],
     Tail4 = <<",2,3]">>,
-    Result4 = bondy_wamp_json:encode_with_tail(Elements4, Tail4),
+    Result4 = iolist_to_binary(
+        bondy_wamp_json:encode_with_tail(Elements4, Tail4)
+    ),
     ?assertEqual(<<"[{\"key\":\"value\"},2,3]">>, Result4),
 
     %% Complex elements with tail without leading comma
     Elements5 = [1],
     Tail5 = <<"2,3]">>,
-    Result5 = bondy_wamp_json:encode_with_tail(Elements5, Tail5),
+    Result5 = iolist_to_binary(
+        bondy_wamp_json:encode_with_tail(Elements5, Tail5)
+    ),
     ?assertEqual(<<"[1,2,3]">>, Result5).
-
 
 test_validate_opts(_) ->
     %% Valid float format options
@@ -410,11 +402,7 @@ test_validate_opts(_) ->
     ),
     ?assertEqual([{float_format, [{scientific, 249}]}], Result).
 
-
 test_roundtrip(_) ->
-    %% Test encode/decode roundtrip for various data structures
-
-    %% Basic types
     ?assertEqual(1, bondy_wamp_json:decode(bondy_wamp_json:encode(1))),
     ?assertEqual(
         <<"text">>, bondy_wamp_json:decode(bondy_wamp_json:encode(<<"text">>))
@@ -425,47 +413,46 @@ test_roundtrip(_) ->
         undefined, bondy_wamp_json:decode(bondy_wamp_json:encode(undefined))
     ),
 
-    %% Arrays
     List = [1, 2, 3, <<"hello">>, true, undefined],
     ?assertEqual(List, bondy_wamp_json:decode(bondy_wamp_json:encode(List))),
 
-    %% Maps
     Map = #{<<"key1">> => 1, <<"key2">> => <<"value">>, <<"key3">> => true},
     ?assertEqual(Map, bondy_wamp_json:decode(bondy_wamp_json:encode(Map))),
 
-    %% Nested structures
     Nested = [
         1,
         #{<<"a">> => [2, 3, #{<<"b">> => 4}]},
         [5, 6],
         undefined
     ],
-    ?assertEqual(Nested, bondy_wamp_json:decode(bondy_wamp_json:encode(Nested))),
+    ?assertEqual(
+        Nested, bondy_wamp_json:decode(bondy_wamp_json:encode(Nested))
+    ),
 
     %% Partial encode/decode roundtrip (decode_head strips leading comma from tail)
-    FullArray = [1, 2, 3, 4, 5],
+    FullArray = [1, 2, [3, 4], #{<<"k">> => 5}],
     {Head, Tail} = bondy_wamp_json:decode_head(
         bondy_wamp_json:encode(FullArray), 2
     ),
     ?assertEqual([1, 2], Head),
-    ?assertEqual(<<"3,4,5]">>, Tail),
+    ?assertEqual(<<"[3,4],{\"k\":5}]">>, Tail),
     TailDecoded = bondy_wamp_json:decode_tail(Tail),
     ?assertEqual(FullArray, Head ++ TailDecoded),
 
     %% Encode with tail roundtrip (with leading comma)
     Elements = [1, 2],
     OriginalTail = <<",3,4,5]">>,
-    Encoded = bondy_wamp_json:encode_with_tail(Elements, OriginalTail),
+    Encoded = iolist_to_binary(
+        bondy_wamp_json:encode_with_tail(Elements, OriginalTail)
+    ),
     ?assertEqual([1, 2, 3, 4, 5], bondy_wamp_json:decode(Encoded)),
 
     %% Encode with tail roundtrip (without leading comma, from decode_head)
-    {Head2, Tail2} = bondy_wamp_json:decode_head(<<"[10,20,30,40]">>, 2),
-    Encoded2 = bondy_wamp_json:encode_with_tail(Head2, Tail2),
-    ?assertEqual([10, 20, 30, 40], bondy_wamp_json:decode(Encoded2)).
-
+    {Head2, Tail2} = bondy_wamp_json:decode_head(<<"[10,20,[30],{}]">>, 2),
+    Encoded2 = iolist_to_binary(bondy_wamp_json:encode_with_tail(Head2, Tail2)),
+    ?assertEqual([10, 20, [30], #{}], bondy_wamp_json:decode(Encoded2)).
 
 test_error_cases(_) ->
-    %% Invalid JSON should fail
     ?assertError(_, bondy_wamp_json:decode(<<"{invalid}">>)),
     ?assertError(_, bondy_wamp_json:decode(<<"[1,2,">>)),
     ?assertError(_, bondy_wamp_json:decode(<<"not json">>)),
@@ -481,4 +468,14 @@ test_error_cases(_) ->
         badarg, bondy_wamp_json:encode(1.0, [{float_format, [invalid_opt]}])
     ).
 
-
+test_decode_invalid_json_is_badarg(_) ->
+    Opts = [{decoders, #{null => undefined}}],
+    _ = [
+        begin
+            ?assertError(badarg, bondy_wamp_json:decode(Bin, []), Bin),
+            ?assertError(badarg, bondy_wamp_json:decode(Bin, Opts), Bin)
+        end
+     || Bin <- [~"[", ~"[1]x", ~"[tru]", ~"{\"a\"}", ~"\"\\q\"", ~"[1] [2]"]
+    ],
+    ?assertError(badarg, bondy_wamp_json:decode_head(~"[48,1,{]", 2)),
+    ok.

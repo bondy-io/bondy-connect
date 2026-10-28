@@ -1,11 +1,11 @@
 ![Bondy logo](https://github.com/bondy-io/bondy/blob/develop/doc/assets/bondy_bg.png?raw=true)
 
-![Version](https://img.shields.io/badge/version-1.0.0--rc.2-blue?style=for-the-badge
+![Version](https://img.shields.io/badge/version-1.0.0-blue?style=for-the-badge
 )<br>
 ![Docker Pulls](https://img.shields.io/docker/pulls/leapsight/bondy?style=for-the-badge)
-![Docker Build (master)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy/docker_image_build.yaml?&branch=master&label=docker-master&style=for-the-badge)
-![Docker Build (develop)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy/docker_image_build.yaml?&branch=develop&label=docker-develop&style=for-the-badge)
-![Docker Build (latest-tag)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy/docker_image_build.yaml?&tag=version-1.0.0-rc.65&label=docker-1.0.0-rc.65&style=for-the-badge)
+![Docker Build (master)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy/docker-debian.yaml?&branch=master&label=docker-master&style=for-the-badge)
+![Docker Build (develop)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy/docker-debian.yaml?&branch=develop&label=docker-develop&style=for-the-badge)
+![Docker Build (latest-tag)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy/docker-debian.yaml?&tag=version-1.0.0&label=docker-1.0.0&style=for-the-badge)
 <br>![Architectures](https://img.shields.io/badge/architecture-linux%2Famd64%20%7C%20linux%2Farm64%20%7C%20macOS%2Fintel%20%7C%20macOS%2FM1-lightgrey?style=for-the-badge)
 
 
@@ -36,7 +36,7 @@ For our work-in-progress documentation for v1.0.0 go to [https://developer.bondy
 * [x] Cryptosign
 * [x] Ticket
 * [x] WAMP-CRA
-* [ ] WAMP-SCRAM (WIP)
+* [x] WAMP-SCRAM
 * [x] Cookie (Using Ticket)
 
 
@@ -51,7 +51,7 @@ In addition Bondy provides:
 ### Advanced RPC features
 * [x] Call Canceling
 * [x] Call Timeouts
-* [x] Call Trust Levels
+* [ ] Call Trust Levels (WIP -- `INVOCATION.Details.trust_level` is always `0`; no trust-level policy engine yet)
 * [x] Caller Identification
 * [x] Pattern-based registration
 * [x] Shared Registration
@@ -61,29 +61,41 @@ In addition Bondy provides:
      * [x] Hot Stand-by
           * [x] First
           * [x] Last
-* [ ] Payload Passthru Mode (WIP)
-* [ ] Registration Revocation (WIP)
-* [ ] Progressive Call Results
-* [ ] Progressive Calls
+* [ ] Sharded Registration
+* [x] Payload Passthru Mode
+* [ ] Registration Revocation (WIP -- callee-side handling is implemented in `bondy_connect_sdk`; the Dealer cannot yet trigger a revocation itself)
+* [x] Registration Meta API
+* [ ] Procedure Reflection
+* [ ] Call Re-Routing
+* [x] Progressive Call Results
+* [x] Progressive Call Invocations -- streaming call **arguments** from caller to callee; see [`doc/guides/router/progressive_calls.md`](doc/guides/router/progressive_calls.md).
 
 
 ### Advanced Pub/Sub features
 * [x] Event Retention
 * [x] Pattern-based Subscriptions
-* [x] Publication Trust Levels
+* [ ] Publication Trust Levels (WIP -- `EVENT.Details.trust_level` is not yet computed)
 * [x] Publisher Exclusion
 * [x] Publisher Identification
 * [x] Subscriber Black- and Whitelisting
-* [ ] Payload Passthru Mode (WIP)
+* [x] Payload Passthru Mode
 * [ ] Sharded Subscriptions
 * [ ] Subscription Revocation
+* [x] Subscription Meta API
+* [ ] Event History
+* [ ] Topic Reflection
+
+### Other Advanced Features
+
+* [ ] Session Meta API (WIP -- `on_join`/`on_leave` events and `wamp.session.get` are implemented; the `list`/`count`/`kill*` session-management procedures are not)
+* [ ] Testament
 
 ### WAMP Transports
 
 * [x] WebSockets
 * [x] RawSockets
 * [x] HTTP Longpoll
-* [ ] E2E encryption
+* [x] E2E encryption (via Payload Passthru Mode)
 
 In addition Bondy provides:
 
@@ -94,7 +106,6 @@ In addition Bondy provides:
 * [x] JSON
 * [x] Msgpack
 * [x] CBOR
-* [x] BERT
 * [x] Erlang (subset)
 * [ ] JSON batched
 * [ ] Msgpack batched
@@ -132,10 +143,7 @@ docker run \
 -p 18080:18080 \
 -p 18081:18081 \
 -p 18082:18082 \
--p 18083:18083 \
--p 18084:18084 \
--p 18085:18085 \
--v "$(PWD)/examples/custom_config/etc:/bondy/etc" \
+-v "$PWD/examples/custom_config/etc:/bondy/etc" \
 -v "/tmp/data:/bondy/data" \
 leapsight/bondy:master
 ```
@@ -143,8 +151,11 @@ leapsight/bondy:master
 ### Building from source
 #### Requirements
 * macOS (Intel|Apple Silicon) or Linux (amd64|arm64)
-* [Erlang](https://www.erlang.org/) 26.2.5.6 (Support for OTP 27 is on its way)
-* [Rebar3](https://rebar3.readme.io/) 3.22.1 or later
+* [Erlang](https://www.erlang.org/) 29.1.2 (OTP 28 also builds; `rebar.config`
+  sets `minimum_otp_vsn` to `R28`, and the release images ship OTP 29)
+* [Rebar3](https://rebar3.readme.io/) 3.27.0 or later
+* [just](https://just.systems/) — the task runner the commands below use
+  (`brew install just`, `cargo install just`, or see the install guide)
 * openssl
 * libssl
 * libsnappy
@@ -156,16 +167,19 @@ leapsight/bondy:master
 
 Clone this repository and `cd` to the location where you cloned it.
 
+All build, test and run tasks are driven by [just](https://just.systems/); run
+`just` with no arguments to list every recipe.
+
 To generate a Bondy release to be used in production execute the following command which will generate a tarball containing the release at `$(PWD)/_build/prod/rel/`.
 
 ```shell
-make release
+just release
 ```
 
 Untar and copy the resulting tarball to the location where you want to install Bondy e.g. `~/tmp/bondy`.
 
 ```shell
-tar -zxvf _build/prod/rel/bondy-1.0.0-rc.65.tar.qz -C ~/tmp/bondy
+tar -zxvf _build/prod/rel/bondy-1.0.0.tar.gz -C ~/tmp/bondy
 ```
 
 #### Running
@@ -206,7 +220,7 @@ We will start a node named `bondy1@127.0.0.1` which uses the following variables
 
 
 ```bash
-make node1
+just node1
 ```
 
 #### Create a Realm
@@ -248,7 +262,7 @@ We start a second node named `bondy2@127.0.0.1` which uses the following variabl
 |TLS|WAMP Raw Socket|18185|
 
 ```bash
-make node2
+just node2
 ```
 
 After a minute the two nodes will automatically connect.
@@ -258,7 +272,7 @@ One minute after joining the cluster, the Active Anti-entropy service will trigg
 ### Run a third node
 
 ```bash
-make node3
+just node3
 ```
 
 ## Resources

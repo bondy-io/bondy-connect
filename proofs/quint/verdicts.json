@@ -1,0 +1,926 @@
+{
+  "ReadCache_Ship": {
+    "verdict": "holds",
+    "distinct": 1113775,
+    "depth": 23
+  },
+  "ReadCache_Head": {
+    "verdict": "violated",
+    "cex_states": 7
+  },
+  "ReadCache_Swap": {
+    "verdict": "violated",
+    "cex_states": 8
+  },
+  "ReadCache_RAW": {
+    "verdict": "violated",
+    "cex_states": 7
+  },
+  "ReadCache_SmallShip": {
+    "verdict": "holds",
+    "distinct": 1670,
+    "depth": 14
+  },
+  "ReadCache_SmallSwap": {
+    "verdict": "violated",
+    "cex_states": 8,
+    "distinct": 1487
+  },
+  "AuthFence_Refuse": {
+    "verdict": "holds",
+    "distinct": 1022,
+    "depth": 10
+  },
+  "AuthFence_Single": {
+    "verdict": "holds",
+    "distinct": 91,
+    "depth": 8
+  },
+  "AuthFence_Refuse_CommitBumps": {
+    "verdict": "violated",
+    "cex_states": 6,
+    "reachable": 1232
+  },
+  "AuthFence_Proceed": {
+    "verdict": "violated",
+    "cex_states": 7,
+    "reachable": 1232
+  },
+  "SeqSeed_Shipped": {
+    "verdict": "violated",
+    "cex_states": 8,
+    "reachable": 566
+  },
+  "SeqSeed_CkptCommitKeyedRetention": {
+    "verdict": "violated",
+    "cex_states": 9,
+    "reachable": 1868
+  },
+  "SeqSeed_CkptEarlyMint": {
+    "verdict": "violated",
+    "cex_states": 5,
+    "reachable": 1486
+  },
+  "SeqSeed_CkptWal": {
+    "verdict": "holds",
+    "reachable": 426
+  },
+  "SeqSeed_CkptWal_MaxSeq5": {
+    "verdict": "holds",
+    "distinct": 3942,
+    "generated": 75261,
+    "depth": 27
+  },
+  "AaeCausalClosure_Shipped": {
+    "verdict": "holds",
+    "distinct": 1523,
+    "depth": 15
+  },
+  "AaeCausalClosure_Shipped_3R": {
+    "verdict": "no violation, not exhaustive",
+    "distinct_before_cap": 18183015
+  },
+  "AaeCausalClosure_Unheld": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "AaeCausalClosure_Unheld_2R": {
+    "verdict": "violated",
+    "cex_states": 6,
+    "reachable": 1682
+  },
+  "CellContextReap_R2_DirTree": {
+    "verdict": "violated",
+    "cex_states": 3,
+    "reachable": 2183
+  },
+  "CellContextReap_R2_DirTree_Dead": {
+    "verdict": "violated",
+    "cex_states": 4,
+    "reachable": 2183
+  },
+  "CellContextReap_R2_Unordered": {
+    "verdict": "holds",
+    "distinct": 2183,
+    "depth": 12
+  },
+  "CellContextReap_R2_ReapTRUE_CausalTRUE": {
+    "verdict": "holds",
+    "distinct": 1354631,
+    "generated": 6742307,
+    "depth": 20
+  },
+  "CellContextReap_R3S1_ReapTRUE_CausalTRUE": {
+    "verdict": "holds",
+    "distinct": 30258937,
+    "generated": 225005485,
+    "depth": 27
+  },
+  "CellContextReap_R3S1_ReapTRUE_CausalFALSE": {
+    "verdict": "violated",
+    "cex_states": 6,
+    "safety_distinct": 10570826,
+    "safety_depth": 27,
+    "note": "inv without convergence holds: TLC on the compiled module under SYMMETRY over the replicas"
+  },
+  "ReplayReanchor_Shipped_NoRestart": {
+    "verdict": "violated",
+    "cex_states": 6,
+    "reachable": 15405
+  },
+  "ReplayReanchor_Shipped_Gated": {
+    "verdict": "violated",
+    "cex_states": 6,
+    "reachable": 104852,
+    "generated": 247828
+  },
+  "ReplayReanchor_Guarded_Open": {
+    "verdict": "holds, with live",
+    "distinct": 52140,
+    "depth": 14
+  },
+  "ReplayReanchor_Guarded_Gated": {
+    "verdict": "holds, with live",
+    "distinct": 97610,
+    "generated": 231956,
+    "depth": 15
+  },
+  "ReplayReanchor_Guarded_Gated_NoAnchor": {
+    "verdict": "violated",
+    "cex_states": 8
+  },
+  "ReplayReanchor_Guarded_Gated_2R_Safety": {
+    "verdict": "holds",
+    "distinct": 246760,
+    "generated": 598311,
+    "depth": 15
+  },
+  "RibReading_WallAhead": {
+    "verdict": "holds",
+    "distinct": 6882826,
+    "generated": 41666820,
+    "depth": 36
+  },
+  "RibReading_WallStepBack": {
+    "verdict": "violated",
+    "cex_states": 16
+  },
+  "RibAbs_Shipped": {
+    "verdict": "holds",
+    "note": "TLC on the compiled module, peer strings replaced by model values, SYMMETRY over them",
+    "distinct": 115078878,
+    "generated": 1026359836,
+    "depth": 38
+  },
+  "RibAbs_Shipped_Stamp5_OnePeer": {
+    "verdict": "holds",
+    "distinct": 15538045,
+    "generated": 84069091,
+    "depth": 37
+  },
+  "RibAbs_NoRestart_Stamp5": {
+    "verdict": "holds",
+    "note": "TLC on the compiled module, peer strings replaced by model values, SYMMETRY over them",
+    "distinct": 76851033,
+    "generated": 806854664,
+    "depth": 42
+  },
+  "RibAbs_RestartNoRestore": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "RibAbs_HealOnAbsent": {
+    "verdict": "violated",
+    "cex_states": 19
+  },
+  "RibAbs_HealOnForeignTop": {
+    "verdict": "violated",
+    "cex_states": 14
+  },
+  "FrontierPending_MaxCap": {
+    "verdict": "violated",
+    "cex_states": 3,
+    "reachable": 1910
+  },
+  "FrontierPending_Contig_Dead": {
+    "verdict": "violated",
+    "cex_states": 7,
+    "reachable": 626
+  },
+  "FrontierPending_Pending": {
+    "verdict": "holds",
+    "reachable": 532
+  },
+  "FrontierPending_Pending_TwoOrigins": {
+    "verdict": "holds",
+    "reachable": 4160
+  },
+  "FrontierPending_Pending_Restart": {
+    "verdict": "holds, with live",
+    "reachable": 1476
+  },
+  "FrontierPending_Pending_Restart_NoRefold": {
+    "verdict": "violated, live",
+    "reachable": 1194
+  },
+  "OriginRetirementSet_ForgetfulS1": {
+    "verdict": "violated",
+    "cex_states": 9
+  },
+  "OriginRetirementSet_MeetProbe": {
+    "verdict": "holds",
+    "reachable": 4035
+  },
+  "OriginRetirementSet_NoneCompactS1": {
+    "verdict": "violated",
+    "cex_states": 7
+  },
+  "OriginRetirementSet_Unbanned": {
+    "verdict": "violated",
+    "cex_states": 5
+  },
+  "OriginRetirementSet_UnbannedS1": {
+    "verdict": "violated",
+    "cex_states": 5
+  },
+  "OriginRetirementSet_Universal": {
+    "verdict": "holds",
+    "distinct": 95684190,
+    "generated": 685709113,
+    "depth": 37
+  },
+  "OriginRetirementSet_UniversalChurnS1": {
+    "verdict": "violated",
+    "cex_states": 9
+  },
+  "OriginRetirementSet_UniversalCompactS1": {
+    "verdict": "holds",
+    "distinct": 662464,
+    "generated": 4061596,
+    "depth": 23
+  },
+  "OriginRetirementSet_UniversalProbe": {
+    "verdict": "violated",
+    "cex_states": 9
+  },
+  "OriginRetirementSet_UniversalS1": {
+    "verdict": "holds",
+    "distinct": 2538102,
+    "generated": 17013691,
+    "depth": 32
+  },
+  "OriginRetirementSet_UniversalUnbannedS1": {
+    "verdict": "violated",
+    "cex_states": 5
+  },
+  "LiveRebootstrapRefold_LateRederive_TrailFail": {
+    "verdict": "violated",
+    "cex_states": 8
+  },
+  "LiveRebootstrapRefold_MergeFrontier_3R_Safety": {
+    "verdict": "violated",
+    "cex_states": 13
+  },
+  "LiveRebootstrapRefold_NoMarker_Crash": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "LiveRebootstrapRefold_NoServeGuard_TwoFaults": {
+    "verdict": "violated",
+    "cex_states": 11
+  },
+  "LiveRebootstrapRefold_Proposed_3R_Safety": {
+    "verdict": "no violation, not exhaustive",
+    "note": "stopped at the 30-minute cap at depth 18",
+    "distinct": 155825372,
+    "queued": 65603153
+  },
+  "LiveRebootstrapRefold_NoExpiry_3R_Safety": {
+    "verdict": "violated",
+    "cex_states": 19,
+    "note": "beyond breadth-first reach: TLC stops at the disk guard at depth 18 (163,789,997 distinct, 80,511,238 queued); `tests/LiveRebootstrapRefold_test.qnt` replays an 18-step run that violates claimSound"
+  },
+  "LiveRebootstrapRefold_Proposed_Crash": {
+    "verdict": "holds, with live",
+    "distinct": 749480,
+    "depth": 21
+  },
+  "LiveRebootstrapRefold_Proposed_TrailFail_Crash": {
+    "verdict": "holds, with live",
+    "distinct": 853160,
+    "depth": 21
+  },
+  "LiveRebootstrapRefold_Proposed_TrailFail": {
+    "verdict": "holds, with live",
+    "distinct": 251560,
+    "depth": 19
+  },
+  "LiveRebootstrapRefold_Proposed_TwoFaults_TwoCrashes": {
+    "verdict": "holds, with live",
+    "distinct": 242406,
+    "depth": 22
+  },
+  "LiveRebootstrapRefold_Proposed_WriteFailAborts": {
+    "verdict": "holds, with live",
+    "distinct": 962106,
+    "depth": 21
+  },
+  "LiveRebootstrapRefold_Proposed_WriteFailCounted": {
+    "verdict": "violated",
+    "cex_states": 8
+  },
+  "LiveRebootstrapRefold_SkipIfOlder_TrailFail": {
+    "verdict": "violated",
+    "cex_states": 9
+  },
+  "MuxBucketSkip_Final_NoSkew": {
+    "verdict": "holds, with live",
+    "distinct": 126529,
+    "generated": 497077,
+    "depth": 20
+  },
+  "MuxBucketSkip_Final_Skew": {
+    "verdict": "holds, with live",
+    "distinct": 20736,
+    "generated": 90115,
+    "depth": 18,
+    "reachable": 20736
+  },
+  "MuxBucketSkip_Minus_AdoptIfComplete": {
+    "verdict": "violated",
+    "cex_states": 4
+  },
+  "MuxBucketSkip_Minus_GapVerdict": {
+    "verdict": "violated, live"
+  },
+  "MuxBucketSkip_Minus_GateOnRegistration": {
+    "verdict": "holds",
+    "distinct": 26016,
+    "generated": 125566,
+    "depth": 19
+  },
+  "MuxBucketSkip_Minus_ServeGate": {
+    "verdict": "violated",
+    "cex_states": 5
+  },
+  "MuxBucketSkip_Minus_SkipHole_Contig": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "MuxBucketSkip_Final_3r": {
+    "verdict": "holds",
+    "distinct": 7227093,
+    "generated": 59454882,
+    "depth": 34
+  },
+  "ConfirmedCompaction_2R_Async": {
+    "verdict": "holds",
+    "distinct": 948191,
+    "generated": 4312497,
+    "depth": 22
+  },
+  "ConfirmedCompaction_2R_Async_DoorKeep_Live": {
+    "verdict": "violated, live"
+  },
+  "ConfirmedCompaction_2R_Async_Live": {
+    "verdict": "holds, with live",
+    "distinct": 83666,
+    "generated": 376662,
+    "depth": 22,
+    "reachable": 83666
+  },
+  "ConfirmedCompaction_2R_Async_Lost": {
+    "verdict": "holds",
+    "distinct": 1069710,
+    "generated": 4394515,
+    "depth": 27
+  },
+  "ConfirmedCompaction_2R_Async_Lost_Control": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "ConfirmedCompaction_2R_Async_Lost_Live": {
+    "verdict": "holds, with live",
+    "distinct": 1069710,
+    "generated": 4394515,
+    "depth": 27
+  },
+  "ConfirmedCompaction_2R_Async_Lost_NoHeal_Live": {
+    "verdict": "violated, live"
+  },
+  "ConfirmedCompaction_2R_Async_NoCap": {
+    "verdict": "holds",
+    "distinct": 948191,
+    "generated": 4312497,
+    "depth": 22
+  },
+  "ConfirmedCompaction_2R_Async_Partition_Retire": {
+    "verdict": "holds",
+    "distinct": 8533719,
+    "generated": 33089907,
+    "depth": 25
+  },
+  "ConfirmedCompaction_2R_Seq2_Lost": {
+    "verdict": "holds",
+    "distinct": 80688,
+    "generated": 354498,
+    "depth": 17,
+    "reachable": 80688
+  },
+  "ConfirmedCompaction_2R_Seq2_Lost_Control": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "ConfirmedCompaction_2R_Seq2_Lost_Live": {
+    "verdict": "holds, with live",
+    "distinct": 80688,
+    "generated": 354498,
+    "depth": 17
+  },
+  "ConfirmedCompaction_2R_Seq2_Lost_NoHeal_Live": {
+    "verdict": "violated, live"
+  },
+  "ConfirmedCompaction_2R_Seq2_Lost_Uncapped": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "ConfirmedCompaction_3R": {
+    "verdict": "holds",
+    "distinct": 52924,
+    "generated": 401862,
+    "depth": 16,
+    "reachable": 52924
+  },
+  "ConfirmedCompaction_3R_Lost": {
+    "verdict": "holds",
+    "distinct": 22744478,
+    "generated": 213696353,
+    "depth": 24
+  },
+  "ConfirmedCompaction_3R_Async_Depth": {
+    "verdict": "holds",
+    "distinct": 17022458,
+    "generated": 142928528,
+    "depth": 34,
+    "note": "the TLC backend passes no CONSTRAINT, so the instance checks the whole reachable graph"
+  },
+  "ConfirmedCompaction_3R_DoorDrop": {
+    "verdict": "violated",
+    "cex_states": 7
+  },
+  "ConfirmedCompaction_3R_Fresh_Partition": {
+    "verdict": "violated",
+    "cex_states": 7
+  },
+  "ConfirmedCompaction_3R_Lost_SkipWalk": {
+    "verdict": "violated",
+    "cex_states": 7
+  },
+  "ConfirmedCompaction_3R_Lost_Uncapped": {
+    "verdict": "violated",
+    "cex_states": 7
+  },
+  "ConfirmedCompaction_3R_Lost_Ungated": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "ConfirmedCompaction_3R_Partition": {
+    "verdict": "holds",
+    "distinct": 635088,
+    "generated": 6092509,
+    "depth": 20
+  },
+  "ConfirmedCompaction_3R_Retire": {
+    "verdict": "holds",
+    "distinct": 296223,
+    "generated": 1359957,
+    "depth": 18
+  },
+  "IndexIntents_BatchVersion": {
+    "verdict": "violated",
+    "cex_states": 4
+  },
+  "IndexIntents_ClearBeforeSync": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "IndexIntents_ClearMarked": {
+    "verdict": "violated",
+    "cex_states": 11
+  },
+  "IndexIntents_Dispatched": {
+    "verdict": "holds",
+    "distinct": 1449124,
+    "generated": 6486964,
+    "depth": 21
+  },
+  "IndexIntents_Dispatched_2Shards": {
+    "verdict": "holds",
+    "distinct": 1444042,
+    "generated": 10620253,
+    "depth": 21
+  },
+  "IndexIntents_Dispatched_Clean": {
+    "verdict": "holds",
+    "distinct": 5470796,
+    "generated": 21887368,
+    "depth": 24
+  },
+  "IndexIntents_Dispatched_Remark": {
+    "verdict": "holds",
+    "distinct": 5206188,
+    "generated": 28873317,
+    "depth": 26
+  },
+  "IndexIntents_Dispatched_Saturation": {
+    "verdict": "holds",
+    "distinct": 1517054,
+    "generated": 8203067,
+    "depth": 23
+  },
+  "IndexIntents_Dispatched_Saturation_NoRefold": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "IndexIntents_Dispatched_Saturation_NoWipe": {
+    "verdict": "violated",
+    "cex_states": 9
+  },
+  "IndexIntents_Dispatched_Subset": {
+    "verdict": "holds",
+    "distinct": 2102312,
+    "generated": 9421913,
+    "depth": 21
+  },
+  "IndexIntents_Dispatched_Subset_Rebuild": {
+    "verdict": "holds",
+    "distinct": 37306196,
+    "generated": 288949311,
+    "depth": 27
+  },
+  "IndexIntents_Dispatched_Writer": {
+    "verdict": "holds",
+    "distinct": 2874433,
+    "generated": 14882980,
+    "depth": 26
+  },
+  "IndexIntents_DrainRequests": {
+    "verdict": "violated",
+    "cex_states": 11
+  },
+  "IndexIntents_DrawnBound": {
+    "verdict": "violated",
+    "cex_states": 5
+  },
+  "IndexIntents_FreshenWithoutFlush": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "IndexIntents_HlcOrder": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "IndexIntents_InstallBatch": {
+    "verdict": "holds",
+    "distinct": 39967004,
+    "generated": 167134039,
+    "depth": 24
+  },
+  "IndexIntents_InstallBatch_NoSync": {
+    "verdict": "violated",
+    "cex_states": 8
+  },
+  "IndexIntents_InstallBatch_Writer": {
+    "verdict": "holds",
+    "distinct": 196124,
+    "generated": 811080,
+    "depth": 23
+  },
+  "IndexIntents_InstallBatch_Writer_NoReplaySync": {
+    "verdict": "violated",
+    "cex_states": 10
+  },
+  "IndexIntents_InstallDispatch": {
+    "verdict": "violated",
+    "cex_states": 8
+  },
+  "IndexIntents_Intents": {
+    "verdict": "holds",
+    "distinct": 1487564,
+    "generated": 6664580,
+    "depth": 21
+  },
+  "IndexIntents_IntentsVersion": {
+    "verdict": "violated",
+    "cex_states": 12
+  },
+  "IndexIntents_Intents_2Shards": {
+    "verdict": "holds",
+    "distinct": 1873366,
+    "generated": 13683441,
+    "depth": 21
+  },
+  "IndexIntents_Intents_Clean": {
+    "verdict": "holds",
+    "distinct": 5661419,
+    "generated": 22667169,
+    "depth": 24
+  },
+  "IndexIntents_Intents_Rebuild": {
+    "verdict": "holds",
+    "distinct": 24607151,
+    "generated": 130481560,
+    "depth": 32
+  },
+  "IndexIntents_Intents_Saturation": {
+    "verdict": "holds",
+    "distinct": 1531174,
+    "generated": 8294525,
+    "depth": 23
+  },
+  "IndexIntents_Intents_Subset": {
+    "verdict": "holds",
+    "distinct": 2146512,
+    "generated": 9637308,
+    "depth": 21
+  },
+  "IndexIntents_Intents_Subset_NoInstallSync": {
+    "verdict": "violated",
+    "cex_states": 10
+  },
+  "IndexIntents_Intents_Writer": {
+    "verdict": "holds",
+    "distinct": 2982019,
+    "generated": 15447346,
+    "depth": 26
+  },
+  "IndexIntents_MarkWithoutFlush": {
+    "verdict": "violated",
+    "cex_states": 13
+  },
+  "IndexIntents_NoInstallIndex": {
+    "verdict": "violated",
+    "cex_states": 3
+  },
+  "IndexIntents_NoIntents": {
+    "verdict": "holds",
+    "distinct": 84928,
+    "generated": 442684,
+    "depth": 18
+  },
+  "IndexIntents_NoIntents_Install": {
+    "verdict": "violated",
+    "cex_states": 3
+  },
+  "IndexIntents_NoIntents_NoRebuildAtOpen": {
+    "verdict": "violated",
+    "cex_states": 4
+  },
+  "IndexIntents_NoIntents_Version": {
+    "verdict": "holds",
+    "distinct": 84928,
+    "generated": 442684,
+    "depth": 18
+  },
+  "IndexIntents_NoIntents_Version_Clean": {
+    "verdict": "holds",
+    "distinct": 171313,
+    "generated": 917367,
+    "depth": 19
+  },
+  "IndexIntents_NoIntents_Version_Clean_Reset": {
+    "verdict": "violated",
+    "cex_states": 7
+  },
+  "IndexIntents_NoIntents_Version_Writer": {
+    "verdict": "holds",
+    "distinct": 3349560,
+    "generated": 17506668,
+    "depth": 25
+  },
+  "IndexIntents_NoIntents_Writer": {
+    "verdict": "violated",
+    "cex_states": 9
+  },
+  "IndexIntents_NoIntents_Writer_MarkNeedsFlush": {
+    "verdict": "holds",
+    "distinct": 3457974,
+    "generated": 18063500,
+    "depth": 25
+  },
+  "IndexIntents_NoSyncBeforeMark": {
+    "verdict": "violated",
+    "cex_states": 15
+  },
+  "IndexIntents_NoSyncBeforeWipe": {
+    "verdict": "violated",
+    "cex_states": 12
+  },
+  "IndexIntents_OpenNoFlush": {
+    "verdict": "violated",
+    "cex_states": 5
+  },
+  "IndexIntents_OpenSeed": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "IndexIntents_ReplayBeforeStamp": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "IndexIntents_SeparateBatch": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "IndexIntents_UnmarkLost": {
+    "verdict": "holds",
+    "distinct": 2434342,
+    "generated": 13167325,
+    "depth": 23
+  },
+  "IndexIntents_UnmarkLost_2Shards": {
+    "verdict": "holds",
+    "distinct": 46678196,
+    "generated": 368698869,
+    "depth": 27
+  },
+  "IndexIntents_UnmarkLost_2Shards_NoRebuildUnmark": {
+    "verdict": "violated",
+    "cex_states": 12
+  },
+  "IndexIntents_UnmarkLost_NoRebuildUnmark": {
+    "verdict": "holds",
+    "distinct": 1577126,
+    "generated": 8498299,
+    "depth": 23
+  },
+  "IndexIntents_UnmarkLost_Remark": {
+    "verdict": "holds",
+    "distinct": 12435088,
+    "generated": 68503807,
+    "depth": 26
+  },
+  "IndexIntents_VersionReset": {
+    "verdict": "violated",
+    "cex_states": 8
+  },
+  "IndexIntents_WriterBound": {
+    "verdict": "violated",
+    "cex_states": 9
+  },
+  "JoinInstall_Stage_2I": {
+    "verdict": "holds",
+    "distinct": 3272969,
+    "generated": 23852225,
+    "depth": 35
+  },
+  "JoinInstall_Stage_3E_1I": {
+    "verdict": "holds",
+    "distinct": 25124570,
+    "generated": 171087353,
+    "depth": 31
+  },
+  "JoinInstall_Stage_Crash_2I": {
+    "verdict": "holds",
+    "distinct": 21232304,
+    "generated": 180220755,
+    "depth": 37
+  },
+  "JoinInstall_Truncation_CompactDurable_Crash": {
+    "verdict": "holds",
+    "distinct": 3270804,
+    "generated": 26511197,
+    "depth": 32
+  },
+  "JoinInstall_Truncation_CompactDurable_Crash_NoFloor": {
+    "verdict": "violated",
+    "cex_states": 12
+  },
+  "JoinInstall_Truncation_CompactMembers": {
+    "verdict": "holds",
+    "distinct": 3999196,
+    "generated": 33668783,
+    "depth": 29
+  },
+  "JoinInstall_Truncation_CompactMembers_3R": {
+    "verdict": "no violation, not exhaustive",
+    "distinct_before_cap": 68617447,
+    "queued": 32379377,
+    "note": "stopped at the 30-minute cap at depth 18"
+  },
+  "JoinInstall_Truncation_CompactMembers_CompactReceipt": {
+    "verdict": "holds",
+    "distinct": 24343482,
+    "generated": 232911915,
+    "depth": 33
+  },
+  "JoinInstall_Truncation_CompactMembers_LastConfirmed": {
+    "verdict": "violated",
+    "cex_states": 9
+  },
+  "JoinInstall_Truncation_CompactMembers_Leave": {
+    "verdict": "holds",
+    "distinct": 24180445,
+    "generated": 209728524,
+    "depth": 34
+  },
+  "JoinInstall_Truncation_CompactMembers_Leave_3R": {
+    "verdict": "no violation, not exhaustive",
+    "distinct_before_cap": 81441438,
+    "queued": 46269227,
+    "note": "stopped at the 30-minute cap at depth 16"
+  },
+  "JoinInstall_Truncation_CompactMembers_Leave_Crash": {
+    "verdict": "holds",
+    "distinct": 141831546,
+    "generated": 1398147999,
+    "depth": 38
+  },
+  "JoinInstall_Truncation_CompactMembers_Leave_JoinAny": {
+    "verdict": "violated",
+    "cex_states": 7
+  },
+  "JoinInstall_Truncation_CompactMembers_Leave_Kept": {
+    "verdict": "violated",
+    "cex_states": 7
+  },
+  "JoinInstall_Truncation_CompactMembers_NoBusy": {
+    "verdict": "violated",
+    "cex_states": 5
+  },
+  "JoinInstall_Truncation_CompactMembers_NoCover": {
+    "verdict": "violated",
+    "cex_states": 10
+  },
+  "JoinInstall_Truncation_CompactMembers_NoEarly": {
+    "verdict": "violated",
+    "cex_states": 10
+  },
+  "JoinInstall_Truncation_CompactMembers_NoMark": {
+    "verdict": "holds",
+    "distinct": 24495448,
+    "generated": 234743179,
+    "depth": 33
+  },
+  "JoinInstall_Truncation_CompactMembers_NoRefoldFirst": {
+    "verdict": "violated",
+    "cex_states": 8
+  },
+  "JoinInstall_Truncation_CompactMembers_NoReplayed": {
+    "verdict": "violated",
+    "cex_states": 18
+  },
+  "JoinInstall_Truncation_CompactMembers_NoServe": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "JoinInstall_Truncation_CompactMembers_NoTarget": {
+    "verdict": "violated",
+    "cex_states": 20
+  },
+  "JoinInstall_Truncation_CompactMembers_NoToken": {
+    "verdict": "holds",
+    "distinct": 23569922,
+    "generated": 225342161,
+    "depth": 33
+  },
+  "JoinInstall_Truncation_CompactMembers_NoTrunc": {
+    "verdict": "violated",
+    "cex_states": 10
+  },
+  "JoinInstall_Truncation_CompactMembers_Reap": {
+    "verdict": "holds",
+    "distinct": 96228992,
+    "generated": 1013364443,
+    "depth": 37,
+    "note": "TLC on the compiled module, replica strings replaced by model values, SYMMETRY over them; without symmetry, quint verify reaches depth 25 (106,312,632 distinct) before the 25 GB disk floor"
+  },
+  "JoinInstall_Truncation_CompactMembers_Replace": {
+    "verdict": "violated",
+    "cex_states": 10
+  },
+  "JoinInstall_Truncation_CompactMembers_SoloClean": {
+    "verdict": "holds",
+    "distinct": 4138861,
+    "generated": 34938498,
+    "depth": 30
+  },
+  "JoinInstall_Truncation_CompactMembers_SoloClean_3R": {
+    "verdict": "no violation, not exhaustive",
+    "distinct_before_cap": 69600110,
+    "queued": 33098325,
+    "note": "stopped at the 30-minute cap at depth 18"
+  },
+  "JoinInstall_Truncation_CompactMembers_SoloJoinAny": {
+    "verdict": "violated",
+    "cex_states": 6
+  },
+  "JoinInstall_Truncation_CompactOwn_Stranded": {
+    "verdict": "violated",
+    "cex_states": 5
+  },
+  "JoinInstall_Truncation_CompactRecorded_Stranded_3R": {
+    "verdict": "violated",
+    "cex_states": 9
+  }
+}

@@ -1,0 +1,89 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_session_manager_sup).
+-moduledoc """
+Supervisor for the pool of `bondy_session_manager` workers.
+""".
+-behaviour(supervisor).
+
+%% API
+-export([start_link/0]).
+
+%% SUPERVISOR CALLBACKS
+-export([init/1]).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+
+%% =============================================================================
+%% SUPERVISOR CALLBACKS
+%% =============================================================================
+
+init([]) ->
+    %% Owned by this (stable) supervisor process so it survives worker restarts.
+    ok = bondy_session_manager:ensure_reg_realms_table(),
+    {PoolName, WorkerNames} = init_pool(),
+    SupFlags = #{
+        strategy => one_for_one,
+        intensity => 5,
+        period => 10,
+        auto_shutdown => never
+    },
+    Children = [
+        #{
+            id => WorkerName,
+            start =>
+                {bondy_session_manager, start_link, [PoolName, WorkerName]},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [bondy_session_manager]
+        }
+     || WorkerName <- WorkerNames
+    ],
+    {ok, {SupFlags, Children}}.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+init_pool() ->
+    #{
+        name := PoolName,
+        size := Size,
+        algorithm := Algorithm
+    } = bondy_session_manager:pool(),
+
+    %% gproc owns the pool and its workers, so both outlive a restart of this
+    %% supervisor. `gproc_pool` then raises `exists` for each of them.
+    _ =
+        try
+            gproc_pool:new(PoolName, Algorithm, [{size, Size}])
+        catch
+            error:exists -> ok
+        end,
+
+    WorkerNames = [
+        begin
+            WorkerName = worker_name(Id),
+            _ =
+                try
+                    gproc_pool:add_worker(PoolName, WorkerName)
+                catch
+                    error:exists -> ok
+                end,
+            WorkerName
+        end
+     || Id <- lists:seq(1, Size)
+    ],
+    {PoolName, WorkerNames}.
+
+worker_name(Id) when is_integer(Id) ->
+    list_to_atom("bondy_session_manager_" ++ integer_to_list(Id)).

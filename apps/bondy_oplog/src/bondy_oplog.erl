@@ -1,0 +1,875 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_oplog).
+
+-include("bondy_oplog.hrl").
+
+-moduledoc #{format => "text/markdown"}.
+-moduledoc """
+Public façade for the operation-log replication framework.
+
+Each replicated value is an **instance**: an append-only operation log
+keyed by `{HLC, Origin, Seq}`, stored in a Merkle Search Tree. Its
+events are applied to a projection, and compaction truncates a stable
+prefix of the log only once the projection has applied it
+(`bondy_oplog_catalogue_compaction_test`).
+
+## Attribution
+
+The Concurrent Operation Group (COG) abstraction, the operation-log
+framing, and the equivocation-tolerance approach via hash-chaining
+are taken from Preston McCrary's *Canteen* (UC Berkeley, 2022 —
+EECS-2022-160). The MST substrate underneath comes from Auvolat &
+Taïani (Inria/IRISA, SRDS 2019 — HAL-02303490). See the "Credits"
+section of this library's README for full references.
+
+## API surface
+
+Lifecycle primitives are intentionally minimal: `start_instance/2`,
+`stop_instance/1,2` and `list_instances/0`. The library does not impose
+lifecycle policy — *when* and *how often* to call these is the
+consumer's choice. Lazy loading, LRU eviction,
+cold-tier offload, and per-tenant policies belong to the consumer.
+
+Per-instance event operations pass through to
+`bondy_oplog_instance`.
+
+## Concurrency model — what to expect
+
+- **Single-event `append/2,3` is lock-free for stateless
+  validators.** The default `bondy_oplog_validator_trust` advertises
+  `is_stateless/0 -> true`; the call builds the event, signs it, and
+  hits the WAL gen_server directly from the caller's process,
+  bypassing the instance gen_server. Stateful validators (e.g.
+  `bondy_oplog_validator_crypto`) fall back to the gen_server path.
+- **Reads are lock-free.** `get/2`, `fold_range/5`, `first_key/1`,
+  `latest_key/1`, `size/1`, and `root_hash/1` go straight to the
+  registry-published MST handle plus the overlay ETS table — no
+  gen_server hop. Readers scale with cores.
+- **The WAL gen_server is the sole write serialiser.** Multi-writer
+  throughput on a single instance is bounded by the slower of the
+  WAL `fsync_mode` rate and the WAL gen_server's serial processing
+  rate. In `batched` mode that gen_server processes millions of
+  events/s; in `per_write` mode it is bounded by the device fsync
+  rate (~5 k events/s on commodity NVMe).
+- For high-churn write paths prefer `fsync_mode => batched` plus
+  `await_durable/3` over the default `per_write` (see
+  `bondy_oplog_wal` moduledoc).
+- `append_many/2` also takes the lock-free fast path when the
+  validator is stateless — every event is signed in the caller
+  process, the WAL writes one atomic frame, and every overlay
+  row is staged in a single `ets:insert/2`. Remote-event delivery
+  (`append_remote/2`) still routes through the applier+instance
+  gen_server because the verify+conflict path is stateful.
+""".
+
+%% Lifecycle
+-export([start_instance/2]).
+-export([stop_instance/1]).
+-export([stop_instance/2]).
+-export([list_instances/0]).
+
+%% Per-instance API (pass-through to bondy_oplog_instance)
+-export([append/2]).
+-export([append/3]).
+-export([append/4]).
+-export([append_many/2]).
+-export([append_many/3]).
+-export([barrier/1]).
+-export([append_applied/4]).
+-export([await_applied/3]).
+-export([append_remote/2]).
+-export([await_apply/1]).
+-export([await_apply/2]).
+-export([await_drain/1]).
+-export([open_drain_gate/1]).
+-export([get/2]).
+-export([root_hash/1]).
+-export([fold_range/5]).
+-export([range/3]).
+-export([truncate_prefix/2]).
+-export([size/1]).
+-export([first_key/1]).
+-export([latest_key/1]).
+-export([origin/1]).
+-export([info/1]).
+
+%% Sync
+-export([sync/2]).
+-export([sync/3]).
+
+%% GC / queries
+-export([compact/1]).
+-export([current_watermark/1]).
+-export([compaction_checkpoint/1]).
+-export([retention_advice/1, retention_advice/2]).
+-export([retention_decision/1]).
+
+%% Topology fingerprint (AAE compatibility handshake)
+-export([db_of/1]).
+-export([set_topology_fingerprint/2]).
+-export([topology_fingerprint/1]).
+
+%% =============================================================================
+%% TYPES
+%% =============================================================================
+
+%% The appender's side of the per-event apply barrier (`barrier/1`).
+-opaque barrier() :: #{
+    alias := reference(),
+    monitor := reference() | undefined
+}.
+
+-type retention_pressure() :: #{
+    bytes_total := non_neg_integer(),
+    max_total_wal_size := pos_integer(),
+    bytes_ratio := float(),
+    live_segments_count := non_neg_integer(),
+    max_live_segments := pos_integer(),
+    segments_ratio := float(),
+    backpressure := term()
+}.
+
+-type retention_inputs() :: #{
+    pressure := retention_pressure(),
+    has_snapshot := boolean(),
+    snapshot_watermark := bondy_oplog_event:event_key() | undefined,
+    scrubber_alerts := [{non_neg_integer(), atom()}],
+    bootstrap_consumers := non_neg_integer()
+}.
+
+-type retention_advice_action() :: compact | truncate_prefix | none.
+
+-type retention_advice() :: #{
+    recommended_action := retention_advice_action(),
+    rationale := binary(),
+    inputs := retention_inputs()
+}.
+
+-export_type([barrier/0]).
+-export_type([retention_pressure/0]).
+-export_type([retention_inputs/0]).
+-export_type([retention_advice/0]).
+-export_type([retention_advice_action/0]).
+
+%% =============================================================================
+%% LIFECYCLE
+%% =============================================================================
+
+-doc """
+Starts an instance. Returns the pid of the per-instance supervisor.
+Idempotent: re-starting a running instance returns its existing
+supervisor pid.
+
+`Opts` must carry `applier.cell_apply_target`, the projection shard that
+materialises the instance's state; without it the start returns
+`{error, {missing_required_opt, cell_apply_target}}`.
+""".
+-spec start_instance(
+    instance_id(),
+    bondy_oplog_instance:opts()
+) -> {ok, pid()} | {error, term()}.
+
+start_instance(InstanceId, Opts) when
+    is_binary(InstanceId), is_map(Opts)
+->
+    bondy_oplog_instance_dyn_sup:start_instance(InstanceId, Opts).
+
+-spec stop_instance(instance_id()) -> ok | {error, not_found}.
+
+stop_instance(InstanceId) ->
+    stop_instance(InstanceId, #{}).
+
+-doc """
+Stops an instance. The `Opts` map is currently unused; a future
+`destroy => true` option to also delete the instance's on-disk state
+is reserved.
+""".
+-spec stop_instance(instance_id(), map()) -> ok | {error, not_found}.
+
+stop_instance(InstanceId, _Opts) when is_binary(InstanceId) ->
+    case bondy_oplog_instance_dyn_sup:stop_instance(InstanceId) of
+        ok ->
+            %% Casts, so a registry a partial tree never started drops them.
+            ok = bondy_oplog_peer_state:forget_instance(InstanceId),
+            ok = bondy_oplog_quarantine:forget_instance(InstanceId);
+        Other ->
+            Other
+    end.
+
+-doc """
+Lists currently-running instances on this node. Order unspecified.
+
+Answered from the registry's key-only select, so it wakes no process and
+takes no lock. This is called from periodic sweeps (the sync and GC
+scheduler ticks, origin retirement) and from the Prometheus scrape, and
+a supervision-tree walk is the wrong shape for all of them:
+`supervisor:which_children/1` is a `gen_server:call` that serialises
+against the process managing child starts and stops, and copies the whole
+child list per call. Walking the tree to reach each instance cost one such
+call per instance supervisor plus an `info/1` call per instance — 2N
+round trips that made all N instances runnable at the same instant.
+
+A row exists from instance start until its `terminate/2`, so the set is
+the same one the tree reports, minus instances that have started but not
+yet registered. Sweeps pick those up on their next pass.
+""".
+-spec list_instances() -> [instance_id()].
+
+list_instances() ->
+    bondy_oplog_registry:list().
+
+%% =============================================================================
+%% PER-INSTANCE API
+%% =============================================================================
+
+-spec append(instance_id(), bondy_oplog_event:op()) ->
+    bondy_oplog_event:event_key().
+
+append(InstanceId, Op) ->
+    bondy_oplog_instance:append_fast(InstanceId, Op, undefined).
+
+-spec append(
+    instance_id(),
+    bondy_oplog_event:op(),
+    bondy_oplog_event:meta()
+) -> bondy_oplog_event:event_key().
+
+append(InstanceId, Op, Meta) ->
+    bondy_oplog_instance:append_fast(InstanceId, Op, Meta).
+
+-spec append_many(
+    instance_id(),
+    [{bondy_oplog_event:op(), bondy_oplog_event:meta()}]
+) -> [bondy_oplog_event:event_key()].
+
+append_many(InstanceId, Items) ->
+    bondy_oplog_instance:append_many_fast(InstanceId, Items).
+
+-doc """
+The appender's side of the per-event apply barrier: a process alias
+(`erlang:alias/0`) that the events' overlay rows will carry, and a monitor
+on the instance so that its death answers at once. Pass it to `append/4`
+or `append_many/3`, then collect with `await_applied/3`, which releases
+both.
+
+The monitor is taken BEFORE the append, so an instance that dies at any
+point after the barrier exists is seen: its overlay table — and with it
+every row that would have answered — dies with it, and nothing else ever
+would answer. An instance with no registered pid at this moment (a subtree
+mid-restart) is not monitored; the append then fails on its own, or lands
+on the restarted instance and is answered by it.
+""".
+-spec barrier(instance_id()) -> barrier().
+
+barrier(InstanceId) ->
+    Monitor =
+        case bondy_oplog_registry:instance_pid(InstanceId) of
+            undefined -> undefined;
+            Pid -> monitor(process, Pid)
+        end,
+    #{alias => alias(), monitor => Monitor}.
+
+-doc """
+As `append/3`, with the barrier's alias staged in the event's overlay row.
+The row is answered by whichever process evicts it: `{Alias, ok}` once the
+event is installed — its projection write committed, its MST entry
+published — or `{Alias, {error, rejected}}` when the applier refuses it
+(`verify_event/2` failed). A refused append (this call's `{error, _}`
+return) leaves no row and sends nothing, though a WAL writer failure can
+still leave the event durable (`bondy_oplog_instance:append_fast/3`).
+
+The interest travels with the row from the moment the row exists, which
+is before the WAL frame the applier reads — so the answer cannot be
+missed, whichever of the two arrives at the row first. This is the
+per-event barrier `append_applied/4` is built on; it replaces the
+whole-overlay `await_apply/1,2` for the write path, where a caller
+otherwise paid for every other appender's backlog on the shard
+(`bondy_oplog_apply_barrier_test`).
+""".
+-spec append(
+    instance_id(),
+    bondy_oplog_event:op(),
+    bondy_oplog_event:meta(),
+    barrier()
+) -> bondy_oplog_event:event_key() | {error, term()}.
+
+append(InstanceId, Op, Meta, #{alias := Alias}) ->
+    bondy_oplog_instance:append_fast(InstanceId, Op, Meta, Alias).
+
+-doc """
+As `append_many/2` with the barrier (`append/4`): every event of the batch
+is answered separately, so `await_applied/3` collects one message per key.
+""".
+-spec append_many(
+    instance_id(),
+    [{bondy_oplog_event:op(), bondy_oplog_event:meta()}],
+    barrier()
+) -> [bondy_oplog_event:event_key()] | {error, term()}.
+
+append_many(InstanceId, Items, #{alias := Alias}) ->
+    bondy_oplog_instance:append_many_fast(InstanceId, Items, Alias).
+
+-doc """
+Collects the answers to `N` events appended with `Barrier` within
+`Timeout` milliseconds, then releases the barrier: `ok` when every event
+was installed, `{error, rejected}` when any was refused,
+`{error, instance_unavailable}` the moment the instance dies with answers
+still owed (an answer that arrived before the death still counts — the
+mailbox is read in order), `{error, timeout}` when an answer did not arrive
+in time. Whatever the outcome, no message for the barrier remains in the
+caller's mailbox and none can arrive later — an answer sent to a
+deactivated alias is dropped by the VM, and the monitor is flushed.
+
+On `{error, timeout}` or `{error, instance_unavailable}` the events are
+durable in the WAL and still pending; the caller cannot tell whether they
+were applied. A barrier is released once; callers must not reuse it.
+`N = 0` releases it without waiting.
+""".
+-spec await_applied(barrier(), N :: non_neg_integer(), timeout()) ->
+    ok | {error, timeout | rejected | instance_unavailable}.
+
+await_applied(#{alias := Alias, monitor := Monitor} = Barrier, N, Timeout) ->
+    Deadline = deadline(Timeout),
+    Result = collect_applied(Alias, Monitor, N, Deadline, ok),
+    ok = release(Barrier),
+    Result.
+
+-doc """
+`barrier/1`, `append/4` and `await_applied/3` for one event: the
+read-your-writes barrier of `bondy_db:apply/4`. Returns `ok` once the
+event's projection write is committed, `{error, rejected}` if the applier
+refused it, `{error, instance_unavailable}` if the instance died first,
+`{error, timeout}` if it was not applied within `Timeout`, or the append's
+own `{error, _}`. The barrier is released on every path, including an
+exception raised by the append (the instance gone mid-call), which is
+re-raised.
+""".
+-spec append_applied(
+    instance_id(),
+    bondy_oplog_event:op(),
+    bondy_oplog_event:meta(),
+    timeout()
+) -> ok | {error, timeout | rejected | instance_unavailable | term()}.
+
+append_applied(InstanceId, Op, Meta, Timeout) ->
+    Barrier = barrier(InstanceId),
+    try append(InstanceId, Op, Meta, Barrier) of
+        {error, _} = Err ->
+            ok = release(Barrier),
+            Err;
+        _Key ->
+            await_applied(Barrier, 1, Timeout)
+    catch
+        Class:Reason:Stacktrace ->
+            ok = release(Barrier),
+            erlang:raise(Class, Reason, Stacktrace)
+    end.
+
+%% @private
+%% Every answer counts; the first `{error, rejected}` decides the result
+%% but the remaining answers are still awaited, so that nothing for the
+%% alias is left in flight when the caller moves on. The instance's
+%% `'DOWN'` ends the wait: no answer can follow it. `Monitor` is
+%% `undefined` when none was taken, which no `'DOWN'` ever matches.
+collect_applied(_Alias, _Monitor, 0, _Deadline, Result) ->
+    Result;
+collect_applied(Alias, Monitor, N, Deadline, Result) ->
+    receive
+        {Alias, ok} ->
+            collect_applied(Alias, Monitor, N - 1, Deadline, Result);
+        {Alias, {error, rejected} = Rejected} ->
+            collect_applied(Alias, Monitor, N - 1, Deadline, Rejected);
+        {'DOWN', Monitor, process, _Pid, _Reason} ->
+            {error, instance_unavailable}
+    after remaining(Deadline) ->
+        {error, timeout}
+    end.
+
+%% @private
+%% Deactivates the alias, drops the answers that reached the mailbox before
+%% that, and flushes the monitor.
+release(#{alias := Alias, monitor := Monitor}) ->
+    _ = unalias(Alias),
+    ok = flush_applied(Alias),
+    case Monitor of
+        undefined -> ok;
+        _ -> true = demonitor(Monitor, [flush])
+    end,
+    ok.
+
+%% @private
+flush_applied(Alias) ->
+    receive
+        {Alias, _} -> flush_applied(Alias)
+    after 0 -> ok
+    end.
+
+%% @private
+deadline(infinity) ->
+    infinity;
+deadline(Timeout) when is_integer(Timeout), Timeout >= 0 ->
+    erlang:monotonic_time(millisecond) + Timeout.
+
+%% @private
+remaining(infinity) ->
+    infinity;
+remaining(Deadline) ->
+    max(0, Deadline - erlang:monotonic_time(millisecond)).
+
+-spec append_remote(instance_id(), bondy_oplog_event:t()) ->
+    ok | {error, term()}.
+
+append_remote(InstanceId, Event) ->
+    bondy_oplog_instance:append_remote(InstanceId, Event).
+
+-spec await_apply(instance_id()) -> ok | {error, timeout}.
+
+await_apply(InstanceId) ->
+    bondy_oplog_instance:await_apply(InstanceId).
+
+-spec await_apply(instance_id(), timeout()) -> ok | {error, timeout}.
+
+await_apply(InstanceId, Timeout) ->
+    bondy_oplog_instance:await_apply(InstanceId, Timeout).
+
+-spec await_drain(instance_id()) -> ok | {error, term()}.
+
+-doc """
+Block until the instance's applier has drained its WAL to end-of-log (the
+cold-start rebuild barrier — see `bondy_oplog_applier:await_drain/1`). Resolves
+the applier pid from the registry; `{error, no_applier}` if it is not yet
+published.
+""".
+
+await_drain(InstanceId) ->
+    case bondy_oplog_registry:applier_pid(InstanceId) of
+        Pid when is_pid(Pid) ->
+            bondy_oplog_applier:await_drain(Pid);
+        _ ->
+            {error, no_applier}
+    end.
+
+-spec open_drain_gate(instance_id()) -> ok | {error, term()}.
+
+-doc """
+Release an instance founded with the WAL drain GATED (`drain_gated => true`),
+kicking its deferred replay. The provisioning orchestrator calls this once per
+collapsed per-shard instance after every table sharing the shard has registered
+its cell-apply bucket, so the shared WAL is replayed with a complete routing
+directory and no cell is skipped. Idempotent; a no-op on an ungated or fused
+instance. See `bondy_oplog_instance:open_drain_gate/1`.
+""".
+
+open_drain_gate(InstanceId) when is_binary(InstanceId) ->
+    bondy_oplog_instance:open_drain_gate(InstanceId).
+
+-spec get(instance_id(), bondy_oplog_event:event_key()) ->
+    {ok, bondy_oplog_event:t()} | not_found.
+
+get(InstanceId, Key) ->
+    bondy_oplog_instance:get(InstanceId, Key).
+
+-spec root_hash(instance_id()) -> binary() | undefined.
+
+root_hash(InstanceId) ->
+    %% Drain the applier so the returned root reflects every event
+    %% the caller has already `append/2`-ed. Callers comparing roots
+    %% across nodes after a write expect read-your-writes semantics.
+    _ = bondy_oplog_instance:await_apply(InstanceId),
+    bondy_oplog_instance:root_hash(InstanceId).
+
+-spec fold_range(
+    instance_id(),
+    From :: bondy_oplog_event:event_key(),
+    To :: bondy_oplog_event:event_key(),
+    fun((bondy_oplog_event:t(), Acc) -> Acc),
+    Acc
+) -> Acc when Acc :: term().
+
+fold_range(InstanceId, From, To, Fun, Acc0) ->
+    bondy_oplog_instance:fold_range(InstanceId, From, To, Fun, Acc0).
+
+-spec range(
+    instance_id(),
+    From :: bondy_oplog_event:event_key(),
+    To :: bondy_oplog_event:event_key()
+) -> [bondy_oplog_event:t()].
+
+range(InstanceId, From, To) ->
+    bondy_oplog_instance:range(InstanceId, From, To).
+
+-doc """
+Operator-driven removal of every event with key `=< Watermark` from
+the live MST.
+
+Advances `current_watermark/1` to `Watermark` (monotonically — a value
+lower than the current watermark is ignored), so peer events arriving
+later with HLC `=< Watermark` are rejected by the receive-side filter
+instead of being re-installed. Without this, a peer that has not yet
+seen the truncate would keep re-shipping the events we just dropped.
+
+The checkpoint's watermark does not move. Use this only when the operator has
+out-of-band evidence that the dropped events are safe to lose cluster-wide.
+For coordinated retention, use `compact/1` instead.
+
+The removal is a truncation like any other: it raises the instance's
+truncation record (`bondy_oplog_registry:truncated/1`) to its applied frontier.
+
+Returns the number of MST rows removed, or `{error, {refold_owed, Id}}` while
+a catalogue install holds the instance's re-fold mark.
+""".
+-spec truncate_prefix(instance_id(), bondy_oplog_event:event_key()) ->
+    non_neg_integer() | {error, {refold_owed, instance_id()}}.
+
+truncate_prefix(InstanceId, Watermark) ->
+    %% Drain the local applier so truncation operates on the up-to-date
+    %% MST. Without this, overlay-pending events whose keys are
+    %% `=< Watermark` are invisible to the MST-level fold and survive
+    %% the truncate — they are then installed by the applier *after*
+    %% truncate_prefix has returned, leaving the caller with rows the
+    %% truncate was meant to drop.
+    _ = bondy_oplog_instance:await_apply(InstanceId),
+    bondy_oplog_instance:truncate_prefix(InstanceId, Watermark).
+
+-spec size(instance_id()) -> non_neg_integer().
+
+size(InstanceId) ->
+    bondy_oplog_instance:size(InstanceId).
+
+-spec first_key(instance_id()) ->
+    {ok, bondy_oplog_event:event_key()} | empty.
+
+first_key(InstanceId) ->
+    bondy_oplog_instance:first_key(InstanceId).
+
+-spec latest_key(instance_id()) ->
+    {ok, bondy_oplog_event:event_key()} | empty.
+
+latest_key(InstanceId) ->
+    bondy_oplog_instance:latest_key(InstanceId).
+
+-spec origin(instance_id()) -> bondy_oplog_origin:t().
+
+origin(InstanceId) ->
+    bondy_oplog_instance:origin(InstanceId).
+
+-spec info(instance_id()) -> map().
+
+info(InstanceId) ->
+    bondy_oplog_instance:info(InstanceId).
+
+-doc """
+The `bondy_db` DB an oplog instance belongs to, or `undefined` when the
+instance is not running on this node, or was started outside `bondy_db`
+(the library API and the test suites start instances that belong to no DB).
+
+Answered from the instance's registry row, where the provisioning path
+recorded it at start — the instance id is NOT parsed. An instance id is an
+opaque name: recovering the DB from it would make this module depend on how
+`bondy_db` composes ids, and `bondy_db` is the layer ABOVE this one.
+
+What this feeds, and which way it fails: `db_of/1` selects the keying
+topology fingerprint (`topology_fingerprint/1`) that
+`bondy_oplog_sync_session` compares with a peer's before pulling. A
+mismatch refuses the pull loudly. `undefined` on either side is treated as
+compatible and the check is SKIPPED — so a `bondy_db` instance whose `db`
+opt were omitted would fail open, not closed. What keeps that from
+happening is that `bondy_db` builds instance opts in one place
+(`open_table_provision`) and starts instances in one place, and
+`bondy_db_instance_id_test` asserts `db_of/1` answers the DB for every
+instance a provisioned DB starts.
+""".
+-spec db_of(instance_id()) -> atom() | undefined.
+
+db_of(InstanceId) when is_binary(InstanceId) ->
+    bondy_oplog_registry:db(InstanceId).
+
+-doc """
+Record this node's frozen keying-topology fingerprint for `Db` (computed
+by `bondy_db_manifest:fingerprint/1`). Exchanged during anti-entropy so two
+nodes refuse to sync when they key data differently. Stored in
+`persistent_term` (written once at provision, read on the sync path).
+""".
+-spec set_topology_fingerprint(Db :: atom(), Fingerprint :: binary()) -> ok.
+
+set_topology_fingerprint(Db, Fingerprint) when
+    is_atom(Db) andalso is_binary(Fingerprint)
+->
+    persistent_term:put({?MODULE, topology_fingerprint, Db}, Fingerprint).
+
+-doc """
+This node's keying-topology fingerprint for `Db`, or `undefined` if none
+was recorded (e.g. an ephemeral in-memory DB with no manifest).
+""".
+-spec topology_fingerprint(Db :: atom() | undefined) -> binary() | undefined.
+
+topology_fingerprint(undefined) ->
+    undefined;
+topology_fingerprint(Db) when is_atom(Db) ->
+    persistent_term:get({?MODULE, topology_fingerprint, Db}, undefined).
+
+%% =============================================================================
+%% SYNC
+%% =============================================================================
+
+-doc """
+Synchronously pulls events from `Peer` into `InstanceId`.
+
+A successful pull merges the peer's tree into ours; a converse pull
+(initiated by the peer) is needed to bring the peer up to date. This
+is the single-direction primitive; consumers that want full
+convergence call sync in both directions or rely on the default
+schedulers running on both replicas.
+
+Returns `{ok, FinalRoot}` on success.
+""".
+-spec sync(instance_id(), peer_id()) ->
+    {ok, bondy_mst:hash() | undefined} | {error, term()}.
+
+sync(InstanceId, Peer) ->
+    sync(InstanceId, Peer, #{}).
+
+-spec sync(
+    instance_id(),
+    peer_id(),
+    bondy_oplog_sync_session:opts()
+) -> {ok, bondy_mst:hash() | undefined} | {error, term()}.
+
+sync(InstanceId, Peer, Opts) ->
+    %% Drain the local applier so sync operates on the up-to-date MST
+    %% instead of stale state with overlay-pending events. Production
+    %% callers who do many appends followed by sync would otherwise
+    %% sync against an MST that doesn't yet contain those appends.
+    _ = bondy_oplog_instance:await_apply(InstanceId),
+    bondy_oplog_sync_session:run(InstanceId, Peer, Opts).
+
+%% =============================================================================
+%% GC
+%% =============================================================================
+
+-doc """
+Runs one compaction cycle on `InstanceId`. See
+`bondy_oplog_compaction:compact/1`.
+""".
+-spec compact(instance_id()) ->
+    {ok, no_change}
+    | {ok, {compacted, bondy_oplog_event:event_key(), non_neg_integer()}}
+    | {error, term()}.
+
+compact(InstanceId) ->
+    %% No `await_apply` drain, unlike `truncate_prefix/2`, whose watermark the
+    %% caller supplies: the instance picks its own truncation point from the
+    %% members' durable frontiers and its own, capped below its first
+    %% never-applied key (`bondy_oplog_instance:compact/2`).
+    bondy_oplog_compaction:compact(InstanceId).
+
+-spec current_watermark(instance_id()) ->
+    undefined | bondy_oplog_event:event_key().
+
+current_watermark(InstanceId) ->
+    bondy_oplog_instance:current_watermark(InstanceId).
+
+-spec compaction_checkpoint(instance_id()) ->
+    {ok, bondy_oplog_event:event_key(), term()} | not_found.
+
+compaction_checkpoint(InstanceId) ->
+    bondy_oplog_instance:compaction_checkpoint(InstanceId).
+
+%% =============================================================================
+%% RETENTION ADVICE
+%% =============================================================================
+
+%% Threshold under which both pressure ratios must fall to be considered
+%% "low" (no retention action recommended). Chosen so that an instance
+%% with comfortable headroom on either dimension is left alone.
+-define(LOW_PRESSURE_THRESHOLD, 0.5).
+
+-doc """
+Surfaces a recommended retention action for `InstanceId` based on
+current state: write/segment pressure ratios, snapshot existence,
+outstanding scrubber alerts, and the number of in-flight bootstrap
+consumers the caller is aware of.
+
+The advice is **advisory only** — no state is changed. Returns
+`{ok, retention_advice()}` with the recommended action
+(`compact | truncate_prefix | none`), a human-readable rationale, and
+the full set of inputs the decision was made from, so an operator can
+audit the call.
+
+Returns `{error, instance_not_running}` if `InstanceId` has no
+running WAL.
+
+The `bootstrap_consumers` count is operator-supplied: the library
+does not track active bootstrap sessions as durable state, so the
+caller is expected to plumb in any cluster-level information about
+peers that are currently mid-bootstrap and would be orphaned by a
+`truncate_prefix/2`.
+
+Decision tree:
+
+1. Scrubber alert outstanding ⇒ `none` (investigate the alert before
+   changing retention).
+2. Both pressure ratios under 50 % ⇒ `none` (ample headroom).
+3. Otherwise:
+   - bootstrap consumers > 0:
+     - snapshot exists ⇒ `compact` (non-lossy; bootstrap consumers
+       are unaffected because compaction preserves the snapshot
+       watermark in the manifest).
+     - no snapshot ⇒ `none` (truncate would orphan bootstrap; no
+       snapshot to compact against — wait or take a snapshot first).
+   - no bootstrap consumers:
+     - snapshot exists ⇒ `compact` (non-lossy; preserves history up
+       to the watermark).
+     - no snapshot ⇒ `truncate_prefix` (no compaction lever
+       available; operator picks a watermark).
+""".
+-spec retention_advice(instance_id()) ->
+    {ok, retention_advice()} | {error, instance_not_running}.
+
+retention_advice(InstanceId) ->
+    retention_advice(InstanceId, #{}).
+
+-doc """
+As `retention_advice/1` but accepts a map of caller-supplied inputs:
+
+- `bootstrap_consumers :: non_neg_integer()` (default `0`) — number
+  of peers currently mid-bootstrap from this instance. Drives the
+  bootstrap-aware branch of the decision tree.
+""".
+-spec retention_advice(instance_id(), map()) ->
+    {ok, retention_advice()} | {error, instance_not_running}.
+
+retention_advice(InstanceId, Opts) when
+    is_binary(InstanceId), is_map(Opts)
+->
+    BootstrapConsumers = maps:get(bootstrap_consumers, Opts, 0),
+    case bondy_oplog_registry:wal_pid(InstanceId) of
+        undefined ->
+            {error, instance_not_running};
+        WalPid when is_pid(WalPid) ->
+            WalInfo = bondy_oplog_wal:info(WalPid),
+            Snapshot = ?MODULE:compaction_checkpoint(InstanceId),
+            Inputs = build_inputs(WalInfo, Snapshot, BootstrapConsumers),
+            {ok, retention_decision(Inputs)}
+    end.
+
+-doc """
+Pure decision function — given a fully-populated `retention_inputs()`
+map, returns the recommended action and rationale. Exposed primarily
+for unit testing and for callers that have already gathered the
+inputs by other means.
+""".
+-spec retention_decision(retention_inputs()) -> retention_advice().
+
+retention_decision(#{scrubber_alerts := [_ | _] = Alerts} = Inputs) ->
+    Rationale = list_to_binary(
+        io_lib:format(
+            "scrubber alert outstanding on ~p segment(s); resolve via "
+            "re-derivation or magic-rescan before changing retention",
+            [length(Alerts)]
+        )
+    ),
+    advice(none, Rationale, Inputs);
+retention_decision(#{pressure := P} = Inputs) ->
+    BytesR = maps:get(bytes_ratio, P),
+    SegsR = maps:get(segments_ratio, P),
+    case max(BytesR, SegsR) < ?LOW_PRESSURE_THRESHOLD of
+        true ->
+            advice(
+                none,
+                <<"retention pressure is low; no action recommended">>,
+                Inputs
+            );
+        false ->
+            HasSnapshot = maps:get(has_snapshot, Inputs),
+            Bootstrap = maps:get(bootstrap_consumers, Inputs),
+            non_low_pressure_decision(HasSnapshot, Bootstrap, Inputs)
+    end.
+
+%% @private
+non_low_pressure_decision(true, Bootstrap, Inputs) when Bootstrap > 0 ->
+    advice(
+        compact,
+        <<
+            "bootstrap consumers active; compact preserves the snapshot "
+            "watermark and will not orphan them"
+        >>,
+        Inputs
+    );
+non_low_pressure_decision(false, Bootstrap, Inputs) when Bootstrap > 0 ->
+    advice(
+        none,
+        <<
+            "bootstrap consumers active but no snapshot exists; "
+            "truncate_prefix would orphan them and compact has nothing "
+            "to fold — wait for bootstrap to finish or take a snapshot "
+            "first"
+        >>,
+        Inputs
+    );
+non_low_pressure_decision(true, _Bootstrap, Inputs) ->
+    advice(
+        compact,
+        <<
+            "snapshot exists; compact reclaims space without loss of "
+            "history visible to peers"
+        >>,
+        Inputs
+    );
+non_low_pressure_decision(false, _Bootstrap, Inputs) ->
+    advice(
+        truncate_prefix,
+        <<
+            "no snapshot available; truncate_prefix at an "
+            "operator-chosen watermark is the only retention lever"
+        >>,
+        Inputs
+    ).
+
+%% @private
+advice(Action, Rationale, Inputs) ->
+    #{
+        recommended_action => Action,
+        rationale => Rationale,
+        inputs => Inputs
+    }.
+
+%% @private
+build_inputs(WalInfo, Snapshot, BootstrapConsumers) ->
+    BytesTotal = maps:get(bytes_total, WalInfo),
+    MaxTotal = maps:get(max_total_wal_size, WalInfo),
+    LiveSegs = maps:get(live_segments_count, WalInfo),
+    MaxSegs = maps:get(max_live_segments, WalInfo),
+    Backpressure = maps:get(backpressure, WalInfo, ok),
+    ScrubberAlerts = maps:get(scrubber_alerts, WalInfo, []),
+    Pressure = #{
+        bytes_total => BytesTotal,
+        max_total_wal_size => MaxTotal,
+        bytes_ratio => safe_ratio(BytesTotal, MaxTotal),
+        live_segments_count => LiveSegs,
+        max_live_segments => MaxSegs,
+        segments_ratio => safe_ratio(LiveSegs, MaxSegs),
+        backpressure => Backpressure
+    },
+    {HasSnapshot, Watermark} = snapshot_summary(Snapshot),
+    #{
+        pressure => Pressure,
+        has_snapshot => HasSnapshot,
+        snapshot_watermark => Watermark,
+        scrubber_alerts => ScrubberAlerts,
+        bootstrap_consumers => BootstrapConsumers
+    }.
+
+%% @private
+safe_ratio(_, Max) when Max =< 0 -> 0.0;
+safe_ratio(N, Max) -> N / Max.
+
+%% @private
+snapshot_summary(not_found) ->
+    {false, undefined};
+snapshot_summary({ok, Key, _Value}) ->
+    {true, Key}.

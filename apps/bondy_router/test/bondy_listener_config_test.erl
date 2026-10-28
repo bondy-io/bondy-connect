@@ -1,0 +1,1763 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+%% Tests `bondy_listener_config:resolve/2`, the pure boot-time validation of
+%% the `bondy_router.listeners` inventory. Most cases here are written to
+%% BREAK an invariant rather than confirm it: each asserts that a specific
+%% malformed listener is REJECTED, because the resolver exists so that a static
+%% config error is reported rather than papered over with a default. Three
+%% cases are deliberately confirmatory — the minimal-listener defaults, the
+%% accepted half of the uds bind rule, and the port-0 exemption — because each
+%% pins behaviour a rejection test cannot express.
+%% =============================================================================
+-module(bondy_listener_config_test).
+
+-include_lib("eunit/include/eunit.hrl").
+
+%% A GetFun that knows nothing: every option block is empty. Used by the
+%% required-key cases, where the inventory entry alone decides the outcome.
+empty_get() ->
+    fun(_Key, Default) -> Default end.
+
+minimal_http_listener_resolves_test() ->
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    ?assertEqual(pub, maps:get(name, L)),
+    ?assertEqual(tcp, maps:get(transport, L)),
+    ?assertEqual(http, maps:get(protocol, L)),
+    ?assertEqual({port, 18080}, maps:get(bind, L)),
+    %% Absent `enabled` means enabled: five call sites read
+    %% `bondy_config:get([Ref, enabled], true)` today.
+    ?assertEqual(true, maps:get(enabled, L)),
+    ?assertEqual(normal, maps:get(start_phase, L)).
+
+missing_transport_is_rejected_test() ->
+    Inventory = [
+        {pub, #{protocol => http, port => 18080, services => [wamp_ws]}}
+    ],
+    ?assertMatch(
+        {error, {invalid_listener, pub, {missing, transport}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+missing_protocol_is_rejected_test() ->
+    Inventory = [{pub, #{transport => tcp, port => 18080}}],
+    ?assertMatch(
+        {error, {invalid_listener, pub, {missing, protocol}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+missing_port_is_rejected_test() ->
+    %% A mistyped listener NAME shows up here: the intended block loses its
+    %% port, so boot fails naming the listener rather than silently binding a
+    %% phantom one.
+    Inventory = [
+        {pub, #{transport => tcp, protocol => http, services => [wamp_ws]}}
+    ],
+    ?assertMatch(
+        {error, {invalid_listener, pub, {missing, port}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+uds_requires_path_not_port_test() ->
+    Ok = [
+        {local, #{
+            transport => uds,
+            protocol => wamp_rawsocket,
+            path => "/tmp/bondy_wamp.sock"
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Ok, empty_get()),
+    ?assertEqual({path, "/tmp/bondy_wamp.sock"}, maps:get(bind, L)),
+
+    Bad = [{local, #{transport => uds, protocol => wamp_rawsocket}}],
+    ?assertMatch(
+        {error, {invalid_listener, local, {missing, path}}},
+        bondy_listener_config:resolve(Bad, empty_get())
+    ).
+
+http_requires_services_test() ->
+    Inventory = [{pub, #{transport => tcp, protocol => http, port => 18080}}],
+    ?assertMatch(
+        {error, {invalid_listener, pub, {missing, services}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+services_on_non_http_is_rejected_test() ->
+    %% RawSocket's whole demux surface is a fixed 4-octet header, so a service
+    %% LIST is meaningless there. Accepting it silently would mislead.
+    Inventory = [
+        {raw, #{
+            transport => tcp,
+            protocol => wamp_rawsocket,
+            port => 18082,
+            services => [wamp_ws]
+        }}
+    ],
+    ?assertMatch(
+        {error,
+            {invalid_listener, raw, {services_not_supported, wamp_rawsocket}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+unknown_transport_is_rejected_test() ->
+    Inventory = [{pub, #{transport => sctp, protocol => http, port => 1}}],
+    ?assertMatch(
+        {error, {invalid_listener, pub, {unknown_transport, sctp}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+unknown_protocol_is_rejected_test() ->
+    Inventory = [{pub, #{transport => tcp, protocol => gopher, port => 1}}],
+    ?assertMatch(
+        {error, {invalid_listener, pub, {unknown_protocol, gopher}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+duplicate_name_is_rejected_test() ->
+    Inventory = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+        }},
+        {pub, #{
+            transport => tcp, protocol => http, port => 2, services => [wamp_ws]
+        }}
+    ],
+    ?assertMatch(
+        {error, {invalid_listener, pub, duplicate_name}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+duplicate_port_is_rejected_test() ->
+    Inventory = [
+        {a, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws]
+        }},
+        {b, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws]
+        }}
+    ],
+    ?assertMatch(
+        {error, {invalid_listener, b, {port_in_use_by, a}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+port_zero_never_clashes_test() ->
+    %% Port 0 means "let the OS choose", so two such listeners cannot collide.
+    %% Rejecting them would make it impossible to define more than one
+    %% ephemeral-port listener, which every CT suite needs.
+    Inventory = [
+        {a, #{
+            transport => tcp, protocol => http, port => 0, services => [wamp_ws]
+        }},
+        {b, #{
+            transport => tcp, protocol => http, port => 0, services => [wamp_ws]
+        }}
+    ],
+    ?assertMatch(
+        {ok, [_, _]}, bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+%% A raw-socket listener spec on `Port`, plus whatever address key the case
+%% needs. Raw-socket rather than http so the spec needs no `services`.
+on_port(Port, Extra) ->
+    maps:merge(
+        #{transport => tcp, protocol => wamp_rawsocket, port => Port}, Extra
+    ).
+
+distinct_addresses_may_share_a_port_test() ->
+    %% The OS's uniqueness domain for a stream socket is (address, port) and not
+    %% port: `bondy_listener_SUITE:one_port_two_addresses` binds this exact pair
+    %% for real. Comparing the port alone refused a configuration the OS
+    %% accepts, which is the per-tenant-TLS case the design names as motivation.
+    Inventory = [
+        {a, on_port(18099, #{ip => {127, 0, 0, 1}})},
+        {b, on_port(18099, #{ip => {0, 0, 0, 0, 0, 0, 0, 1}})}
+    ],
+    ?assertMatch(
+        {ok, [_, _]}, bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+a_wildcard_conflicts_with_every_address_on_its_port_test() ->
+    %% Both orders, because the wildcard may be either the incumbent or the
+    %% newcomer and a comparison that widened only one side would pass one case
+    %% and fail the other.
+    Narrow = on_port(18099, #{ip => {127, 0, 0, 1}}),
+    Wide = on_port(18099, #{}),
+    ?assertMatch(
+        {error, {invalid_listener, b, {port_in_use_by, a}}},
+        bondy_listener_config:resolve([{a, Wide}, {b, Narrow}], empty_get())
+    ),
+    ?assertMatch(
+        {error, {invalid_listener, b, {port_in_use_by, a}}},
+        bondy_listener_config:resolve([{a, Narrow}, {b, Wide}], empty_get())
+    ).
+
+an_explicit_wildcard_address_conflicts_like_an_absent_one_test() ->
+    %% The resolver leaves `ip` absent when none was configured, and
+    %% `bondy_config` binds that to the wildcard of the configured family.
+    %% An absent address and a written-out `0.0.0.0` are
+    %% therefore the same socket, so they must get the same verdict.
+    ?assertMatch(
+        {error, {invalid_listener, b, {port_in_use_by, a}}},
+        bondy_listener_config:resolve(
+            [
+                {a, on_port(18099, #{ip => {0, 0, 0, 0}})},
+                {b, on_port(18099, #{ip => {127, 0, 0, 1}})}
+            ],
+            empty_get()
+        )
+    ).
+
+a_path_clash_ignores_the_address_test() ->
+    %% A uds socket node has no address, so an `ip` on either listener says
+    %% nothing about whether the two collide. Written with two DIFFERENT
+    %% addresses because that is precisely what an address-aware comparison
+    %% applied to every bind kind would let through, and
+    %% `duplicate_path_is_rejected_test` says why a path clash cannot be left to
+    %% bind time.
+    Path = "/tmp/bondy_ct_dup_addr.sock",
+    Inventory = [
+        {a, #{
+            transport => uds,
+            protocol => wamp_rawsocket,
+            path => Path,
+            ip => {127, 0, 0, 1}
+        }},
+        {b, #{
+            transport => uds,
+            protocol => wamp_rawsocket,
+            path => Path,
+            ip => {0, 0, 0, 0, 0, 0, 0, 1}
+        }}
+    ],
+    ?assertMatch(
+        {error, {invalid_listener, b, {path_in_use_by, a}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+%% A GetFun that answers a fixed set of option paths and defaults the rest.
+%% Mirrors `bondy_config:get/2`'s contract: the path is a list of atoms.
+get_with(Paths) ->
+    fun(Key, Default) ->
+        case lists:keyfind(Key, 1, Paths) of
+            {Key, Value} -> Value;
+            false -> Default
+        end
+    end.
+
+tcp_listener_gets_ranch_driver_test() ->
+    Inventory = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    ?assertEqual(bondy_listener_ranch, maps:get(driver, L)).
+
+tls_keys_on_plain_tcp_are_rejected_test() ->
+    Inventory = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+        }}
+    ],
+    Get = get_with([{[pub, tls, certfile], "/tmp/cert.pem"}]),
+    ?assertMatch(
+        {error, {invalid_listener, pub, {tls_not_supported, tcp}}},
+        bondy_listener_config:resolve(Inventory, Get)
+    ),
+
+    %% Every key of the `tls` block, not only the two a TLS listener requires:
+    %% `verify` alone on a plaintext listener is the same misconception, and
+    %% `assert_tls_keys/4` scans `?TLS_KEYS` rather than `?TLS_REQUIRED_KEYS`
+    %% for exactly this case.
+    VerifyOnly = get_with([{[pub, tls, verify], verify_peer}]),
+    ?assertMatch(
+        {error, {invalid_listener, pub, {tls_not_supported, tcp}}},
+        bondy_listener_config:resolve(Inventory, VerifyOnly)
+    ),
+    VersionsOnly = get_with([{[pub, tls, versions], ['tlsv1.3']}]),
+    ?assertMatch(
+        {error, {invalid_listener, pub, {tls_not_supported, tcp}}},
+        bondy_listener_config:resolve(Inventory, VersionsOnly)
+    ).
+
+disabling_a_listener_defers_the_tls_check_it_does_not_lose_it_test() ->
+    %% ONE spec, resolved twice, differing only in `enabled`. Written this way
+    %% because the risk in skipping a check is that it is skipped for good: the
+    %% second assertion is what shows the check still exists and runs at the boot
+    %% that enables the listener.
+    Spec = #{
+        transport => tls, protocol => http, port => 1, services => [wamp_ws]
+    },
+
+    Disabled = [{sec, Spec#{enabled => false}}],
+    ?assertMatch(
+        {ok, [#{name := sec, enabled := false}]},
+        bondy_listener_config:resolve(Disabled, empty_get())
+    ),
+
+    Enabled = [{sec, Spec#{enabled => true}}],
+    ?assertMatch(
+        {error, {invalid_listener, sec, {missing, [tls, certfile]}}},
+        bondy_listener_config:resolve(Enabled, empty_get())
+    ),
+
+    %% `resolve/2` fails the whole inventory on the first bad entry, so without
+    %% the guard ONE disabled certificate-less listener would stop two healthy
+    %% ones from starting.
+    Mixed = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 2, services => [wamp_ws]
+        }},
+        {sec, Spec#{enabled => false}}
+    ],
+    ?assertMatch(
+        {ok, [#{name := pub}, #{name := sec}]},
+        bondy_listener_config:resolve(Mixed, empty_get())
+    ).
+
+disabled_listener_is_not_checked_for_tls_keys_on_a_plain_transport_test() ->
+    %% The symmetric consequence, pinned so a reader knows it is intended rather
+    %% than an oversight: a DISABLED plaintext listener carrying TLS material
+    %% resolves. The misconception it guards against -- a port the operator
+    %% believes is encrypted -- cannot be acted on while the listener does not
+    %% start, and enabling it runs the check (asserted below).
+    Spec = #{
+        transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+    },
+    Get = get_with([{[pub, tls, certfile], "/tmp/cert.pem"}]),
+
+    ?assertMatch(
+        {ok, [#{name := pub, enabled := false}]},
+        bondy_listener_config:resolve([{pub, Spec#{enabled => false}}], Get)
+    ),
+    ?assertMatch(
+        {error, {invalid_listener, pub, {tls_not_supported, tcp}}},
+        bondy_listener_config:resolve([{pub, Spec#{enabled => true}}], Get)
+    ).
+
+tls_transport_requires_cert_and_key_test() ->
+    %% No `enabled` key: absent means enabled, so this is the checked case.
+    Inventory = [
+        {sec, #{
+            transport => tls, protocol => http, port => 1, services => [wamp_ws]
+        }}
+    ],
+    ?assertMatch(
+        {error, {invalid_listener, sec, {missing, [tls, certfile]}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ),
+    OnlyCert = get_with([{[sec, tls, certfile], "/tmp/cert.pem"}]),
+    ?assertMatch(
+        {error, {invalid_listener, sec, {missing, [tls, keyfile]}}},
+        bondy_listener_config:resolve(Inventory, OnlyCert)
+    ),
+    Both = get_with([
+        {[sec, tls, certfile], "/tmp/cert.pem"},
+        {[sec, tls, keyfile], "/tmp/key.pem"}
+    ]),
+    ?assertMatch({ok, [_]}, bondy_listener_config:resolve(Inventory, Both)).
+
+default_inventory_resolves_with_no_configuration_test() ->
+    %% The case every `prod`, `prod_named` and `docker` node is in: those
+    %% releases overlay no `bondy.conf` at all, so this inventory resolves
+    %% against nothing. It must succeed, or those nodes cannot boot.
+    %% `get_with([])` supplies NO certificate material on purpose: the TLS key
+    %% check has no `enabled` guard, so a single TLS entry in the default
+    %% inventory fails here — and on every node that never asked for TLS.
+    {ok, Listeners} = bondy_listener_config:resolve(
+        bondy_listener_config:default_inventory(), get_with([])
+    ),
+    ?assertEqual(3, length(Listeners)),
+    ?assertEqual(
+        [admin, api_gateway_http, wamp_tcp],
+        lists:sort([N || #{name := N} <- Listeners])
+    ),
+    %% All three enabled: a default node binds all of what it declares.
+    ?assertEqual(
+        [admin, api_gateway_http, wamp_tcp],
+        lists:sort([N || #{name := N, enabled := true} <- Listeners])
+    ),
+    ?assertEqual(
+        [], [N || #{name := N, transport := tls} <- Listeners]
+    ),
+    %% The admin listener carries the reserved name, which is what makes
+    %% `bondy_listener_manager:with_reserved/1` a no-op over this inventory
+    %% rather than a second listener on 18081.
+    ?assert(
+        lists:keymember(admin, 1, bondy_listener_config:default_inventory())
+    ).
+
+uds_rejects_tls_test() ->
+    Inventory = [
+        {local, #{
+            transport => uds, protocol => wamp_rawsocket, path => "/tmp/s.sock"
+        }}
+    ],
+    Get = get_with([{[local, tls, certfile], "/tmp/cert.pem"}]),
+    ?assertMatch(
+        {error, {invalid_listener, local, {tls_not_supported, uds}}},
+        bondy_listener_config:resolve(Inventory, Get)
+    ).
+
+uds_bridge_relay_is_refused_test() ->
+    %% A bridge relay is a connection between two Bondy nodes, not something a
+    %% Unix domain socket can serve. `transport` and `protocol` validate
+    %% independently above this check, so each half of this combination
+    %% passes on its own; without the check the listener binds and only fails
+    %% later, on its first connection, inside
+    %% `inet_utils:peername_to_binary/1`, which has no clause for the raw
+    %% `{local, <<>>}` peername `bondy_bridge_relay_server:peername/2` stores.
+    Inventory = [
+        {relay, #{
+            transport => uds,
+            protocol => bridge_relay,
+            path => "/tmp/bondy_ct_uds_relay.sock"
+        }}
+    ],
+    ?assertMatch(
+        {error,
+            {invalid_listener, relay,
+                {unsupported_combination, uds, bridge_relay}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+uds_http_is_still_valid_test() ->
+    %% `admin_local`: the co-located Admin API bound to a Unix domain socket.
+    %% The cross-check added for `uds_bridge_relay_is_refused_test` must not
+    %% widen beyond the one unsupported combination.
+    Inventory = [
+        {local_http, #{
+            transport => uds,
+            protocol => http,
+            path => "/tmp/bondy_ct_uds_http.sock",
+            services => [admin_api, admin]
+        }}
+    ],
+    ?assertMatch(
+        {ok, [_]}, bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+uds_wamp_rawsocket_is_still_valid_test() ->
+    %% `wamp_uds`: the pre-existing WAMP raw-socket listener over a Unix
+    %% domain socket.
+    Inventory = [
+        {local_wamp, #{
+            transport => uds,
+            protocol => wamp_rawsocket,
+            path => "/tmp/bondy_ct_uds_wamp.sock"
+        }}
+    ],
+    ?assertMatch(
+        {ok, [_]}, bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+websocket_carrier_is_grouped_from_services_test() ->
+    %% Two services on one carrier must UNION their protocols into a single
+    %% carrier entry: both mount `/ws`, and two routes on one path would make
+    %% the second unreachable.
+    Inventory = [
+        {mix, #{
+            transport => tcp,
+            protocol => http,
+            port => 1,
+            services => [wamp_ws, bamp_ws]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    #{websocket := #{protocols := Protos}} = maps:get(carriers, L),
+    ?assertEqual([bamp, wamp], lists:sort(Protos)).
+
+restricting_a_carrier_to_one_protocol_test() ->
+    %% The operator requirement: offer BAMP over WebSocket WITHOUT offering
+    %% WAMP on the same port.
+    Inventory = [
+        {bamp, #{
+            transport => tcp, protocol => http, port => 1, services => [bamp_ws]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    #{websocket := #{protocols := Protos}} = maps:get(carriers, L),
+    ?assertEqual([bamp], Protos).
+
+unknown_service_is_rejected_test() ->
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 1,
+            services => [wamp_ws, smtp]
+        }}
+    ],
+    ?assertMatch(
+        {error, {invalid_listener, pub, {unknown_service, smtp}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+listener_value_overrides_only_the_key_it_names_test() ->
+    %% One key stated on the listener, and the default block must survive
+    %% around it. A merge at the BLOCK rather than the leaf would leave this
+    %% listener with `idle_timeout' and nothing else, which the second
+    %% assertion is what catches.
+    Inventory = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+        }}
+    ],
+    Get = get_with([{[pub, websocket, idle_timeout], 90000}]),
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, Get),
+    #{websocket := #{config := Cfg}} = maps:get(carriers, L),
+    ?assertEqual(90000, maps:get(idle_timeout, Cfg)),
+    ?assertEqual(
+        maps:remove(
+            idle_timeout, bondy_listener_config:carrier_defaults(websocket)
+        ),
+        maps:remove(idle_timeout, Cfg)
+    ).
+
+stale_global_carrier_key_is_ignored_test() ->
+    %% No `wamp.websocket.*' mapping exists, but the application environment
+    %% it names is still reachable — a `sys.config' carried over from an
+    %% older release, or an embedded caller, can still set
+    %% `[wamp_websocket, idle_timeout]'. It must have no effect: this listener
+    %% states nothing, so it gets the code default and not the 90000 seeded
+    %% here. A resolver that falls back to that key fails this case.
+    Inventory = [
+        {iot, #{
+            transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+        }}
+    ],
+    Get = get_with([{[wamp_websocket, idle_timeout], 90000}]),
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, Get),
+    #{websocket := #{config := Cfg}} = maps:get(carriers, L),
+    ?assertEqual(
+        bondy_listener_config:carrier_defaults(websocket), Cfg
+    ).
+
+sse_carrier_gets_its_own_defaults_test() ->
+    %% The resolver is carrier-generic, so a table keyed on the wrong carrier
+    %% would pass a websocket-only case and fail only here. Asserted as
+    %% equality with `carrier_defaults(sse)' AND as difference from the
+    %% websocket block, because equality alone would still hold if both
+    %% carriers had been given the same entry by mistake.
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 1,
+            services => [wamp_sse]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    #{sse := #{config := Cfg}} = maps:get(carriers, L),
+    ?assertEqual(bondy_listener_config:carrier_defaults(sse), Cfg),
+    ?assertNotEqual(bondy_listener_config:carrier_defaults(websocket), Cfg).
+
+longpoll_carrier_gets_its_own_defaults_test() ->
+    %% Same property, for the carrier `bondy_http_longpoll_handler' reads.
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 1,
+            services => [wamp_longpoll]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    #{longpoll := #{config := Cfg}} = maps:get(carriers, L),
+    ?assertEqual(bondy_listener_config:carrier_defaults(longpoll), Cfg),
+    ?assertNotEqual(bondy_listener_config:carrier_defaults(sse), Cfg).
+
+nested_carrier_key_resolves_test() ->
+    %% Carrier settings are not flat: `ping.enabled' and `deflate_opts.level'
+    %% are nested under the carrier block, and the resolved config must mirror
+    %% that shape. A flat implementation would silently drop every nested key —
+    %% 11 of WebSocket's 15 overridable settings.
+    Inventory = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+        }}
+    ],
+    Get = get_with([
+        {[pub, websocket, ping, enabled], true},
+        {[pub, websocket, ping, max_attempts], 2},
+        {[pub, websocket, deflate_opts, level], 9}
+    ]),
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, Get),
+    #{websocket := #{config := Cfg}} = maps:get(carriers, L),
+    ?assertEqual(true, maps:get(enabled, maps:get(ping, Cfg))),
+    ?assertEqual(9, maps:get(level, maps:get(deflate_opts, Cfg))).
+
+partial_ping_is_completed_from_the_defaults_test() ->
+    %% `ping.enabled' resolves independently of its siblings, so a partial
+    %% block is what an operator naturally writes. The merge is at the LEAF,
+    %% not the block: the two keys stated here survive and the two left
+    %% unresolved arrive from `carrier_defaults/1'.
+    %%
+    %% `idle_timeout' is 45000 rather than the default 20000 on purpose — with
+    %% the default value the assertion would hold even if the operator's value
+    %% had been discarded and the whole block replaced.
+    Inventory = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+        }}
+    ],
+    Get = get_with([
+        {[pub, websocket, ping, enabled], true},
+        {[pub, websocket, ping, idle_timeout], 45000}
+        %% `timeout' and `max_attempts' deliberately left unresolved.
+    ]),
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, Get),
+    #{websocket := #{config := Cfg}} = maps:get(carriers, L),
+    ?assertEqual(
+        #{
+            enabled => true,
+            idle_timeout => 45000,
+            timeout => 10000,
+            max_attempts => 3
+        },
+        maps:get(ping, Cfg)
+    ).
+
+partial_ping_with_enabled_absent_is_accepted_test() ->
+    %% A `ping' map with siblings but no `enabled' is a WORKING configuration:
+    %% every `maybe_enable_ping/2' falls through to "ping off" when `enabled' is
+    %% absent (pinned by `ping_off_is_the_handler_fall_through_test'), so there
+    %% is no crash to prevent and rejecting it would refuse a node that runs.
+    Inventory = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+        }}
+    ],
+    Get = get_with([{[pub, websocket, ping, idle_timeout], 20000}]),
+    ?assertMatch(
+        {ok, [#{name := pub}]},
+        bondy_listener_config:resolve(Inventory, Get)
+    ).
+
+ping_off_is_the_handler_fall_through_test() ->
+    %% Tested against the three handlers themselves rather than assumed: a
+    %% `ping' map WITHOUT `enabled' means ping off, and is a no-op on the
+    %% state. A handler without that fall-through clause raises
+    %% `function_clause' on the first connection — after the socket was
+    %% accepted, so the listener binds and then dies.
+    %%
+    %% `State' is opaque here on purpose: the clause under test returns it
+    %% untouched, so it never has to be a real record.
+    Partial = #{idle_timeout => 20000, timeout => 10000, max_attempts => 2},
+    Sentinel = {state_untouched, make_ref()},
+    lists:foreach(
+        fun(Mod) ->
+            ?assertEqual(
+                Sentinel,
+                Mod:maybe_enable_ping(Partial, Sentinel),
+                atom_to_list(Mod) ++ " must treat an absent `enabled' as off"
+            ),
+            %% An explicit `false' keeps behaving the same way.
+            ?assertEqual(
+                Sentinel,
+                Mod:maybe_enable_ping(#{enabled => false}, Sentinel)
+            ),
+            %% ...but a PRESENT non-boolean is not silently "off": ping is the
+            %% mechanism for noticing a dead peer, so running without it because
+            %% a value was misspelled is the one outcome worth crashing over.
+            %% This is what separates the fall-through from a blanket catch-all.
+            ?assertError(
+                {invalid_ping_enabled, <<"on">>},
+                Mod:maybe_enable_ping(
+                    Partial#{enabled => <<"on">>}, Sentinel
+                )
+            )
+        end,
+        [
+            bondy_wamp_tcp_connection_handler,
+            bondy_wamp_ws_connection_handler,
+            bondy_bridge_relay_server
+        ]
+    ).
+
+malformed_ping_enabled_is_rejected_at_boot_test() ->
+    %% The handler refuses a non-boolean `enabled', but only once a connection
+    %% arrives — by then the listener has bound and every client dies on it. Any
+    %% inventory that resolves is checked here first, so the operator gets the
+    %% same boot-time error as for any other bad listener key, and the handler
+    %% clause is left as the backstop for callers that never resolve.
+    Raw = [
+        {raw, #{transport => tcp, protocol => wamp_rawsocket, port => 18082}}
+    ],
+    Bad = get_with([{[raw, ping], [{enabled, 1}, {timeout, 10000}]}]),
+    ?assertMatch(
+        {error, {invalid_listener, raw, {invalid_ping_enabled, listener, 1}}},
+        bondy_listener_config:resolve(Raw, Bad)
+    ),
+    %% Same for a carrier, whose ping block is assembled key-by-key.
+    Ws = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+        }}
+    ],
+    BadWs = get_with([{[pub, websocket, ping, enabled], <<"yes">>}]),
+    ?assertMatch(
+        {error,
+            {invalid_listener, pub,
+                {invalid_ping_enabled, websocket, <<"yes">>}}},
+        bondy_listener_config:resolve(Ws, BadWs)
+    ).
+
+ping_enabled_false_needs_no_siblings_test() ->
+    %% The other half of `assert_carrier_ping/3': `enabled => false' is a
+    %% complete configuration on its own, because no handler reads a sibling
+    %% once ping is off. Written to break the guard from the other side: a
+    %% version that required every sibling unconditionally would reject this.
+    Inventory = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+        }}
+    ],
+    Get = get_with([{[pub, websocket, ping, enabled], false}]),
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, Get),
+    #{websocket := #{config := Cfg}} = maps:get(carriers, L),
+    ?assertEqual(false, maps:get(enabled, maps:get(ping, Cfg))).
+
+carrier_key_set_nowhere_gets_the_code_default_test() ->
+    %% Neither listener nor global sets anything, so every carrier key comes
+    %% from `carrier_defaults/1' and the resolved config is TOTAL over them.
+    %%
+    %% Equality with the whole table, not a spot check: the failure this is for
+    %% is a key missing from one side, and asserting a handful of keys would
+    %% miss it. That the table holds the values the schema renders is asserted
+    %% where cuttlefish is available, in `bondy_listener_schema_SUITE'.
+    Inventory = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    #{websocket := #{config := Cfg}} = maps:get(carriers, L),
+    ?assertEqual(bondy_listener_config:carrier_defaults(websocket), Cfg).
+
+websocket_dynamic_buffer_is_not_overridable_test() ->
+    %% `wamp.websocket.buffer.{min,max}' cannot take effect: since Cowboy 2.13 a
+    %% WebSocket inherits the listener's dynamic_buffer and cowboy_websocket
+    %% overrides any handler-supplied value. Offering it per listener would be a
+    %% knob that does nothing, so it must NOT appear in the resolved config even
+    %% when an operator sets it.
+    Inventory = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 1, services => [wamp_ws]
+        }}
+    ],
+    Get = get_with([
+        {[pub, websocket, protocol_opts, dynamic_buffer, min], 1024}
+    ]),
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, Get),
+    #{websocket := #{config := Cfg}} = maps:get(carriers, L),
+    ?assertNot(maps:is_key(protocol_opts, Cfg)).
+
+admin_listener_defaults_to_loopback_test() ->
+    Inventory = [
+        {admin, #{
+            transport => tcp,
+            protocol => http,
+            port => 18081,
+            services => [admin, metrics]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    ?assertEqual({127, 0, 0, 1}, maps:get(ip, L)).
+
+absent_ip_stays_absent_test() ->
+    %% A listener that configured no address and exposes neither `admin` nor
+    %% `metrics` must carry NO `ip` key, not a v4 wildcard. Written to break the
+    %% claim that a defaulted address is harmless: the resolved `ip` is written
+    %% into ranch's `socket_opts`, and a v4 wildcard there contradicts the
+    %% `inet6` family `bondy_config:normalise_socket_opts/1` derives from
+    %% `ip_version = 6`, which `gen_tcp:listen/2` answers with `badarg`.
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    ?assertNot(maps:is_key(ip, L)).
+
+partial_listener_ping_is_rejected_test() ->
+    %% The listener's own `ping` block, distinct from a carrier's. Every
+    %% `listeners.$name.ping.*` mapping is default-free and resolves
+    %% independently, so an operator can write `ping.timeout` and no
+    %% `ping.enabled`. Only an ENABLED block is incomplete-able:
+    %% `bondy_wamp_tcp_connection_handler:maybe_enable_ping/2` reads
+    %% `idle_timeout`, `timeout` and `max_attempts` with `maps:get/2` once
+    %% enabled, so a gap there kills the first connection instead of failing the
+    %% boot.
+    Inventory = [
+        {raw, #{transport => tcp, protocol => wamp_rawsocket, port => 18082}}
+    ],
+    %% No `enabled` at all is ping OFF, not an error — the handler falls
+    %% through (`ping_off_is_the_handler_fall_through_test`).
+    NoEnabled = get_with([{[raw, ping], [{timeout, 10000}]}]),
+    ?assertMatch(
+        {ok, [#{name := raw}]},
+        bondy_listener_config:resolve(Inventory, NoEnabled)
+    ),
+    NoSiblings = get_with([{[raw, ping], [{enabled, true}]}]),
+    ?assertMatch(
+        {error,
+            {invalid_listener, raw,
+                {incomplete_ping, listener, [
+                    idle_timeout, timeout, max_attempts
+                ]}}},
+        bondy_listener_config:resolve(Inventory, NoSiblings)
+    ),
+    %% `enabled => false` is complete on its own: no handler reads a sibling
+    %% once ping is off.
+    Off = get_with([{[raw, ping], [{enabled, false}]}]),
+    ?assertMatch({ok, [_]}, bondy_listener_config:resolve(Inventory, Off)).
+
+stream_listener_ping_siblings_are_the_same_for_both_protocols_test() ->
+    %% A raw-socket block naming `interval` instead of `idle_timeout` is
+    %% REJECTED: a listener carrying `interval` would enable ping and then
+    %% crash on `maps:get(idle_timeout, PingOpts)`.
+    Inventory = [
+        {wamp_tls, #{
+            transport => tcp, protocol => wamp_rawsocket, port => 18085
+        }}
+    ],
+    Interval = get_with([
+        {[wamp_tls, ping], [
+            {enabled, true},
+            {interval, 30000},
+            {timeout, 10000},
+            {max_attempts, 3}
+        ]}
+    ]),
+    ?assertMatch(
+        {error,
+            {invalid_listener, wamp_tls,
+                {incomplete_ping, listener, [idle_timeout]}}},
+        bondy_listener_config:resolve(Inventory, Interval)
+    ),
+    %% The accepting side: the same block with the key the handler actually
+    %% reads.
+    Complete = get_with([
+        {[wamp_tls, ping], [
+            {enabled, true},
+            {idle_timeout, 20000},
+            {timeout, 10000},
+            {max_attempts, 2}
+        ]}
+    ]),
+    ?assertMatch({ok, [_]}, bondy_listener_config:resolve(Inventory, Complete)),
+    %% The bridge-relay server reads `ping.idle_timeout` too, so the same
+    %% omission is an error there.
+    Relay = [
+        {relay, #{transport => tcp, protocol => bridge_relay, port => 18092}}
+    ],
+    Missing = get_with([
+        {[relay, ping], [
+            {enabled, true}, {timeout, 10000}, {max_attempts, 2}
+        ]}
+    ]),
+    ?assertMatch(
+        {error,
+            {invalid_listener, relay,
+                {incomplete_ping, listener, [idle_timeout]}}},
+        bondy_listener_config:resolve(Relay, Missing)
+    ).
+
+explicit_ip_overrides_the_default_test() ->
+    Inventory = [
+        {admin, #{
+            transport => tcp,
+            protocol => http,
+            port => 18081,
+            services => [admin],
+            ip => {0, 0, 0, 0}
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    ?assertEqual({0, 0, 0, 0}, maps:get(ip, L)).
+
+admin_listener_cannot_be_disabled_test() ->
+    %% `enabled => false` on the reserved name is the exact configuration that
+    %% would leave a node unadministrable, so it is refused rather than
+    %% honoured.
+    ?assertMatch(
+        {error, {invalid_listener, admin, reserved_cannot_be_disabled}},
+        bondy_listener_config:resolve(
+            [
+                {admin, #{
+                    transport => tcp,
+                    protocol => http,
+                    port => 18081,
+                    enabled => false,
+                    services => [admin_api, admin]
+                }}
+            ],
+            fun(_K, D) -> D end
+        )
+    ).
+
+duplicate_path_is_rejected_test() ->
+    %% Two listeners on one path do NOT race like two on one port. The driver
+    %% deletes the socket node before binding, so the second listener succeeds
+    %% and silently takes the path over while the first keeps an unreachable
+    %% listen socket — no error from ranch, nothing in the log. Nothing at
+    %% runtime can catch this, so the resolver has to.
+    Inventory = [
+        {a, #{
+            transport => uds,
+            protocol => wamp_rawsocket,
+            path => "/tmp/bondy_ct_dup.sock"
+        }},
+        {b, #{
+            transport => uds,
+            protocol => wamp_rawsocket,
+            path => "/tmp/bondy_ct_dup.sock"
+        }}
+    ],
+    ?assertMatch(
+        {error, {invalid_listener, b, {path_in_use_by, a}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+internal_listener_participates_in_uniqueness_test() ->
+    %% The injected listener is checked against the resolved inventory, not
+    %% exempt from it. Written to break the guarantee the way an operator
+    %% actually could: point a `uds` listener at the internal socket's path.
+    %% `wamp_uds` starts in the NORMAL phase, after `admin_local`, so without
+    %% this every later connection to that path would reach the WAMP
+    %% raw-socket handler instead of the Admin API.
+    Path = "/tmp/bondy_ct_admin_steal.sock",
+    {ok, Resolved} = bondy_listener_config:resolve(
+        [
+            {wamp_uds, #{
+                transport => uds, protocol => wamp_rawsocket, path => Path
+            }}
+        ],
+        empty_get()
+    ),
+    Spec = #{
+        transport => uds,
+        protocol => http,
+        path => Path,
+        start_phase => early,
+        services => [admin_api, admin]
+    },
+    ?assertMatch(
+        {error, {invalid_listener, admin_local, {path_in_use_by, wamp_uds}}},
+        bondy_listener_config:resolve_internal(
+            admin_local, Spec, Resolved, empty_get()
+        )
+    ).
+
+resolve_internal_refuses_a_name_an_operator_may_use_test() ->
+    %% `resolve_internal/4` skips nothing an operator-supplied entry gets, but
+    %% its whole safety argument — that the name cannot already be taken —
+    %% rests on `resolve/2` refusing that name. Only `?RESERVED_INTERNAL` names
+    %% are refused there, so injecting any other name could produce two
+    %% listeners with one name, which `bondy_listener_manager:listener/1`
+    %% cannot resolve. A caller error, so it raises rather than returning
+    %% `{error, _}`.
+    Spec = #{
+        transport => tcp, protocol => http, port => 1, services => [admin]
+    },
+    ?assertError(
+        {not_a_reserved_internal_listener, admin},
+        bondy_listener_config:resolve_internal(admin, Spec, [], empty_get())
+    ),
+    ?assertError(
+        {not_a_reserved_internal_listener, pub},
+        bondy_listener_config:resolve_internal(pub, Spec, [], empty_get())
+    ).
+
+operator_cannot_define_admin_local_test() ->
+    %% `listeners.$name` is a cuttlefish FUZZY mapping, so
+    %% `listeners.admin_local.transport` is accepted by the schema and reaches
+    %% the inventory. Rejecting it explicitly is what stops an operator's block
+    %% being silently overridden by the injected internal listener.
+    ?assertMatch(
+        {error, {invalid_listener, admin_local, reserved_name}},
+        bondy_listener_config:resolve(
+            [
+                {admin_local, #{
+                    transport => tcp,
+                    protocol => http,
+                    port => 19999,
+                    services => [admin]
+                }}
+            ],
+            fun(_K, D) -> D end
+        )
+    ).
+
+legacy_hostname_ip_is_resolved_test() ->
+    %% `localhost` is in /etc/hosts on every supported platform, so this does
+    %% not depend on a live resolver.
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws],
+            ip => "localhost"
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    ?assertEqual({127, 0, 0, 1}, maps:get(ip, L)).
+
+literal_ip_string_is_parsed_not_resolved_test() ->
+    %% The falsification, and the reason parse_address must be tried FIRST: a
+    %% resolver with a wildcard record can answer a lookup for "0.0.0.0" with
+    %% some other address entirely. A literal must never reach DNS.
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws],
+            ip => "0.0.0.0"
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    ?assertEqual({0, 0, 0, 0}, maps:get(ip, L)).
+
+ipv6_literal_string_is_accepted_test() ->
+    %% Accepted by `inet:parse_address/1`, and also by the legacy `ip_address`
+    %% validator: `inet:getaddr(Term, inet)` fails for an IPv6 literal
+    %% (`{error, nxdomain}`, verified directly), but the validator falls back
+    %% to `inet:getaddr(Term, inet6)`, which succeeds. So this pins a preserved
+    %% behaviour, not a widening — the divergence between the two validators is
+    %% hostnames, not which IP literal family is accepted.
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws],
+            ip => "::1"
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    ?assertEqual({0, 0, 0, 0, 0, 0, 0, 1}, maps:get(ip, L)).
+
+unresolvable_ip_is_rejected_test() ->
+    %% `.invalid` is reserved by RFC 2606 and cannot resolve, so this asserts
+    %% the error path without depending on any particular resolver's answer.
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws],
+            ip => "no-such-host.invalid"
+        }}
+    ],
+    ?assertMatch(
+        {error, {invalid_listener, pub, {unresolvable_ip, _, _}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+non_string_non_tuple_ip_is_rejected_test() ->
+    %% `ip => any` is neither a tuple nor a string/binary. Written to break the
+    %% claim that a static configuration error always aborts boot as a named
+    %% error, here `{error, {invalid_listener, pub, _}}` rather than an opaque
+    %% `badarg` from `unicode:characters_to_list(any)`.
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws],
+            ip => any
+        }}
+    ],
+    ?assertMatch(
+        {error, {invalid_listener, pub, {invalid_ip, any}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+malformed_ip_tuple_is_rejected_test() ->
+    %% A 3-tuple is not an `inet:ip_address()`, but `is_tuple/1` alone cannot
+    %% tell: written to break the claim that every tuple `resolve_ip/3` accepts
+    %% is one `gen_tcp:listen/2` would too.
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws],
+            ip => {1, 2, 3}
+        }}
+    ],
+    ?assertMatch(
+        {error, {invalid_listener, pub, {invalid_ip, {1, 2, 3}}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+%% =============================================================================
+%% OPTION DEFAULTS IMPLIED BY TRANSPORT AND PROTOCOL
+%% =============================================================================
+%% A `listeners.$name.*' mapping cannot carry a default: a fuzzy default
+%% materialises for every listener name under the prefix, so the defaults
+%% live in `bondy_listener_config' and these cases pin each one. The
+%% `..._is_independent_of_..._test' and `operator_..._wins_..._test' cases
+%% assert the two properties a wrong default would violate while looking right.
+
+rawsocket_ping_defaults_are_restored_test() ->
+    %% The `listeners.$name.*' mapping is default-free, so with nothing here a
+    %% raw-socket listener has no `ping' key at all and every connection runs
+    %% without a keepalive.
+    Defaults = bondy_listener_config:option_defaults(tcp, wamp_rawsocket),
+    ?assertMatch(#{ping := #{enabled := true}}, Defaults),
+    ?assertMatch(#{ping := #{timeout := 10000}}, Defaults),
+    ?assertMatch(#{ping := #{max_attempts := 3}}, Defaults).
+
+rawsocket_reap_deadline_is_restored_test() ->
+    %% Without this 8h default the handler falls back to `infinity'
+    %% (`bondy_wamp_tcp_connection_handler:init/1'), and an idle raw-socket
+    %% connection is never reaped.
+    Defaults = bondy_listener_config:option_defaults(tcp, wamp_rawsocket),
+    ?assertMatch(#{idle_timeout := 28800000}, Defaults).
+
+rawsocket_ping_interval_is_independent_of_the_reap_deadline_test() ->
+    %% The load-bearing case. A ping interval equal to the listener's
+    %% `idle_timeout' brings both timers due at the same moment: the connection
+    %% is closed rather than probed, and the ping can neither hold a NAT
+    %% binding open nor detect a dead peer sooner than the reap. The two must
+    %% be distinct, and the probe must be the shorter of the two.
+    #{
+        idle_timeout := Reap,
+        ping := #{idle_timeout := Probe}
+    } = bondy_listener_config:option_defaults(tcp, wamp_rawsocket),
+    ?assertNotEqual(Reap, Probe),
+    ?assert(Probe < Reap),
+    %% 20s is the interval `wamp.tcp.ping.idle_timeout' documented and the one
+    %% every WebSocket connection is already probed at
+    %% (`wamp.websocket.ping.idle_timeout').
+    ?assertEqual(20000, Probe).
+
+bridge_relay_ping_defaults_are_restored_test() ->
+    %% The bridge relay server reads `idle_timeout' out of the ping block
+    %% itself when it enables ping, so all four ping defaults matter here.
+    Defaults = bondy_listener_config:option_defaults(tcp, bridge_relay),
+    ?assertMatch(
+        #{
+            idle_timeout := 28800000,
+            ping := #{
+                enabled := true,
+                idle_timeout := 20000,
+                timeout := 10000,
+                max_attempts := 3
+            }
+        },
+        Defaults
+    ).
+
+http_protocol_opts_defaults_are_restored_test() ->
+    %% Without these defaults an HTTP listener that does not set them gets
+    %% Cowboy's own: `active_n' 1 and `idle_timeout' 60000.
+    Defaults = bondy_listener_config:option_defaults(tcp, http),
+    ?assertMatch(#{protocol_opts := #{active_n := 100}}, Defaults),
+    ?assertMatch(#{protocol_opts := #{idle_timeout := 15000}}, Defaults).
+
+http_versions_default_offers_both_test() ->
+    %% HTTP/2 first — the preference Cowboy itself ships — with HTTP/1.1
+    %% offered, and the order asserted as a value since it is the server's
+    %% ALPN preference. h2-first is safe for held streams only because their
+    %% lifetime is connection-level on both versions; the wire proof is
+    %% `bondy_http_sse_SUITE:held_stream_outlives_http_default_on_both_versions'.
+    ?assertMatch(
+        #{http_versions := [http2, http]},
+        bondy_listener_config:option_defaults(tcp, http)
+    ),
+    %% The key belongs to the HTTP shape only: a stream listener negotiates
+    %% no HTTP version, and a stray default here would be splatted to
+    %% `[Name, http_versions]' for consumers that never read it.
+    ?assertNot(
+        maps:is_key(
+            http_versions,
+            bondy_listener_config:option_defaults(tcp, wamp_rawsocket)
+        )
+    ).
+
+held_stream_services_raise_the_connection_floor_test() ->
+    %% A listener serving SSE or long-poll gets its CONNECTION idle timeout
+    %% seated from the carriers' `idle_timeout' (their default: 600000), with
+    %% `reset_idle_timeout_on_send' on — because over HTTP/2 the connection
+    %% timer is the only one that exists (`cowboy_http2.erl:988' discards the
+    %% per-stream cast), and without the reset flag a stream whose traffic is
+    %% all sends dies at the floor even mid-conversation. Without a
+    %% held-stream service, the plain 15s HTTP default stands and no reset
+    %% flag is seated.
+    Held = bondy_listener_config:with_option_defaults(#{
+        transport => tcp,
+        protocol => http,
+        port => 0,
+        services => [api_gateway, wamp_ws, wamp_sse, wamp_longpoll]
+    }),
+    ?assertMatch(
+        #{
+            protocol_opts := #{
+                idle_timeout := 600000,
+                reset_idle_timeout_on_send := true
+            }
+        },
+        Held
+    ),
+    Plain = bondy_listener_config:with_option_defaults(#{
+        transport => tcp,
+        protocol => http,
+        port => 0,
+        services => [api_gateway, wamp_ws]
+    }),
+    ?assertMatch(#{protocol_opts := #{idle_timeout := 15000}}, Plain),
+    ?assertNot(
+        maps:is_key(
+            reset_idle_timeout_on_send, maps:get(protocol_opts, Plain)
+        )
+    ).
+
+held_stream_floor_follows_the_operator_carrier_value_test() ->
+    %% The floor is MAX over the held-stream carriers' effective values, the
+    %% operator's own where stated, so at any config the connection holds a
+    %% stream as long as the HTTP/1.1 path does. The larger carrier must win — a
+    %% floor from
+    %% the smaller one would kill the other carrier's holds.
+    Spec = #{
+        transport => tcp,
+        protocol => http,
+        port => 0,
+        services => [wamp_sse, wamp_longpoll],
+        sse => #{idle_timeout => 120000},
+        longpoll => #{idle_timeout => 900000}
+    },
+    ?assertMatch(
+        #{protocol_opts := #{idle_timeout := 900000}},
+        bondy_listener_config:with_option_defaults(Spec)
+    ).
+
+operator_protocol_opts_beat_the_held_stream_floor_test() ->
+    %% The floor is a DEFAULT. An operator who states `http.idle_timeout'
+    %% (or turns the reset flag off) on a held-stream listener gets exactly
+    %% what they wrote — even a value that re-creates the h2 held-stream
+    %% problem is theirs to state.
+    Spec = #{
+        transport => tcp,
+        protocol => http,
+        port => 0,
+        services => [wamp_sse],
+        protocol_opts => #{
+            idle_timeout => 30000,
+            reset_idle_timeout_on_send => false
+        }
+    },
+    ?assertMatch(
+        #{
+            protocol_opts := #{
+                idle_timeout := 30000,
+                reset_idle_timeout_on_send := false
+            }
+        },
+        bondy_listener_config:with_option_defaults(Spec)
+    ).
+
+http_versions_operator_order_survives_defaults_test() ->
+    %% `with_option_defaults/1' merges `deep_merge(Defaults, Spec)' — the
+    %% spec side wins. An operator's h1-only list (a value the default never
+    %% produces) must come through intact, not be unioned with the default's
+    %% members.
+    Spec = #{
+        transport => tls,
+        protocol => http,
+        port => 0,
+        http_versions => [http]
+    },
+    ?assertMatch(
+        #{http_versions := [http]},
+        bondy_listener_config:with_option_defaults(Spec)
+    ).
+
+rawsocket_linger_default_is_one_second_test() ->
+    %% `wamp.{tcp,tls}.linger.timeout' defaults to `1s'. The datatype is
+    %% `{duration, s}' because `bondy_config' passes the value straight into
+    %% `{linger, {true, N}}', whose second component `inet' documents as
+    %% SECONDS; a `{duration, ms}' datatype would request a 1000-second
+    %% blocking close. ONE, not 1000, so it is asserted as a value rather than
+    %% as a key being present.
+    Defaults = bondy_listener_config:option_defaults(tcp, wamp_rawsocket),
+    ?assertMatch(
+        #{transport_opts := #{socket_opts := #{linger_timeout := 1}}}, Defaults
+    ).
+
+both_stream_protocols_get_the_linger_default_test() ->
+    %% `bridge.listener.{tcp,tls}.linger.timeout' carried the same `1s', so the
+    %% default belongs to the raw-socket SHAPE and not to one protocol. An HTTP
+    %% listener gets none: its equivalent is Cowboy's own `linger_timeout`
+    %% protocol option, reached through `listeners.$name.http.linger.timeout`,
+    %% which is a genuinely different setting in genuinely different units.
+    Expected = #{transport_opts => #{socket_opts => #{linger_timeout => 1}}},
+    ?assertMatch(
+        #{transport_opts := #{socket_opts := #{linger_timeout := 1}}},
+        bondy_listener_config:option_defaults(tls, bridge_relay)
+    ),
+    ?assertEqual(
+        maps:get(transport_opts, Expected),
+        maps:get(
+            transport_opts,
+            bondy_listener_config:option_defaults(tcp, wamp_rawsocket)
+        )
+    ),
+    ?assertNot(
+        maps:is_key(
+            transport_opts, bondy_listener_config:option_defaults(tcp, http)
+        )
+    ).
+
+tls_http_listener_gets_hsts_test() ->
+    %% `bondy_http_security_headers:default_config/0' has `hsts => undefined',
+    %% so without this default a TLS listener sends no HSTS header.
+    Tls = bondy_listener_config:option_defaults(tls, http),
+    ?assertMatch(
+        #{
+            security_headers := #{
+                hsts := <<"max-age=31536000; includeSubDomains">>
+            }
+        },
+        Tls
+    ).
+
+plaintext_http_listener_gets_no_hsts_test() ->
+    %% The other half, and the reason `option_defaults/2' takes the transport as
+    %% well as the protocol: HSTS on a plaintext listener tells a browser to use
+    %% TLS on a port that does not speak it.
+    Tcp = bondy_listener_config:option_defaults(tcp, http),
+    ?assertNot(maps:is_key(security_headers, Tcp)).
+
+rawsocket_gets_no_http_defaults_test() ->
+    %% `protocol_opts' are Cowboy's; a raw socket has no Cowboy. Written because
+    %% one table keyed on two axes is easy to over-apply.
+    Raw = bondy_listener_config:option_defaults(tcp, wamp_rawsocket),
+    ?assertNot(maps:is_key(protocol_opts, Raw)),
+    ?assertNot(maps:is_key(security_headers, Raw)).
+
+operator_value_wins_over_a_protocol_default_test() ->
+    %% `deployment/fly/config/bondy.conf.template:105' sets
+    %% `listeners.wamp_tcp.ping.enabled = off'. It must stay off.
+    Spec = #{
+        transport => tcp,
+        protocol => wamp_rawsocket,
+        port => 18082,
+        ping => #{enabled => false}
+    },
+    #{ping := Ping} = bondy_listener_config:with_option_defaults(Spec),
+    ?assertMatch(#{enabled := false}, Ping).
+
+protocol_defaults_merge_into_a_partial_block_test() ->
+    %% The property that makes a ping-completeness validation unnecessary:
+    %% an operator who sets ONE ping key gets the rest from the defaults, so an
+    %% enabled block cannot be missing a sibling the handler reads with
+    %% `maps:get/2'. A shallow merge would drop `enabled', `timeout' and
+    %% `max_attempts' here.
+    Spec = #{
+        transport => tcp,
+        protocol => wamp_rawsocket,
+        port => 18082,
+        ping => #{timeout => 3000}
+    },
+    #{ping := Ping} = bondy_listener_config:with_option_defaults(Spec),
+    ?assertEqual(3000, maps:get(timeout, Ping)),
+    ?assertEqual(true, maps:get(enabled, Ping)),
+    ?assertEqual(20000, maps:get(idle_timeout, Ping)),
+    ?assertEqual(3, maps:get(max_attempts, Ping)).
+
+with_option_defaults_leaves_an_unidentified_spec_alone_test() ->
+    %% A spec with no `transport'/`protocol' is rejected by `resolve/2` with a
+    %% named error; this must not raise first.
+    Spec = #{port => 18082},
+    ?assertEqual(Spec, bondy_listener_config:with_option_defaults(Spec)).
+
+tls_rawsocket_ping_defaults_match_tcp_test() ->
+    %% The transport does not change how many unanswered probes mean a dead
+    %% peer, so TCP and TLS share one value: 3, which is also what a WebSocket
+    %% connection gets. Asserts both halves: the transports agree, and on 3.
+    Tcp = bondy_listener_config:option_defaults(tcp, wamp_rawsocket),
+    Tls = bondy_listener_config:option_defaults(tls, wamp_rawsocket),
+    ?assertEqual(maps:get(ping, Tcp), maps:get(ping, Tls)),
+    ?assertMatch(#{ping := #{max_attempts := 3}}, Tls).
+
+tls_rawsocket_gets_no_hsts_test() ->
+    %% `security_headers' are HTTP response headers. The `tls' axis must not
+    %% carry them on its own, or a raw-socket TLS listener would resolve with a
+    %% block nothing can send.
+    Tls = bondy_listener_config:option_defaults(tls, wamp_rawsocket),
+    ?assertNot(maps:is_key(security_headers, Tls)).
+
+%% =============================================================================
+%% CARRIER → MODULE IS A FUNCTIONAL DEPENDENCY
+%% =============================================================================
+%% `module` depends on the carrier alone, so no SERVICE carries it: two
+%% services naming one carrier could otherwise disagree on it. These cases pin
+%% the normalised shape: the resolver decides the module once, from the carrier.
+
+resolved_carrier_carries_its_module_test() ->
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws, bamp_ws]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    #{websocket := #{module := Module, protocols := Protos}} =
+        maps:get(carriers, L),
+    ?assertEqual(bondy_http_services, Module),
+    %% Two services, one carrier, both protocols — the union is what makes the
+    %% module a per-carrier fact rather than a per-service one.
+    ?assertEqual([bamp, wamp], lists:sort(Protos)).
+
+api_gateway_and_admin_api_are_separate_carriers_test() ->
+    %% They differ by ROUTE SOURCE — stored specifications versus the built-in
+    %% specification in `priv/` — not by protocol, and both declare `undefined`
+    %% for protocol. So a shared carrier's protocol union cannot tell them apart
+    %% and the dispatch assembler had to consult `services` to decide which route
+    %% set to fetch. Two carriers removes that lookup.
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [api_gateway, admin_api]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    Carriers = maps:get(carriers, L),
+    ?assert(maps:is_key(api_gateway, Carriers)),
+    ?assert(maps:is_key(admin_api, Carriers)),
+    ?assertNot(maps:is_key(rest, Carriers)).
+
+carrier_config_is_resolved_once_per_carrier_test() ->
+    %% `wamp_ws` and `bamp_ws` share the `websocket` carrier. A fold that
+    %% builds its accumulator entry with `maps:get/3` evaluates the default
+    %% EAGERLY and resolves the carrier's whole configuration once per service.
+    %% Counted through the `GetFun`, which is the only observable the resolver
+    %% has: one read of a given carrier key per carrier, not per service.
+    Key = [pub, websocket, compress],
+    _ = erlang:erase(reads),
+    Counting = fun(K, Default) ->
+        K =:= Key andalso erlang:put(reads, 1 + count()),
+        Default
+    end,
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws, bamp_ws]
+        }}
+    ],
+    {ok, [_]} = bondy_listener_config:resolve(Inventory, Counting),
+    ?assertEqual(1, count()).
+
+count() ->
+    case erlang:get(reads) of
+        undefined -> 0;
+        N -> N
+    end.
+
+unknown_carrier_is_a_boot_error_test() ->
+    %% An external service naming a carrier no module implements. Caught at BOOT
+    %% naming the listener, the carrier and the service that asked for it —
+    %% rather than inside a listener start or a dispatch rebuild, where an
+    %% error could name no listener.
+    ok = application:set_env(bondy_router, http_services, [
+        {ghost, #{carrier => nowhere, protocol => undefined}}
+    ]),
+    try
+        Inventory = [
+            {pub, #{
+                transport => tcp,
+                protocol => http,
+                port => 18080,
+                services => [ghost]
+            }}
+        ],
+        ?assertMatch(
+            {error, {invalid_listener, pub, {unknown_carrier, nowhere, ghost}}},
+            bondy_listener_config:resolve(Inventory, empty_get())
+        )
+    after
+        ok = application:unset_env(bondy_router, http_services)
+    end.
+
+external_carrier_module_is_resolved_test() ->
+    %% The registration path an application outside `bondy_router` uses, in its
+    %% normalised form: the service says which carrier it rides, the carrier says
+    %% which module serves it. Two env keys rather than one is the price of the
+    %% dependency being expressible only once.
+    ok = application:set_env(bondy_router, http_services, [
+        {acme, #{carrier => acme, protocol => acme}}
+    ]),
+    ok = application:set_env(bondy_router, http_carriers, [{acme, bondy_acme}]),
+    try
+        Inventory = [
+            {pub, #{
+                transport => tcp,
+                protocol => http,
+                port => 18080,
+                services => [acme]
+            }}
+        ],
+        {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+        ?assertMatch(
+            #{acme := #{module := bondy_acme, protocols := [acme]}},
+            maps:get(carriers, L)
+        )
+    after
+        ok = application:unset_env(bondy_router, http_services),
+        ok = application:unset_env(bondy_router, http_carriers)
+    end.
+
+http_listener_with_no_services_is_rejected_test() ->
+    %% Accepting an empty list would bind a listener that answers 404 to
+    %% everything with no diagnostic. An HTTP listener naming nothing to serve
+    %% is the same operator mistake as one naming no `services` key at all —
+    %% `listeners.pub.services =` renders as `[]` — so both report the same
+    %% thing.
+    Inventory = [
+        {pub, #{
+            transport => tcp, protocol => http, port => 18080, services => []
+        }}
+    ],
+    ?assertMatch(
+        {error, {invalid_listener, pub, {missing, services}}},
+        bondy_listener_config:resolve(Inventory, empty_get())
+    ).
+
+partial_security_headers_block_still_gets_the_hsts_default_test() ->
+    %% A TLS listener that sets one security header, here `frame_options`,
+    %% still gets the HSTS default. If the translation handed over a TOTAL map,
+    %% that block would carry `hsts => undefined` and win the deep merge,
+    %% switching HSTS off on exactly the listeners it is for.
+    Spec = #{
+        transport => tls,
+        protocol => http,
+        port => 18080,
+        services => [api_gateway],
+        security_headers => #{frame_options => <<"DENY">>}
+    },
+    #{security_headers := Headers} =
+        bondy_listener_config:with_option_defaults(Spec),
+    ?assertEqual(<<"DENY">>, maps:get(frame_options, Headers)),
+    ?assertEqual(
+        <<"max-age=31536000; includeSubDomains">>, maps:get(hsts, Headers)
+    ).
+
+an_explicit_undefined_hsts_still_disables_it_test() ->
+    %% The other side of that merge: an operator who says "do not send this
+    %% header" must keep winning over the default a TLS listener gets.
+    %%
+    %% The conf spelling is `security_headers.hsts = off`, which the schema's
+    %% `Header/1` renders as the `undefined` used here. NOT
+    %% `security_headers.hsts =` with nothing after it, which is a cuttlefish
+    %% CONF SYNTAX ERROR (`an_empty_security_header_value_is_a_syntax_error`
+    %% in `bondy_listener_schema_SUITE`).
+    Spec = #{
+        transport => tls,
+        protocol => http,
+        port => 18080,
+        services => [api_gateway],
+        security_headers => #{hsts => undefined}
+    },
+    #{security_headers := Headers} =
+        bondy_listener_config:with_option_defaults(Spec),
+    ?assertEqual(undefined, maps:get(hsts, Headers)).
+
+websocket_and_stream_ping_attempts_agree_test() ->
+    %% A WebSocket connection and a raw-socket one must judge a dead peer after
+    %% the same number of unanswered probes: the transport does not change what
+    %% "the peer is gone" means. The two numbers come from different tables —
+    %% `carrier_defaults/1' for the carrier, `option_defaults/2' for the
+    %% listener's own ping block — so nothing but this makes them agree.
+    %% Asserted both ways on purpose: against each other, so raising one and
+    %% forgetting the other fails here; and against the literal, so they
+    %% cannot agree on a value nobody chose.
+    Websocket = maps:get(
+        max_attempts,
+        maps:get(ping, bondy_listener_config:carrier_defaults(websocket))
+    ),
+    Stream = maps:get(
+        max_attempts,
+        maps:get(
+            ping, bondy_listener_config:option_defaults(tcp, wamp_rawsocket)
+        )
+    ),
+    ?assertEqual(3, Websocket),
+    ?assertEqual(Websocket, Stream).
+
+%% =============================================================================
+%% MCP SERVICE
+%% =============================================================================
+
+mcp_resolves_to_its_own_carrier_test() ->
+    %% `mcp' is IN-TREE data in this module, not an `http_services' env
+    %% registration: the inventory resolves inside `bondy_config:init/1',
+    %% before any dependent application's `start/2' could register anything,
+    %% and the per-listener half — the `?CARRIER_DEFAULTS' row and the schema
+    %% mappings — lives here regardless.
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [mcp]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    ?assertMatch(
+        #{mcp := #{module := bondy_mcp_http_service, protocols := [mcp]}},
+        maps:get(carriers, L)
+    ).
+
+mcp_carrier_config_is_total_over_its_defaults_test() ->
+    %% An operator who names no `listeners.$name.mcp.*' key gets exactly the
+    %% defaults row — every key present, `public_base_uri' as a PRESENT key
+    %% with an `undefined' sentinel — so the handler reads with bare
+    %% `maps:get/2' and a missing key raises rather than drifting.
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [mcp]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, empty_get()),
+    #{mcp := #{config := Config}} = maps:get(carriers, L),
+    ?assertEqual(bondy_listener_config:carrier_defaults(mcp), Config),
+    ?assert(maps:is_key(public_base_uri, Config)),
+    ?assertEqual(undefined, maps:get(public_base_uri, Config)).
+
+operator_mcp_value_wins_and_siblings_keep_their_defaults_test() ->
+    %% Two-tier resolution, same as every other carrier: the operator's value
+    %% at its leaf, the `?CARRIER_DEFAULTS' row for every leaf not named —
+    %% including the siblings inside a nested block the operator touched.
+    Get = fun
+        ([pub, mcp, max_body_size], _) -> 1024;
+        ([pub, mcp, schema, max_depth], _) -> 8;
+        (_, Default) -> Default
+    end,
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [mcp]
+        }}
+    ],
+    {ok, [L]} = bondy_listener_config:resolve(Inventory, Get),
+    #{mcp := #{config := Config}} = maps:get(carriers, L),
+    ?assertEqual(1024, maps:get(max_body_size, Config)),
+    ?assertEqual(64, maps:get(max_inflight, Config)),
+    ?assertEqual(
+        #{max_depth => 8, max_validation_ms => 50}, maps:get(schema, Config)
+    ).
+
+mcp_and_admin_api_are_incompatible_test() ->
+    %% A boot ERROR, not a warning: mounting an agent-driven surface on the
+    %% socket that administers realms, users and grants is not a
+    %% configuration an operator arrives at deliberately, and refusing it
+    %% eliminates the failure mode. Reported off the service list, before
+    %% the TLS check, in either declaration order.
+    Declare = fun(Services) ->
+        bondy_listener_config:resolve(
+            [
+                {pub, #{
+                    transport => tcp,
+                    protocol => http,
+                    port => 18080,
+                    services => Services
+                }}
+            ],
+            empty_get()
+        )
+    end,
+    Expected =
+        {error,
+            {invalid_listener, pub, {incompatible_services, mcp, admin_api}}},
+    ?assertEqual(Expected, Declare([mcp, admin_api])),
+    ?assertEqual(Expected, Declare([admin_api, wamp_ws, mcp])),
+    %% `mcp' + `api_gateway' is ALLOWED: both are tenant-facing, and a small
+    %% deployment sharing one port is a legitimate choice.
+    ?assertMatch({ok, [_]}, Declare([mcp, api_gateway])).
+
+mcp_service_raises_the_held_stream_floor_test() ->
+    %% MCP holds SSE response streams open, so a listener serving it gets the
+    %% same connection-level defaults as one serving `wamp_sse': the
+    %% carrier's `idle_timeout' as the connection floor, with
+    %% `reset_idle_timeout_on_send' on, identical over HTTP/1.1 and HTTP/2.
+    ?assertMatch(
+        #{
+            protocol_opts := #{
+                idle_timeout := 600000,
+                reset_idle_timeout_on_send := true
+            }
+        },
+        bondy_listener_config:with_option_defaults(#{
+            transport => tcp,
+            protocol => http,
+            port => 0,
+            services => [mcp]
+        })
+    ).
+
+%% A trusted-proxy entry that is not a valid CIDR refuses the listener, naming
+%% the entry. Blank entries and valid ones pass.
+malformed_trusted_proxy_is_rejected_test() ->
+    Inventory = [
+        {pub, #{
+            transport => tcp,
+            protocol => http,
+            port => 18080,
+            services => [wamp_ws]
+        }}
+    ],
+    Get = fun(Proxies) ->
+        fun
+            ([pub, proxy_protocol], _) -> [{trusted_proxies, Proxies}];
+            (_, Default) -> Default
+        end
+    end,
+    ?assertMatch(
+        {error,
+            {invalid_listener, pub,
+                {invalid_trusted_proxies, [<<"10.0.0.0/x">>, <<"10/8">>]}}},
+        bondy_listener_config:resolve(
+            Inventory, Get("10.0.0.0/x, 192.168.0.0/16,10/8")
+        )
+    ),
+    ?assertMatch(
+        {ok, [_]},
+        bondy_listener_config:resolve(
+            Inventory, Get("10.0.0.0/8, ,192.168.0.0/16")
+        )
+    ).

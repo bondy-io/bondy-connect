@@ -1,0 +1,304 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(prop_bondy_connect_itc).
+-moduledoc """
+Property-based tests for bondy_connect_itc (Interval Tree Clocks).
+
+Tests are based on the properties defined in the ITC paper:
+"Interval Tree Clocks: A Logical Clock for Dynamic Systems"
+by Paulo Sérgio Almeida, Carlos Baquero, and Victor Fonte (2008)
+""".
+
+-include_lib("proper/include/proper.hrl").
+
+%% Properties
+-export([
+    prop_seed_is_valid/0,
+    prop_fork_produces_valid_stamps/0,
+    prop_fork_produces_disjoint_ids/0,
+    prop_fork_preserves_event/0,
+    prop_event_increases_stamp/0,
+    prop_event_preserves_validity/0,
+    prop_join_is_commutative/0,
+    prop_join_is_associative/0,
+    prop_join_produces_valid_stamp/0,
+    prop_leq_is_reflexive/0,
+    prop_leq_is_transitive/0,
+    prop_leq_is_antisymmetric/0,
+    prop_encode_decode_roundtrip/0,
+    prop_peek_preserves_event/0,
+    prop_peek_creates_anonymous/0,
+    prop_operations_preserve_validity/0
+]).
+
+%% =============================================================================
+%% Generators
+%% =============================================================================
+
+%% Generate a valid stamp by starting from seed and applying random operations
+stamp() ->
+    ?SIZED(Size, stamp(Size)).
+
+stamp(0) ->
+    bondy_connect_itc:seed();
+stamp(Size) ->
+    ?LET(
+        S,
+        stamp(Size div 2),
+        ?LET(
+            Op,
+            oneof([fork_left, fork_right, event, peek_original]),
+            apply_op(Op, S)
+        )
+    ).
+
+apply_op(fork_left, S) ->
+    {Left, _Right} = bondy_connect_itc:fork(S),
+    Left;
+apply_op(fork_right, S) ->
+    {_Left, Right} = bondy_connect_itc:fork(S),
+    Right;
+apply_op(event, {0, _} = S) ->
+    %% Anonymous stamps cannot register events, return as-is
+    S;
+apply_op(event, S) ->
+    bondy_connect_itc:event(S);
+apply_op(peek_original, S) ->
+    {_Anonymous, Original} = bondy_connect_itc:peek(S),
+    Original.
+
+%% Generate a pair of stamps that have a common ancestor
+stamp_pair() ->
+    ?LET(
+        Ancestor,
+        stamp(),
+        begin
+            {S1, S2} = bondy_connect_itc:fork(Ancestor),
+            {S1, S2}
+        end
+    ).
+
+%% Generate three stamps with a common ancestor (for associativity tests)
+stamp_triple() ->
+    ?LET(
+        Ancestor,
+        stamp(),
+        begin
+            {S1, Tmp} = bondy_connect_itc:fork(Ancestor),
+            {S2, S3} = bondy_connect_itc:fork(Tmp),
+            {S1, S2, S3}
+        end
+    ).
+
+%% Generate a non-anonymous stamp (one that can register events)
+non_anonymous_stamp() ->
+    ?SUCHTHAT(S, stamp(), element(1, S) =/= 0).
+
+%% =============================================================================
+%% Properties: Core Invariants
+%% =============================================================================
+
+prop_seed_is_valid() ->
+    ?FORALL(
+        _,
+        term(),
+        bondy_connect_itc:is_valid(bondy_connect_itc:seed())
+    ).
+
+prop_fork_produces_valid_stamps() ->
+    ?FORALL(
+        S,
+        stamp(),
+        begin
+            {S1, S2} = bondy_connect_itc:fork(S),
+            bondy_connect_itc:is_valid(S1) andalso
+                bondy_connect_itc:is_valid(S2)
+        end
+    ).
+
+%% Property: fork produces stamps with disjoint IDs
+%% When joined, the IDs should sum to the original ID
+prop_fork_produces_disjoint_ids() ->
+    ?FORALL(
+        S,
+        stamp(),
+        begin
+            {S1, S2} = bondy_connect_itc:fork(S),
+            Joined = bondy_connect_itc:join(S1, S2),
+            element(2, Joined) =:= element(2, S)
+        end
+    ).
+
+prop_fork_preserves_event() ->
+    ?FORALL(
+        S,
+        stamp(),
+        begin
+            {S1, S2} = bondy_connect_itc:fork(S),
+            Event = element(2, S),
+            element(2, S1) =:= Event andalso element(2, S2) =:= Event
+        end
+    ).
+
+%% =============================================================================
+%% Properties: Event Operation
+%% =============================================================================
+
+%% Property: event() increases the stamp (the result is strictly greater)
+prop_event_increases_stamp() ->
+    ?FORALL(
+        S,
+        non_anonymous_stamp(),
+        begin
+            S1 = bondy_connect_itc:event(S),
+            bondy_connect_itc:leq(S, S1) andalso
+                not bondy_connect_itc:leq(S1, S)
+        end
+    ).
+
+prop_event_preserves_validity() ->
+    ?FORALL(
+        S,
+        non_anonymous_stamp(),
+        bondy_connect_itc:is_valid(bondy_connect_itc:event(S))
+    ).
+
+%% =============================================================================
+%% Properties: Join Operation (Lattice Properties)
+%% =============================================================================
+
+prop_join_is_commutative() ->
+    ?FORALL(
+        {S1, S2},
+        stamp_pair(),
+        begin
+            J1 = bondy_connect_itc:join(S1, S2),
+            J2 = bondy_connect_itc:join(S2, S1),
+            J1 =:= J2
+        end
+    ).
+
+prop_join_is_associative() ->
+    ?FORALL(
+        {S1, S2, S3},
+        stamp_triple(),
+        begin
+            J1 = bondy_connect_itc:join(S1, bondy_connect_itc:join(S2, S3)),
+            J2 = bondy_connect_itc:join(bondy_connect_itc:join(S1, S2), S3),
+            J1 =:= J2
+        end
+    ).
+
+prop_join_produces_valid_stamp() ->
+    ?FORALL(
+        {S1, S2},
+        stamp_pair(),
+        bondy_connect_itc:is_valid(bondy_connect_itc:join(S1, S2))
+    ).
+
+%% =============================================================================
+%% Properties: Partial Order (leq)
+%% =============================================================================
+
+prop_leq_is_reflexive() ->
+    ?FORALL(
+        S,
+        stamp(),
+        bondy_connect_itc:leq(S, S)
+    ).
+
+prop_leq_is_transitive() ->
+    ?FORALL(
+        S,
+        non_anonymous_stamp(),
+        begin
+            S1 = bondy_connect_itc:event(S),
+            S2 = bondy_connect_itc:event(S1),
+            (bondy_connect_itc:leq(S, S1) andalso bondy_connect_itc:leq(S1, S2)) =:=
+                bondy_connect_itc:leq(S, S2)
+        end
+    ).
+
+%% Property: leq is antisymmetric. Two independently generated stamps
+%% that compare below each other carry the same event tree. Small sizes
+%% make such pairs common (seeds, single events), so the premise fires.
+prop_leq_is_antisymmetric() ->
+    ?FORALL(
+        {A, B},
+        {stamp(), stamp()},
+        begin
+            Both =
+                bondy_connect_itc:leq(A, B) andalso
+                    bondy_connect_itc:leq(B, A),
+            not Both orelse element(2, A) =:= element(2, B)
+        end
+    ).
+
+%% =============================================================================
+%% Properties: Encoding/Decoding
+%% =============================================================================
+
+prop_encode_decode_roundtrip() ->
+    ?FORALL(
+        S,
+        stamp(),
+        begin
+            Encoded = bondy_connect_itc:encode(S),
+            Decoded = bondy_connect_itc:decode(Encoded),
+            S =:= Decoded
+        end
+    ).
+
+%% =============================================================================
+%% Properties: Peek Operation
+%% =============================================================================
+
+prop_peek_preserves_event() ->
+    ?FORALL(
+        S,
+        stamp(),
+        begin
+            {Anonymous, Original} = bondy_connect_itc:peek(S),
+            Event = element(2, S),
+            element(2, Anonymous) =:= Event andalso
+                element(2, Original) =:= Event
+        end
+    ).
+
+%% Property: peek creates an anonymous stamp (Id = 0)
+prop_peek_creates_anonymous() ->
+    ?FORALL(
+        S,
+        stamp(),
+        begin
+            {Anonymous, Original} = bondy_connect_itc:peek(S),
+            element(1, Anonymous) =:= 0 andalso
+                element(1, Original) =:= element(1, S)
+        end
+    ).
+
+%% =============================================================================
+%% Properties: General Validity
+%% =============================================================================
+
+prop_operations_preserve_validity() ->
+    ?FORALL(
+        S,
+        non_anonymous_stamp(),
+        begin
+            {S1, S2} = bondy_connect_itc:fork(S),
+            S3 = bondy_connect_itc:event(S),
+            S4 = bondy_connect_itc:join(S1, S2),
+            {S5, S6} = bondy_connect_itc:peek(S),
+
+            bondy_connect_itc:is_valid(S1) andalso
+                bondy_connect_itc:is_valid(S2) andalso
+                bondy_connect_itc:is_valid(S3) andalso
+                bondy_connect_itc:is_valid(S4) andalso
+                bondy_connect_itc:is_valid(S5) andalso
+                bondy_connect_itc:is_valid(S6)
+        end
+    ).

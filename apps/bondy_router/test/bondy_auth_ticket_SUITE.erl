@@ -1,0 +1,746 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_auth_ticket_SUITE).
+-include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
+
+-include("bondy_security.hrl").
+
+-define(U1, <<"user_1">>).
+-define(U2, <<"user_2">>).
+-define(APP, <<"app_1">>).
+-define(P1, <<"aWe11KeptSecret">>).
+
+-compile([nowarn_export_all, export_all]).
+
+all() ->
+    [
+        anon_auth_not_allowed,
+        ticket_auth_not_allowed,
+        local_scope,
+        client_scope_with_ticket,
+        client_scope_with_id,
+
+        ticket_method_available_for_user,
+        ticket_method_not_available_outside_cidr,
+
+        scope_survives_jwt_roundtrip,
+        issue_with_custom_expiry,
+        issue_returns_ticket_and_details,
+
+        ticket_auth_full_flow,
+        wrong_user_ticket_rejected,
+
+        issue_with_authroles_writes_the_claim,
+        issue_with_authroles_superset_refused,
+        restricted_ticket_caps_session_roles,
+
+        invalid_method_rejected,
+        nonexistent_user_error
+    ].
+
+init_per_suite(Config) ->
+    bondy_ct:start_bondy(),
+    KeyPairs = [bondy_cryptosign:generate_key() || _ <- lists:seq(1, 3)],
+    RealmUri = <<"com.example.test.auth_ticket">>,
+    ok = add_realm(RealmUri, KeyPairs),
+    [{realm_uri, RealmUri}, {keypairs, KeyPairs} | Config].
+
+end_per_suite(Config) ->
+    {save_config, Config}.
+
+add_realm(RealmUri, KeyPairs) ->
+    %% We use the same keys for both users (not to be done in real life)
+    PubKeys = [
+        maps:get(public, KeyPair)
+     || KeyPair <- KeyPairs
+    ],
+
+    Config = #{
+        uri => RealmUri,
+        description => <<"A test realm">>,
+        authmethods => [
+            ?WAMP_TICKET_AUTH, ?WAMP_ANON_AUTH, ?WAMP_CRA_AUTH
+        ],
+        security_enabled => true,
+        grants => [
+            #{
+                permissions => [
+                    <<"wamp.register">>,
+                    <<"wamp.unregister">>,
+                    <<"wamp.subscribe">>,
+                    <<"wamp.unsubscribe">>,
+                    <<"wamp.call">>,
+                    <<"wamp.cancel">>,
+                    <<"wamp.publish">>
+                ],
+                uri => <<"">>,
+                match => <<"prefix">>,
+                roles => <<"all">>
+            },
+            #{
+                permissions => [
+                    <<"bondy.issue">>
+                ],
+                resources => [
+                    #{
+                        uri => <<"bondy.ticket.scope.local">>,
+                        match => <<"exact">>
+                    }
+                ],
+                roles => [?APP]
+            },
+            #{
+                permissions => [
+                    <<"bondy.issue">>
+                ],
+                resources => [
+                    #{
+                        uri => <<"bondy.ticket.scope.client_local">>,
+                        match => <<"exact">>
+                    },
+                    #{
+                        uri => <<"bondy.ticket.scope.client_sso">>,
+                        match => <<"exact">>
+                    }
+                ],
+                roles => [?U1]
+            },
+            %% The delegation cases run under sessions restricted to
+            %% g1/g2, which do NOT carry the user-keyed grants above —
+            %% without this grant a restricted session cannot issue at
+            %% all and the superset case passes VACUOUSLY.
+            #{
+                permissions => [
+                    <<"bondy.issue">>
+                ],
+                resources => [
+                    #{
+                        uri => <<"bondy.ticket.scope.local">>,
+                        match => <<"exact">>
+                    }
+                ],
+                roles => [<<"g1">>, <<"g2">>]
+            }
+        ],
+        groups => [
+            #{name => <<"g1">>},
+            #{name => <<"g2">>}
+        ],
+        users => [
+            #{
+                username => ?U1,
+                password => ?P1,
+                groups => []
+            },
+            %% The delegation cases' user: session `authroles => []`
+            %% builds the RBAC context from the USER's groups, so the
+            %% role-restricted cases get their own user
+            %% rather than leaking grants into every ?U1 expectation.
+            #{
+                username => <<"deleg_user">>,
+                password => ?P1,
+                groups => [<<"g1">>, <<"g2">>]
+            },
+            #{
+                username => ?U2,
+                password => ?P1,
+                groups => []
+            },
+            #{
+                username => ?APP,
+                authorized_keys => PubKeys,
+                groups => []
+            }
+        ],
+        sources => [
+            #{
+                usernames => [?U1],
+                authmethod => ?WAMP_TICKET_AUTH,
+                cidr => <<"0.0.0.0/0">>
+            },
+            #{
+                usernames => [<<"deleg_user">>],
+                authmethod => ?WAMP_TICKET_AUTH,
+                cidr => <<"0.0.0.0/0">>
+            },
+            #{
+                usernames => [?APP],
+                authmethod => ?WAMP_TICKET_AUTH,
+                cidr => <<"0.0.0.0/0">>
+            },
+            #{
+                usernames => [?U2],
+                authmethod => ?WAMP_TICKET_AUTH,
+                cidr => <<"192.168.0.0/16">>
+            }
+        ]
+    },
+    _ = bondy_realm:create(Config),
+    ok.
+
+%% =============================================================================
+%% HELPERS
+%% =============================================================================
+
+%% @private
+make_session(RealmUri, Username, AuthMethod) ->
+    make_session(RealmUri, Username, AuthMethod, {127, 0, 0, 1}).
+
+%% @private
+make_session(RealmUri, Username, AuthMethod, SourceIP) ->
+    make_session(RealmUri, Username, AuthMethod, SourceIP, []).
+
+%% @private
+make_session(RealmUri, Username, AuthMethod, SourceIP, Authroles) ->
+    Session = bondy_session:new(RealmUri, #{
+        peer => {SourceIP, 0},
+        authrealm => RealmUri,
+        authid => Username,
+        authmethod => AuthMethod,
+        security_enabled => true,
+        authroles => Authroles,
+        roles => #{
+            caller => #{}
+        }
+    }),
+    ets:insert(
+        bondy_session:table(bondy_session:external_id(Session)),
+        Session
+    ),
+    Session.
+
+%% =============================================================================
+%% TICKET AVAILABILITY AND SCOPE
+%% =============================================================================
+
+anon_auth_not_allowed(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    Peer = {{127, 0, 0, 1}, 10000},
+
+    Session = bondy_session:new(RealmUri, #{
+        peer => Peer,
+        authrealm => RealmUri,
+        authid => <<"foo">>,
+        authmethod => ?WAMP_ANON_AUTH,
+        is_anonymous => true,
+        security_enabled => true,
+        authroles => [<<"anonymous">>],
+        roles => #{
+            caller => #{}
+        }
+    }),
+    ets:insert(
+        bondy_session:table(bondy_session:external_id(Session)), Session
+    ),
+
+    ?assertMatch(
+        {
+            error,
+            {not_authorized,
+                <<"The authentication method 'anonymous' you used to establish this session is not in the list of methods allowed to issue tickets (configuration option 'security.ticket.authmethods').">>}
+        },
+        bondy_ticket:issue(Session, #{})
+    ).
+
+ticket_auth_not_allowed(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    Roles = [],
+    Peer = {{127, 0, 0, 1}, 10000},
+
+    ok = bondy_config:set([security, ticket, authmethods], [
+        <<"cryptosign">>, <<"wampcra">>
+    ]),
+
+    Session = bondy_session:new(RealmUri, #{
+        peer => Peer,
+        authrealm => RealmUri,
+        authid => ?U1,
+        authmethod => ?WAMP_TICKET_AUTH,
+        security_enabled => true,
+        authroles => Roles,
+        roles => #{
+            caller => #{}
+        }
+    }),
+    ets:insert(
+        bondy_session:table(bondy_session:external_id(Session)), Session
+    ),
+
+    ?assertMatch(
+        {error, {not_authorized, _}},
+        bondy_ticket:issue(Session, #{})
+    ),
+
+    ok = bondy_config:set([security, ticket, authmethods], [
+        <<"cryptosign">>,
+        <<"password">>,
+        <<"ticket">>,
+        <<"tls">>,
+        <<"trust">>,
+        <<"wamp-scram">>,
+        <<"wampcra">>
+    ]).
+
+local_scope(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    Roles = [],
+    SourceIP = {127, 0, 0, 1},
+
+    Session = bondy_session:new(RealmUri, #{
+        peer => {SourceIP, 0},
+        authrealm => RealmUri,
+        authid => ?U1,
+        authmethod => ?WAMP_CRA_AUTH,
+        security_enabled => true,
+        authroles => Roles,
+        roles => #{
+            caller => #{}
+        }
+    }),
+    ets:insert(
+        bondy_session:table(bondy_session:external_id(Session)), Session
+    ),
+
+    ?assertMatch(
+        {error, {not_authorized, _}},
+        bondy_ticket:issue(Session, #{})
+    ),
+
+    ok = bondy_rbac:grant(
+        RealmUri,
+        bondy_rbac:request(#{
+            roles => [?U1],
+            permissions => [<<"bondy.issue">>],
+            resources => [
+                #{
+                    uri => <<"bondy.ticket.scope.local">>,
+                    match => <<"exact">>
+                }
+            ]
+        })
+    ),
+
+    %% Re-insert session so that we cleanup the rbac_ctxt
+    ets:insert(
+        bondy_session:table(bondy_session:external_id(Session)), Session
+    ),
+
+    {ok, Ticket, _} = bondy_ticket:issue(Session, #{}),
+
+    SessionId = bondy_session_id:new(),
+    {ok, Ctxt1} = bondy_auth:init(SessionId, RealmUri, ?U1, Roles, SourceIP),
+
+    ?assertEqual(
+        true,
+        lists:member(?WAMP_TICKET_AUTH, bondy_auth:available_methods(Ctxt1))
+    ),
+
+    ?assertMatch(
+        {ok, _, _},
+        bondy_auth:authenticate(?WAMP_TICKET_AUTH, Ticket, undefined, Ctxt1)
+    ),
+
+    %% U1's own local ticket has client_id = all, so this is not a nested
+    %% ticket; it is rejected because U1 would be granting a ticket to itself.
+    ?assertEqual(
+        {error, {invalid_request, "Self-granting ticket not allowed"}},
+        bondy_ticket:issue(Session, #{client_ticket => Ticket})
+    ).
+
+client_scope_with_ticket(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    Roles = [],
+    SourceIP = {127, 0, 0, 1},
+
+    AppSession = bondy_session:new(RealmUri, #{
+        peer => {SourceIP, 0},
+        authrealm => RealmUri,
+        authid => ?APP,
+        authmethod => ?WAMP_CRYPTOSIGN_AUTH,
+        security_enabled => true,
+        authroles => Roles,
+        roles => #{
+            caller => #{}
+        }
+    }),
+    ets:insert(
+        bondy_session:table(bondy_session:external_id(AppSession)),
+        AppSession
+    ),
+
+    {ok, AppTicket, _} = bondy_ticket:issue(AppSession, #{
+        expiry_time_secs => 300
+    }),
+
+    UserSession = bondy_session:new(RealmUri, #{
+        peer => {SourceIP, 0},
+        authrealm => RealmUri,
+        authid => ?U1,
+        authmethod => ?WAMP_CRA_AUTH,
+        security_enabled => true,
+        authroles => Roles,
+        roles => #{
+            caller => #{}
+        }
+    }),
+    ets:insert(
+        bondy_session:table(bondy_session:external_id(UserSession)),
+        UserSession
+    ),
+
+    %% AppTicket is a plain local ticket (client_id = all) issued by APP, which
+    %% is exactly what the Client-Local scope flow expects as `client_ticket`.
+    %% The result is a ticket for U1 usable only via APP.
+    {ok, UserTicket, Claims} = bondy_ticket:issue(UserSession, #{
+        client_ticket => AppTicket,
+        expiry_time_secs => 300
+    }),
+
+    ?assertMatch(
+        #{
+            authid := ?U1,
+            issued_by := ?APP,
+            scope := #{realm := RealmUri, client_id := ?APP, device_id := all}
+        },
+        Claims
+    ),
+
+    %% Nesting IS rejected: the client-scoped ticket just issued cannot itself
+    %% be used as a `client_ticket`.
+    ?assertEqual(
+        {error, {invalid_request, "Nested tickets are not allowed"}},
+        bondy_ticket:issue(UserSession, #{
+            client_ticket => UserTicket,
+            expiry_time_secs => 300
+        })
+    ).
+
+client_scope_with_id(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    Roles = [],
+    SourceIP = {127, 0, 0, 1},
+
+    UserSession = bondy_session:new(RealmUri, #{
+        peer => {SourceIP, 0},
+        authrealm => RealmUri,
+        authid => ?U1,
+        authmethod => ?WAMP_CRA_AUTH,
+        security_enabled => true,
+        authroles => Roles,
+        roles => #{
+            caller => #{}
+        }
+    }),
+    ets:insert(
+        bondy_session:table(bondy_session:external_id(UserSession)), UserSession
+    ),
+
+    {ok, UserTicket, Details} = bondy_ticket:issue(
+        UserSession,
+        #{
+            client_id => ?APP,
+            expiry_time_secs => 300
+        }
+    ),
+
+    ?assertMatch(
+        #{scope := #{client_id := ?APP}},
+        Details
+    ),
+
+    SessionId = bondy_session_id:new(),
+    {ok, Ctxt1} = bondy_auth:init(SessionId, RealmUri, ?U1, Roles, SourceIP),
+
+    ?assertEqual(
+        true,
+        lists:member(?WAMP_TICKET_AUTH, bondy_auth:available_methods(Ctxt1))
+    ),
+
+    ?assertMatch(
+        {ok, _, _},
+        bondy_auth:authenticate(?WAMP_TICKET_AUTH, UserTicket, undefined, Ctxt1)
+    ).
+
+%% =============================================================================
+%% TICKET AUTH METHOD AVAILABILITY
+%% =============================================================================
+
+ticket_method_available_for_user(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    SessionId = bondy_session_id:new(),
+
+    %% U1 has source for ticket auth from 0.0.0.0/0
+    {ok, Ctxt} = bondy_auth:init(
+        SessionId, RealmUri, ?U1, [], {127, 0, 0, 1}
+    ),
+    ?assert(
+        lists:member(?WAMP_TICKET_AUTH, bondy_auth:available_methods(Ctxt))
+    ).
+
+ticket_method_not_available_outside_cidr(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    SessionId = bondy_session_id:new(),
+
+    %% U2 has ticket source restricted to 192.168.0.0/16
+    {ok, Ctxt} = bondy_auth:init(
+        SessionId, RealmUri, ?U2, [], {10, 0, 0, 1}
+    ),
+    ?assertNot(
+        lists:member(?WAMP_TICKET_AUTH, bondy_auth:available_methods(Ctxt))
+    ).
+
+%% =============================================================================
+%% TICKET ISSUANCE
+%% =============================================================================
+
+-doc """
+The scope survives the ticket as JSON, so its wildcards decode as
+`~"all"` rather than the atom `all`. `verify/1` must normalise them, otherwise
+`scope_type/1` classifies the decoded scope differently from the issued one, the
+derived storage key differs, and `lookup/3` can never find the persisted claims.
+
+That failure is invisible whenever `security.ticket.allow_not_found` is `true`
+(the default) because `verify/1` then falls back to trusting the signature — so
+this test asserts on `lookup/3` directly rather than relying on the flag.
+""".
+scope_survives_jwt_roundtrip(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    Session = make_session(RealmUri, ?U1, ?WAMP_CRA_AUTH),
+
+    {ok, Ticket, IssuedClaims} = bondy_ticket:issue(Session, #{}),
+
+    {ok, VerifiedClaims} = bondy_ticket:verify(Ticket),
+
+    IssuedScope = maps:get(scope, IssuedClaims),
+    VerifiedScope = maps:get(scope, VerifiedClaims),
+
+    %% The decoded scope must be identical to the issued one, wildcards included
+    ?assertEqual(IssuedScope, VerifiedScope),
+    ?assertEqual(all, maps:get(client_id, VerifiedScope)),
+    ?assertEqual(all, maps:get(device_id, VerifiedScope)),
+
+    %% ...so that a lookup keyed off the decoded scope resolves the stored claims
+    ?assertEqual(
+        {ok, IssuedClaims},
+        bondy_ticket:lookup(RealmUri, ?U1, VerifiedScope)
+    ),
+
+    %% Revocation must therefore be observable through verify/1's store check
+    ok = bondy_ticket:revoke(VerifiedClaims),
+    ?assertEqual(
+        {error, revoked},
+        bondy_ticket:lookup(RealmUri, ?U1, VerifiedScope)
+    ).
+
+issue_with_custom_expiry(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    Session = make_session(RealmUri, ?U1, ?WAMP_CRA_AUTH),
+
+    {ok, Ticket, Details} = bondy_ticket:issue(Session, #{
+        expiry_time_secs => 600
+    }),
+
+    ?assert(is_binary(Ticket)),
+    ?assert(is_map(Details)),
+    ?assert(maps:is_key(expires_at, Details)),
+
+    %% The expiry should be roughly 600 seconds from now
+    ExpiresAt = maps:get(expires_at, Details),
+    Now = erlang:system_time(second),
+    ?assert(ExpiresAt > Now),
+    ?assert(ExpiresAt =< Now + 610).
+
+issue_returns_ticket_and_details(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    Session = make_session(RealmUri, ?U1, ?WAMP_CRA_AUTH),
+
+    {ok, Ticket, Details} = bondy_ticket:issue(Session, #{}),
+
+    ?assert(is_binary(Ticket)),
+    ?assert(is_map(Details)),
+    ?assert(maps:is_key(authid, Details)),
+    ?assert(maps:is_key(authrealm, Details)),
+    ?assertEqual(?U1, maps:get(authid, Details)),
+    ?assertEqual(RealmUri, maps:get(authrealm, Details)).
+
+%% =============================================================================
+%% TICKET AUTHENTICATION FLOW
+%% =============================================================================
+
+ticket_auth_full_flow(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    SourceIP = {127, 0, 0, 1},
+
+    Session = make_session(RealmUri, ?U1, ?WAMP_CRA_AUTH),
+    {ok, Ticket, _} = bondy_ticket:issue(Session, #{}),
+
+    SessionId = bondy_session_id:new(),
+    {ok, Ctxt} = bondy_auth:init(
+        SessionId, RealmUri, ?U1, [], SourceIP
+    ),
+    ?assert(
+        lists:member(?WAMP_TICKET_AUTH, bondy_auth:available_methods(Ctxt))
+    ),
+    {ok, Extra, _} = bondy_auth:authenticate(
+        ?WAMP_TICKET_AUTH, Ticket, undefined, Ctxt
+    ),
+
+    ?assert(is_map(Extra)).
+
+wrong_user_ticket_rejected(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    SourceIP = {127, 0, 0, 1},
+
+    Session = make_session(RealmUri, ?U1, ?WAMP_CRA_AUTH),
+    {ok, Ticket, _} = bondy_ticket:issue(Session, #{}),
+
+    SessionId = bondy_session_id:new(),
+    {ok, Ctxt} = bondy_auth:init(
+        SessionId, RealmUri, ?APP, [], SourceIP
+    ),
+
+    %% Should fail because the ticket's authid doesn't match
+    ?assertMatch(
+        {error, _},
+        bondy_auth:authenticate(
+            ?WAMP_TICKET_AUTH, Ticket, undefined, Ctxt
+        )
+    ).
+
+%% =============================================================================
+%% ROLE-RESTRICTED TICKETS (delegation)
+%% =============================================================================
+
+%% The delegation credential: `bondy.ticket.issue` with `authroles` binds
+%% a role RESTRICTION into the signed claims, so a user can hand an agent
+%% a ticket scoped to a subset of their own roles — never their session
+%% credential.
+issue_with_authroles_writes_the_claim(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    Session = make_session(
+        RealmUri,
+        <<"deleg_user">>,
+        ?WAMP_CRA_AUTH,
+        {127, 0, 0, 1},
+        [<<"g1">>, <<"g2">>]
+    ),
+    {ok, _Ticket, Claims} =
+        bondy_ticket:issue(Session, #{authroles => [<<"g1">>]}),
+    ?assertEqual([<<"g1">>], maps:get(authroles, Claims)),
+
+    %% An unrestricted issue writes NO claim — absent means unrestricted,
+    %% which is also what every ticket issued before this field verifies
+    %% as.
+    {ok, _T2, Claims2} = bondy_ticket:issue(Session, #{}),
+    ?assertNot(maps:is_key(authroles, Claims2)).
+
+%% The restriction must be a subset of the ISSUING SESSION's roles — not
+%% the user's groups — so a restricted session cannot mint a wider ticket
+%% than itself (no re-widening chain).
+issue_with_authroles_superset_refused(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    Session = make_session(
+        RealmUri,
+        <<"deleg_user">>,
+        ?WAMP_CRA_AUTH,
+        {127, 0, 0, 1},
+        [<<"g1">>]
+    ),
+    ?assertMatch(
+        {error, {not_authorized, _}},
+        bondy_ticket:issue(Session, #{authroles => [<<"g1">>, <<"g2">>]})
+    ).
+
+%% Authenticating with a restricted ticket caps the session's roles
+%% NON-NEGOTIABLY: the bearer may narrow further, never widen, and a
+%% request entirely outside the cap is refused. The cap is applied in
+%% `bondy_auth:authenticate/4`, which is what both the WAMP session open
+%% and the MCP edge read their roles from — one seam serves both.
+restricted_ticket_caps_session_roles(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    SourceIP = {127, 0, 0, 1},
+    Session = make_session(
+        RealmUri,
+        <<"deleg_user">>,
+        ?WAMP_CRA_AUTH,
+        SourceIP,
+        [<<"g1">>, <<"g2">>]
+    ),
+    %% One live ticket per (authid, scope): a second issue on the same
+    %% scope REPLACES the stored claims and revokes the first ticket
+    %% (`no_match`), so each ticket is exercised fully
+    %% before the next is issued.
+    {ok, Restricted, _} =
+        bondy_ticket:issue(Session, #{authroles => [<<"g1">>]}),
+
+    %% The bearer asks for everything (`all`): the cap decides.
+    {ok, Ctxt0} = bondy_auth:init(
+        bondy_session_id:new(), RealmUri, <<"deleg_user">>, all, SourceIP
+    ),
+    {ok, _, Ctxt1} = bondy_auth:authenticate(
+        ?WAMP_TICKET_AUTH, Restricted, undefined, Ctxt0
+    ),
+    ?assertEqual([<<"g1">>], bondy_auth:roles(Ctxt1)),
+    ?assertEqual(<<"g1">>, bondy_auth:role(Ctxt1)),
+
+    %% A bearer requesting ONLY a role outside the cap is refused — the
+    %% intersection is empty, and an empty cap must never fall back to
+    %% something wider.
+    {ok, CtxtW0} = bondy_auth:init(
+        bondy_session_id:new(),
+        RealmUri,
+        <<"deleg_user">>,
+        [<<"g2">>],
+        SourceIP
+    ),
+    ?assertMatch(
+        {error, no_authorized_role},
+        bondy_auth:authenticate(
+            ?WAMP_TICKET_AUTH, Restricted, undefined, CtxtW0
+        )
+    ),
+
+    %% The same `all` request with an unrestricted ticket keeps every
+    %% role.
+    {ok, Unrestricted, _} = bondy_ticket:issue(Session, #{}),
+    {ok, CtxtU0} = bondy_auth:init(
+        bondy_session_id:new(), RealmUri, <<"deleg_user">>, all, SourceIP
+    ),
+    {ok, _, CtxtU1} = bondy_auth:authenticate(
+        ?WAMP_TICKET_AUTH, Unrestricted, undefined, CtxtU0
+    ),
+    ?assertEqual(
+        lists:sort([<<"g1">>, <<"g2">>]),
+        lists:sort(bondy_auth:roles(CtxtU1))
+    ).
+
+%% =============================================================================
+%% ERROR CASES
+%% =============================================================================
+
+invalid_method_rejected(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    SessionId = bondy_session_id:new(),
+
+    {ok, Ctxt} = bondy_auth:init(
+        SessionId, RealmUri, ?U1, [], {127, 0, 0, 1}
+    ),
+    ?assertMatch(
+        {error, invalid_method},
+        bondy_auth:authenticate(
+            <<"nonexistent">>, <<"data">>, undefined, Ctxt
+        )
+    ).
+
+nonexistent_user_error(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    SessionId = bondy_session_id:new(),
+
+    ?assertMatch(
+        {error, {no_such_user, <<"ghost">>}},
+        bondy_auth:init(SessionId, RealmUri, <<"ghost">>, [], {127, 0, 0, 1})
+    ).

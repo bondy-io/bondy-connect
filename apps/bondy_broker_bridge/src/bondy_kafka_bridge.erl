@@ -43,20 +43,23 @@ mappings for use in `mops` templates.
 """.
 
 -behaviour(bondy_broker_bridge).
--include_lib("kernel/include/logger.hrl").
 -include_lib("bondy_wamp/include/bondy_wamp.hrl").
 
--define(PRODUCE_OPTIONS_SPEC, begin ?BROD_OPTIONS_SPEC end #{
+-define(PRODUCE_OPTIONS_SPEC, begin
+    ?BROD_OPTIONS_SPEC
+end#{
     %% The brod client to be used. This should have been configured through the
     %% configuration files
     <<"client_id">> => #{
         alias => client_id,
         required => true,
-        default => undefined,
+        %% An action that names no client uses the first configured one.
+        %% `maps_utils` evaluates a fun default and does not validate it.
+        default => fun default_client_id/0,
         allow_null => false,
         validator => fun
-            (undefined) ->
-                get_client();
+            (Val) when Val =:= undefined; Val =:= null ->
+                default_client();
             (Val) when is_atom(Val) ->
                 {ok, Val};
             (Val) when is_binary(Val) ->
@@ -84,7 +87,6 @@ mappings for use in `mops` templates.
         required => true,
         validator => ?PARTITIONER_SPEC
     },
-    %% How to encode the Value
     <<"encoding">> => #{
         alias => encoding,
         required => true,
@@ -110,9 +112,9 @@ mappings for use in `mops` templates.
         allow_null => false,
         allow_undefined => false,
         validator => fun
-            (<<"leader">>) -> {ok, -1};
+            (<<"leader">>) -> {ok, 1};
             (<<"none">>) -> {ok, 0};
-            (<<"all">>) -> {ok, 1};
+            (<<"all">>) -> {ok, -1};
             (Val) when Val >= -1 andalso Val =< 1 -> true;
             (_) -> false
         end
@@ -257,13 +259,20 @@ mappings for use in `mops` templates.
         alias => algorithm,
         required => true,
         default => <<"fnv32a">>,
-        datatype => {in, [
-            <<"random">>, <<"hash">>,
-            <<"fnv32">>, <<"fnv32a">>, <<"fnv32m">>,
-            <<"fnv64">>, <<"fnv64a">>,
-            <<"fnv128">>, <<"fnv128a">>
-        ]}
+        datatype =>
+            {in, [
+                <<"random">>,
+                <<"hash">>,
+                <<"fnv32">>,
+                <<"fnv32a">>,
+                <<"fnv32m">>,
+                <<"fnv64">>,
+                <<"fnv64a">>,
+                <<"fnv128">>,
+                <<"fnv128a">>
+            ]}
     },
+    %% The `fnv*` algorithms hash this with `hash:s/1`.
     <<"value">> => #{
         alias => value,
         required => true,
@@ -272,7 +281,8 @@ mappings for use in `mops` templates.
         default => undefined,
         validator => fun
             (null) -> {ok, undefined};
-            (_) -> true
+            (Val) when is_binary(Val); is_number(Val) -> true;
+            (_) -> false
         end
     }
 }).
@@ -284,7 +294,6 @@ mappings for use in `mops` templates.
         default => <<"produce_sync">>,
         allow_null => false,
         allow_undefined => false,
-        %% datatype => {in, [<<"produce">>, <<"produce_sync">>]}
         datatype => {in, [<<"produce_sync">>]}
     },
     <<"topic">> => #{
@@ -325,18 +334,14 @@ mappings for use in `mops` templates.
     }
 }).
 
-
 -export([init/1]).
 -export([validate_action/1]).
 -export([apply_action/1]).
 -export([terminate/2]).
 
-
-
 %% =============================================================================
 %% BONDY_BROKER_BRIDGE CALLBACKS
 %% =============================================================================
-
 
 -doc """
 Initialise the Kafka bridge.
@@ -350,43 +355,33 @@ init(Config) ->
 
     _ = application:ensure_all_started(hash),
 
-    try application:ensure_all_started(brod) of
+    case application:ensure_all_started(brod) of
         {ok, _} ->
             {ok, Clients} = application:get_env(brod, clients),
             [
-                begin
-                    case lists:keyfind(endpoints, 1, Opts) of
-                        false ->
-                            error(badarg);
-                        {endpoint, []} ->
-                            error(badarg);
-                        {endpoints, Endpoints} when is_list(Endpoints) ->
-                            ok = brod:start_client(Endpoints, Name, Opts)
-                    end
-                end || {Name, Opts} <- Clients
+                ok = brod:start_client(
+                    proplists:get_value(endpoints, Opts, []), Name, Opts
+                )
+             || {Name, Opts} <- Clients
             ],
             Topics = maps:from_list(proplists:get_value(topics, Config, [])),
             Ctxt = #{<<"kafka">> => #{<<"topics">> => Topics}},
             {ok, Ctxt};
-        Error ->
+        {error, _} = Error ->
             Error
-    catch
-       _:Reason ->
-            {error, Reason}
     end.
-
 
 -doc "Validate a Kafka produce action spec against `PRODUCE_ACTION_SPEC`.".
 validate_action(Action0) ->
-    %% maps_utils:validate(Action0, ?PRODUCE_ACTION_SPEC).
     try maps_utils:validate(Action0, ?PRODUCE_ACTION_SPEC) of
         Action1 ->
             {ok, Action1}
     catch
-       _:Reason->
-            {error, Reason}
+        error:#{code := _} = Reason ->
+            {error, Reason};
+        error:no_kafka_client_configured ->
+            {error, no_kafka_client_configured}
     end.
-
 
 -doc """
 Execute the action by producing a message to Kafka via `brod:produce_sync/5`.
@@ -395,88 +390,76 @@ Returns `{retry, client_down}` if the brod client is temporarily
 unavailable.
 """.
 apply_action(Action) ->
-    try
-        #{
-            <<"type">> := ActionType,
-            <<"topic">> := Topic,
-            <<"key">> := Key,
-            <<"value">> := Value,
-            <<"options">> := Opts
-        } = Action,
-        #{
-            <<"client_id">> := Client,
-            <<"encoding">> := Enc,
-            <<"acknowledge">> := _Ack
-        } = Opts,
-        Part = partition(Opts),
-        Data = bondy_utils:maybe_encode(Enc, Value),
+    #{
+        <<"type">> := <<"produce_sync">>,
+        <<"topic">> := Topic,
+        <<"key">> := Key,
+        <<"value">> := Value,
+        <<"options">> := Opts
+    } = Action,
+    #{
+        <<"client_id">> := Client,
+        <<"encoding">> := Enc,
+        <<"acknowledge">> := _Ack
+    } = Opts,
 
-        Result = case ActionType of
-            %% <<"produce">> ->
-            %%     brod:produce(Client, Topic, Part, Key, Data);
-            <<"produce_sync">> ->
-                brod:produce_sync(Client, Topic, Part, Key, Data)
-        end,
-
-        case Result of
-            ok ->
-                ok;
-            {ok, _Offset} ->
-                ok;
-            {error, client_down} ->
-                {retry, client_down};
-            {error, Reason} ->
-                {error, Reason}
-        end
+    try bondy_router_utils:maybe_encode(Enc, Value) of
+        Data ->
+            case brod:produce_sync(Client, Topic, partition(Opts), Key, Data) of
+                ok ->
+                    ok;
+                {error, client_down} ->
+                    {retry, client_down};
+                {error, Reason} ->
+                    {error, Reason}
+            end
     catch
-        Class:EReason:Stacktrace ->
-            ?LOG_ERROR(#{
-                description => "Error while evaluating action",
-                class => Class,
-                reason => EReason,
-                stacktrace => Stacktrace
-            }),
-            {error, EReason}
+        error:{invalid_byte, _} = Reason ->
+            {error, Reason};
+        error:{unsupported_type, _} = Reason ->
+            {error, Reason};
+        error:{badarg, _} = Reason ->
+            {error, Reason}
     end.
-
 
 -doc "Stop the `hash` and `brod` applications.".
 terminate(_Reason, _State) ->
-    _  = application:stop(hash),
-    _  = application:stop(brod),
+    _ = application:stop(hash),
+    _ = application:stop(brod),
     ok.
-
-
 
 %% =============================================================================
 %% PRIVATE
 %% =============================================================================
 
-
-
-
-get_client() ->
+%% The bridge record the manager stores carries the configuration this bridge
+%% was initialised with; its `clients` are `{Name, Opts}` pairs.
+default_client() ->
     case bondy_broker_bridge_manager:bridge(?MODULE) of
         undefined ->
-            {error, not_found};
-        PL ->
-            case lists:keyfind(clients, 1, PL) of
-                {clients, [H|_]} ->
-                    {ok, H};
-                false ->
-                    {error, not_found}
+            false;
+        #{config := Config} ->
+            case key_value:get(clients, Config, []) of
+                [{Name, _Opts} | _] ->
+                    {ok, Name};
+                [] ->
+                    false
             end
     end.
 
-
-%% -----------------------------------------------------------------------------
 %% @private
-%% @doc Returns a brod partition() or partitioner().
-%% @end
-%% -----------------------------------------------------------------------------
+default_client_id() ->
+    case default_client() of
+        {ok, Name} ->
+            Name;
+        false ->
+            error(no_kafka_client_configured)
+    end.
+
+%% @private
+-doc "Returns a brod `partition()` or `partitioner()`.".
 partition(#{<<"partition">> := N}) when is_integer(N) ->
     N;
-
 partition(#{<<"partitioner">> := Map}) ->
     case maps:get(<<"algorithm">>, Map) of
         <<"random">> ->
@@ -488,12 +471,13 @@ partition(#{<<"partitioner">> := Map}) ->
             PartValue = maps:get(<<"value">>, Map),
 
             fun(_Topic, PartCount, K, _V) ->
-                Hash = case PartValue of
-                    undefined ->
-                        hash:Type(K);
-                    PartValue ->
-                        hash:Type(PartValue)
-                end,
+                Hash =
+                    case PartValue of
+                        undefined ->
+                            hash:Type(K);
+                        PartValue ->
+                            hash:Type(PartValue)
+                    end,
                 {ok, Hash rem PartCount}
             end
     end.

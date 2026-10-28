@@ -1,0 +1,139 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_oauth2_api).
+-moduledoc """
+Implements the `bondy_wamp_api` behaviour for the OAuth2 administration
+WAMP procedures (client and resource owner management, and token
+revocation).
+""".
+-behaviour(bondy_wamp_api).
+
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("bondy.hrl").
+-include("bondy_uris.hrl").
+
+-export([handle_call/3]).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-spec handle_call(
+    Proc :: uri(), M :: bondy_wamp_message:call(), Ctxt :: bondy_context:t()
+) ->
+    ok
+    | continue
+    | {continue, uri() | wamp_call()}
+    | {continue, uri() | wamp_call(), fun(
+        (Reason :: any()) -> wamp_error() | undefined
+    )}
+    | {reply, wamp_result() | wamp_error()}.
+
+handle_call(?BONDY_OAUTH2_CLIENT_ADD, #call{} = M, Ctxt) ->
+    [Uri, Data] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
+
+    case bondy_oauth2_client:add(Uri, Data) of
+        {ok, Client} ->
+            Ext = bondy_oauth2_client:to_external(Client),
+            R = bondy_wamp_message:result(M#call.request_id, #{}, [Ext]),
+            {reply, R};
+        {error, Reason} ->
+            E = bondy_wamp_api_utils:error(Reason, M),
+            {reply, E}
+    end;
+handle_call(?BONDY_OAUTH2_CLIENT_DELETE, #call{} = M, Ctxt) ->
+    [Uri, Username] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
+    case bondy_oauth2_client:remove(Uri, Username) of
+        ok ->
+            R = bondy_wamp_message:result(M#call.request_id, #{}),
+            {reply, R};
+        {error, Reason} ->
+            E = bondy_wamp_api_utils:error(Reason, M),
+            {reply, E}
+    end;
+handle_call(?BONDY_OAUTH2_CLIENT_UPDATE, #call{} = M, Ctxt) ->
+    [Uri, Username, Info] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 3),
+    case bondy_oauth2_client:update(Uri, Username, Info) of
+        {ok, Client} ->
+            Ext = bondy_oauth2_client:to_external(Client),
+            R = bondy_wamp_message:result(M#call.request_id, #{}, [Ext]),
+            {reply, R};
+        {error, Reason} ->
+            E = bondy_wamp_api_utils:error(Reason, M),
+            {reply, E}
+    end;
+%% Never implemented on this line. `bondy_wamp_api:resolve/1` maps the legacy
+%% `bondy.api_gateway.fetch_client` / `list_clients` aliases here, so without
+%% these clauses a caller of either reaches the catch-all below and is told the
+%% procedure does not exist — which is true of the resolved URI but not of the
+%% one they called. `deprecated_procedure_error/1` reports the URI the CALLER
+%% sent, so the answer names the alias they used.
+handle_call(?BONDY_OAUTH2_CLIENT_GET, #call{} = M, _Ctxt) ->
+    E = bondy_wamp_api_utils:deprecated_procedure_error(M),
+    {reply, E};
+handle_call(?BONDY_OAUTH2_CLIENT_LIST, #call{} = M, _Ctxt) ->
+    E = bondy_wamp_api_utils:deprecated_procedure_error(M),
+    {reply, E};
+handle_call(?BONDY_OAUTH2_RES_OWNER_ADD, #call{} = M, Ctxt) ->
+    [Uri, Data] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
+
+    case bondy_oauth2_resource_owner:add(Uri, Data) of
+        {ok, User} ->
+            Ext = bondy_oauth2_resource_owner:to_external(User),
+            R = bondy_wamp_message:result(M#call.request_id, #{}, [Ext]),
+            {reply, R};
+        {error, Reason} ->
+            E = bondy_wamp_api_utils:error(Reason, M),
+            {reply, E}
+    end;
+handle_call(?BONDY_OAUTH2_RES_OWNER_DELETE, #call{} = M, Ctxt) ->
+    [Uri, Username] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
+    case bondy_oauth2_resource_owner:remove(Uri, Username) of
+        ok ->
+            R = bondy_wamp_message:result(M#call.request_id, #{}),
+            {reply, R};
+        {error, Reason} ->
+            E = bondy_wamp_api_utils:error(Reason, M),
+            {reply, E}
+    end;
+handle_call(?BONDY_OAUTH2_RES_OWNER_UPDATE, #call{} = M, Ctxt) ->
+    [Uri, Username, Info] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 3),
+    case bondy_oauth2_resource_owner:update(Uri, Username, Info) of
+        {ok, User} ->
+            Ext = bondy_oauth2_resource_owner:to_external(User),
+            R = bondy_wamp_message:result(M#call.request_id, #{}, [Ext]),
+            {reply, R};
+        {error, Reason} ->
+            E = bondy_wamp_api_utils:error(Reason, M),
+            {reply, E}
+    end;
+handle_call(?BONDY_OAUTH2_RES_OWNER_GET, #call{} = M, _Ctxt) ->
+    E = bondy_wamp_api_utils:deprecated_procedure_error(M),
+    {reply, E};
+handle_call(?BONDY_OAUTH2_RES_OWNER_LIST, #call{} = M, _Ctxt) ->
+    E = bondy_wamp_api_utils:deprecated_procedure_error(M),
+    {reply, E};
+handle_call(?BONDY_OAUTH2_TOKEN_LOOKUP, #call{} = M, _Ctxt) ->
+    E = bondy_wamp_api_utils:deprecated_procedure_error(M),
+    {reply, E};
+handle_call(?BONDY_OAUTH2_TOKEN_REVOKE, #call{} = M, Ctxt) ->
+    Result =
+        case bondy_wamp_api_utils:validate_call_args(M, Ctxt, 3, 3) of
+            [RealmUri, _ClientId, RefreshToken] ->
+                bondy_oauth_token:revoke(RealmUri, RefreshToken)
+        end,
+
+    R = bondy_wamp_api_utils:maybe_error(Result, M),
+    {reply, R};
+handle_call(?BONDY_OAUTH2_TOKEN_REVOKE_ALL, #call{} = M, Ctxt) ->
+    [RealmUri, _ClientId, Authid] =
+        bondy_wamp_api_utils:validate_call_args(M, Ctxt, 3),
+    Result = bondy_oauth_token:revoke_all(RealmUri, Authid),
+    R = bondy_wamp_api_utils:maybe_error(Result, M),
+    {reply, R};
+handle_call(_, #call{} = M, _) ->
+    E = bondy_wamp_api_utils:no_such_procedure_error(M),
+    {reply, E}.

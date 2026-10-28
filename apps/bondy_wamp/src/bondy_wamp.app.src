@@ -11,8 +11,11 @@
   {applications,
    [kernel,
     stdlib,
+    crypto,
+    public_key,
+    bondy_connect_lib,
     bondy_cbor,
-    msgpack,
+    bondy_msgpack,
     bert,
     utils,
     app_config

@@ -9,7 +9,6 @@
 -include_lib("bondy_wamp.hrl").
 -compile(export_all).
 
-
 all() ->
     [
         test_strict,
@@ -20,10 +19,9 @@ all() ->
         validate_wildcard,
         validate_wildcard_error,
         empty_uri,
+        control_chars_rejected,
         match
     ].
-
-
 
 init_per_suite(Config) ->
     _ = application:ensure_all_started(bondy_wamp),
@@ -32,7 +30,6 @@ init_per_suite(Config) ->
 
 end_per_suite(_) ->
     ok.
-
 
 test_strict(_) ->
     List = [
@@ -91,7 +88,6 @@ validate_exact_error(_) ->
         List
     ).
 
-
 validate_prefix(_) ->
     List = [
         <<>>,
@@ -131,7 +127,6 @@ validate_prefix_error(_) ->
         List
     ).
 
-
 validate_wildcard(_) ->
     List = [
         <<".">>,
@@ -153,21 +148,19 @@ validate_wildcard(_) ->
         List
     ).
 
-
 validate_wildcard_error(_) ->
     List = [
         <<>>
     ],
     lists:foreach(
         fun(URI) ->
-          ?assertError(
+            ?assertError(
                 {invalid_uri, URI},
                 bondy_wamp_uri:validate(URI, ?WILDCARD_MATCH)
             )
         end,
         List
     ).
-
 
 empty_uri(_) ->
     bondy_wamp_config:set(uri_strictness, strict),
@@ -192,7 +185,31 @@ empty_uri(_) ->
 
     ok.
 
-
+%% The loose component class rejects every control character, NUL included
+%% (PCRE `\s` does not cover NUL).
+control_chars_rejected(_) ->
+    Bad = [
+        <<"a", 0, "b">>,
+        <<"a", 0, "b.c">>,
+        <<"a.b", 0>>,
+        <<0, "a">>,
+        <<"a", 1, "b">>,
+        <<"a", 16#1F, "b">>,
+        <<"a", 16#7F, "b">>
+    ],
+    [
+        begin
+            ?assertEqual(false, bondy_wamp_uri:is_valid(U, loose)),
+            ?assertEqual(false, bondy_wamp_uri:is_valid(U, loose_prefix)),
+            ?assertEqual(false, bondy_wamp_uri:is_valid(U, loose_allow_empty)),
+            ?assertEqual(false, bondy_wamp_uri:is_valid(U, strict))
+        end
+     || U <- Bad
+    ],
+    %% Ordinary printable URIs are unaffected.
+    ?assert(bondy_wamp_uri:is_valid(<<"com.example.thing">>, loose)),
+    ?assert(bondy_wamp_uri:is_valid(<<"com.Example-Thing_1">>, loose)),
+    ok.
 
 match(Config) ->
     bondy_wamp_config:set(uri_strictness, strict),
@@ -200,7 +217,6 @@ match(Config) ->
 
     bondy_wamp_config:set(uri_strictness, loose),
     do_match(Config).
-
 
 do_match(_) ->
     ?assertError(badarg, bondy_wamp_uri:match(<<>>, <<"a">>, ?EXACT_MATCH)),
@@ -213,9 +229,48 @@ do_match(_) ->
     ?assert(bondy_wamp_uri:match(<<"a.">>, <<"a">>, ?PREFIX_MATCH)),
     ?assert(bondy_wamp_uri:match(<<"a.b">>, <<"a">>, ?PREFIX_MATCH)),
 
+    %% Prefix matching is component-boundary-aware: the grant `com.app.order`
+    %% does not cover `com.app.orders_admin.x`.
+    ?assertEqual(
+        false,
+        bondy_wamp_uri:match(
+            <<"com.app.orders_admin.x">>, <<"com.app.order">>, ?PREFIX_MATCH
+        )
+    ),
+    ?assertEqual(
+        false,
+        bondy_wamp_uri:match(
+            <<"com.app.orders">>, <<"com.app.order">>, ?PREFIX_MATCH
+        )
+    ),
+    %% ... but genuine sub-URIs and the exact URI still match.
+    ?assert(
+        bondy_wamp_uri:match(
+            <<"com.app.order.secret">>, <<"com.app.order">>, ?PREFIX_MATCH
+        )
+    ),
+    ?assert(
+        bondy_wamp_uri:match(
+            <<"com.app.order">>, <<"com.app.order">>, ?PREFIX_MATCH
+        )
+    ),
+    %% The empty "any" prefix still matches every URI.
+    ?assert(
+        bondy_wamp_uri:match(<<"com.app.orders_admin">>, <<>>, ?PREFIX_MATCH)
+    ),
+
+    %% A trailing-dot pattern (the operator wrote the boundary explicitly) still
+    %% matches sub-URIs but not a byte-prefix sibling.
+    ?assert(
+        bondy_wamp_uri:match(<<"com.api.foo">>, <<"com.api.">>, ?PREFIX_MATCH)
+    ),
+    ?assertEqual(
+        false,
+        bondy_wamp_uri:match(<<"com.apix.foo">>, <<"com.api.">>, ?PREFIX_MATCH)
+    ),
+
     ?assert(bondy_wamp_uri:match(<<"a">>, <<"a">>, ?WILDCARD_MATCH)),
     ?assert(bondy_wamp_uri:match(<<"a.b">>, <<".">>, ?WILDCARD_MATCH)),
     ?assert(bondy_wamp_uri:match(<<"a.b">>, <<"a.">>, ?WILDCARD_MATCH)),
     ?assert(bondy_wamp_uri:match(<<"a.b">>, <<".b">>, ?WILDCARD_MATCH)),
     ?assert(bondy_wamp_uri:match(<<"a.b">>, <<"a.b">>, ?WILDCARD_MATCH)).
-

@@ -1,26 +1,52 @@
 
-aae.data_exchange_timeout = 1m
-aae.enabled = on
-aae.exchange_timer = 1m
-aae.hashtree_timer = 10s
-aae.hashtree_ttl = 1w
-admin_api.http.acceptors_pool_size = 50
-admin_api.http.backlog = 1024
-admin_api.http.enabled = on
-admin_api.http.ip = 0.0.0.0
-admin_api.http.ip_version = 4
-admin_api.http.keepalive = off
-admin_api.http.max_connections = 1000
-admin_api.http.nodelay = on
-admin_api.http.port = 18081
-api_gateway.http.acceptors_pool_size = 200
-api_gateway.http.backlog = 4096
-api_gateway.http.ip = 0.0.0.0
-api_gateway.http.ip_version = 4
-api_gateway.http.keepalive = off
-api_gateway.http.max_connections = 500000
-api_gateway.http.nodelay = on
-api_gateway.http.port = 18080
+## Anti-entropy. The old `aae.*` family (data_exchange_timeout, exchange_timer,
+## hashtree_timer, hashtree_ttl) described a hashtree/exchange mechanism that no
+## longer exists: replication is now a bondy_db sync scheduler that ticks and
+## dispatches sync sessions against peers, so the only equivalent knobs are the
+## on/off flag and the tick interval. The remaining cadence, concurrency and
+## fence knobs (db.aae.live_sync, db.aae.max_concurrency, db.aae.fanout,
+## db.aae.fence.*) are left at their defaults.
+db.aae = on
+db.aae.interval = 500ms
+## Listeners are declared under `listeners.*`. A listener that is not declared
+## does not exist, which is why the TLS variants this deployment used to switch
+## off explicitly are simply absent.
+##
+## `admin` is the reserved name for the administrable listener; the other two
+## keep their historical names.
+##
+## `http.idle_timeout` and `http.active_n` are stated explicitly on both HTTP
+## listeners because Cowboy's own defaults differ from the values they have
+## always run with: 60s rather than 15s, and `active_n` 1 rather than 100
+## (`cowboy_http.erl:214,336`).
+listeners.admin.transport = tcp
+listeners.admin.protocol = http
+listeners.admin.port = 18081
+listeners.admin.start_phase = early
+listeners.admin.services = admin_api, wamp_ws, admin, metrics
+listeners.admin.ip = 0.0.0.0
+listeners.admin.ip_version = 4
+listeners.admin.acceptors_pool_size = 50
+listeners.admin.max_connections = 1000
+listeners.admin.backlog = 1024
+listeners.admin.keepalive = off
+listeners.admin.nodelay = on
+listeners.admin.http.idle_timeout = 15s
+listeners.admin.http.active_n = 100
+
+listeners.api_gateway_http.transport = tcp
+listeners.api_gateway_http.protocol = http
+listeners.api_gateway_http.port = 18080
+listeners.api_gateway_http.services = api_gateway, wamp_ws, wamp_sse, wamp_longpoll
+listeners.api_gateway_http.ip = 0.0.0.0
+listeners.api_gateway_http.ip_version = 4
+listeners.api_gateway_http.acceptors_pool_size = 200
+listeners.api_gateway_http.max_connections = 500000
+listeners.api_gateway_http.backlog = 4096
+listeners.api_gateway_http.keepalive = off
+listeners.api_gateway_http.nodelay = on
+listeners.api_gateway_http.http.idle_timeout = 15s
+listeners.api_gateway_http.http.active_n = 100
 cluster.automatic_leave = off
 cluster.channels.control_plane.compression = on
 cluster.channels.control_plane.parallelism = 1
@@ -44,31 +70,41 @@ cluster.peer_discovery.timeout = 5s
 cluster.peer_discovery.type = dns
 cluster.peer_ip = ${FLY_PRIVATE_IP}
 cluster.peer_port = 18086
+## A node that auto-clusters refuses to boot when its Partisan peer plane is
+## plaintext, unless the operator acknowledges it here. This deployment runs the
+## peer plane over Fly's private 6PN network with no cluster mTLS provisioned,
+## so the acknowledgement is required. Deployments off a trusted network should
+## instead set cluster.tls.enabled = on with verify_peer and a private CA.
+cluster.tls.allow_insecure = on
 log.handlers.default.level = info
 log.level = info
 platform_data_dir=${BONDY_DATA_DIR}
 security.config_file = ${BONDY_ETC_DIR}/security_config.json
 shutdown.grace_period = 20s
-startup.wait_for_store_aae_exchange = off
-startup.wait_for_store_hashtrees = on
-startup.wait_for_store_partitions = on
-vm.cpu.dirty_schedulers.busy_wait_threshold = none
-vm.cpu.schedulers.busy_wait_threshold = none
-vm.io.dirty_schedulers = 16
-vm.io.dirty_schedulers.busy_wait_threshold = none
+vm.cpu.dirty_scheduler.busy_wait_threshold = none
+vm.cpu.scheduler.busy_wait_threshold = none
+vm.io.dirty_scheduler.busy_wait_threshold = none
+vm.io.dirty_scheduler.number = 16
 vm.memory_allocators.super_carrier_only = off
 vm.memory_allocators.super_carrier_size = 0MB
-vm.port_limit = 500000
-vm.process_limit = 500000
-wamp.tcp.acceptors_pool_size = 200
-wamp.tcp.backlog = 1024
-wamp.tcp.enabled = on
-wamp.tcp.ip = ${FLY_PRIVATE_IP}
-wamp.tcp.ip_version = 6
-wamp.tcp.keepalive = on
-wamp.tcp.max_connections = 100000
-wamp.tcp.nodelay = on
-wamp.tcp.port = 18082
+vm.port.limit = 500000
+vm.process.limit = 500000
+## The raw-socket WAMP listener binds Fly's private 6PN address. It has no
+## Cowboy protocol options, so there is nothing to restate for it.
+listeners.wamp_tcp.transport = tcp
+listeners.wamp_tcp.protocol = wamp_rawsocket
+listeners.wamp_tcp.port = 18082
+listeners.wamp_tcp.ip = ${FLY_PRIVATE_IP}
+listeners.wamp_tcp.ip_version = 6
+listeners.wamp_tcp.acceptors_pool_size = 200
+listeners.wamp_tcp.max_connections = 100000
+listeners.wamp_tcp.backlog = 1024
+listeners.wamp_tcp.keepalive = on
+listeners.wamp_tcp.nodelay = on
 ## Autobahn Python doesn't support pings
-wamp.tcp.ping.enabled = off
-wamp.websocket.ping.enabled = off
+listeners.wamp_tcp.ping.enabled = off
+
+## Global carrier fallback, still a global key: it applies to every listener
+## offering WebSocket that does not override it.
+listeners.admin.websocket.ping.enabled = off
+listeners.api_gateway_http.websocket.ping.enabled = off
