@@ -123,6 +123,7 @@ end}.
 {mapping, "mail.relay.$name.port", "bondy_mail.relays", [
   {datatype, integer},
   {default, 587},
+  {commented, 587},
   {validators, ["positive_integer"]}
 ]}.
 
@@ -135,7 +136,8 @@ end}.
 %% -----------------------------------------------------------------------------
 {mapping, "mail.relay.$name.transport", "bondy_mail.relays", [
   {datatype, {enum, [plain, starttls, tls]}},
-  {default, starttls}
+  {default, starttls},
+  {commented, starttls}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -156,7 +158,8 @@ end}.
 %% -----------------------------------------------------------------------------
 {mapping, "mail.relay.$name.secret.provider", "bondy_mail.relays", [
   {datatype, {enum, [none, env, aws_sm]}},
-  {default, none}
+  {default, none},
+  {commented, none}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -196,7 +199,8 @@ end}.
 %% -----------------------------------------------------------------------------
 {mapping, "mail.relay.$name.secret.encoding", "bondy_mail.relays", [
   {datatype, {enum, [raw, base64]}},
-  {default, raw}
+  {default, raw},
+  {commented, raw}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -208,7 +212,8 @@ end}.
 %% -----------------------------------------------------------------------------
 {mapping, "mail.relay.$name.auth", "bondy_mail.relays", [
   {datatype, {enum, [always, if_available, never]}},
-  {default, if_available}
+  {default, if_available},
+  {commented, if_available}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -217,7 +222,8 @@ end}.
 %% -----------------------------------------------------------------------------
 {mapping, "mail.relay.$name.tls.verify", "bondy_mail.relays", [
   {datatype, {enum, [verify_peer, verify_none]}},
-  {default, verify_peer}
+  {default, verify_peer},
+  {commented, verify_peer}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -271,6 +277,7 @@ end}.
 {mapping, "mail.relay.$name.pool.size", "bondy_mail.relays", [
   {datatype, integer},
   {default, 4},
+  {commented, 4},
   {validators, ["positive_integer"]}
 ]}.
 
@@ -288,6 +295,7 @@ end}.
 {mapping, "mail.relay.$name.queue.max_size", "bondy_mail.relays", [
   {datatype, integer},
   {default, 1000},
+  {commented, 1000},
   {validators, ["positive_integer"]}
 ]}.
 
@@ -303,6 +311,7 @@ end}.
 {mapping, "mail.relay.$name.queue.max_bytes", "bondy_mail.relays", [
   {datatype, bytesize},
   {default, "64MB"},
+  {commented, "64MB"},
   {validators, ["positive_integer"]}
 ]}.
 
@@ -312,7 +321,8 @@ end}.
 %% -----------------------------------------------------------------------------
 {mapping, "mail.relay.$name.queue.ttl", "bondy_mail.relays", [
   {datatype, {duration, ms}},
-  {default, "5m"}
+  {default, "5m"},
+  {commented, "5m"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -321,7 +331,8 @@ end}.
 %% -----------------------------------------------------------------------------
 {mapping, "mail.relay.$name.timeout", "bondy_mail.relays", [
   {datatype, {duration, ms}},
-  {default, "30s"}
+  {default, "30s"},
+  {commented, "30s"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -332,6 +343,7 @@ end}.
 {mapping, "mail.relay.$name.retry.max_attempts", "bondy_mail.relays", [
   {datatype, integer},
   {default, 3},
+  {commented, 3},
   {validators, ["non_negative_integer"]}
 ]}.
 
@@ -342,7 +354,8 @@ end}.
 %% -----------------------------------------------------------------------------
 {mapping, "mail.relay.$name.retry.backoff.min", "bondy_mail.relays", [
   {datatype, {duration, ms}},
-  {default, "1s"}
+  {default, "1s"},
+  {commented, "1s"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -351,7 +364,8 @@ end}.
 %% -----------------------------------------------------------------------------
 {mapping, "mail.relay.$name.retry.backoff.max", "bondy_mail.relays", [
   {datatype, {duration, ms}},
-  {default, "1m"}
+  {default, "1m"},
+  {commented, "1m"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -365,6 +379,7 @@ end}.
   %% or to double.
   {datatype, [integer, float]},
   {default, 0},
+  {commented, 0},
   {validators, ["non_negative_number"]}
 ]}.
 
@@ -375,6 +390,7 @@ end}.
 {mapping, "mail.relay.$name.rate_limit.burst", "bondy_mail.relays", [
   {datatype, integer},
   {default, 1},
+  {commented, 1},
   {validators, ["positive_integer"]}
 ]}.
 
@@ -385,7 +401,8 @@ end}.
 %% -----------------------------------------------------------------------------
 {mapping, "mail.relay.$name.max_message_size", "bondy_mail.relays", [
   {datatype, bytesize},
-  {default, "25MB"}
+  {default, "25MB"},
+  {commented, "25MB"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -398,6 +415,7 @@ end}.
 {mapping, "mail.relay.$name.max_recipients", "bondy_mail.relays", [
   {datatype, integer},
   {default, 100},
+  {commented, 100},
   {validators, ["positive_integer"]}
 ]}.
 
@@ -411,6 +429,7 @@ end}.
 {mapping, "mail.relay.$name.health.failure_threshold", "bondy_mail.relays", [
   {datatype, integer},
   {default, 3},
+  {commented, 3},
   {validators, ["positive_integer"]}
 ]}.
 
@@ -424,6 +443,7 @@ end}.
 {mapping, "mail.relay.$name.health.success_threshold", "bondy_mail.relays", [
   {datatype, integer},
   {default, 1},
+  {commented, 1},
   {validators, ["positive_integer"]}
 ]}.
 
