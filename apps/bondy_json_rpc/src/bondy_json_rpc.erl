@@ -41,7 +41,6 @@ carries no `id` because none could be read) and `{invalid_request, Id}`
 -export_type([notification/0]).
 
 -export([decode/1]).
--export([encode/1]).
 -export([error_object/2]).
 -export([error_object/3]).
 -export([error_response/3]).
@@ -66,12 +65,6 @@ decode(Bin) when is_binary(Bin) ->
     catch
         error:Reason -> {error, {parse_error, Reason}}
     end.
-
--doc "Encodes a response map (UTF-8 JSON binary).".
--spec encode(map()) -> binary().
-
-encode(Map) when is_map(Map) ->
-    iolist_to_binary(json:encode(Map)).
 
 -doc "A notification: a request without an `id`, expecting no response.".
 -spec notification(Method :: binary(), Params :: map()) -> map().

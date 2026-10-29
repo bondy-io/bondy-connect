@@ -107,7 +107,8 @@ groups() ->
             gis_fetch_token,
             gis_apply_auth_query_param,
             gis_fetch_error_in_body,
-            gis_fetch_no_token_in_response
+            gis_fetch_no_token_in_response,
+            gis_fetch_null_error_is_no_error
         ]}
     ].
 
@@ -249,6 +250,26 @@ gis_fetch_no_token_in_response(Config) ->
     Conf = gis_config(Config),
     Result = bondy_http_connector_auth_generic:fetch_token(Conf),
     ?assertMatch({error, no_token_in_response}, Result).
+
+%% A JSON `null` at `error_path` is no error. Covers `null` at the end of the
+%% path; does not cover `false` or an empty string there.
+gis_fetch_null_error_is_no_error(Config) ->
+    mock_auth_http_server:set_upstream_response(
+        200, ~"{\"token\":\"t\",\"error\":null}"
+    ),
+    Conf = #{
+        fetch => #{
+            method => get,
+            url => ~"{{base_url}}/api/token",
+            token_path => [~"token"],
+            error_path => [~"error"]
+        },
+        apply => #{placement => query_param, name => ~"token"},
+        vars => #{base_url => proplists:get_value(base_url, Config)}
+    },
+    ?assertEqual(
+        {ok, ~"t"}, bondy_http_connector_auth_generic:fetch_token(Conf)
+    ).
 
 %% ===================================================================
 %% Config builders

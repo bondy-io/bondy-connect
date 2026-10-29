@@ -380,7 +380,7 @@ route_kwargs(Method, Endpoint, KWArgs) when
 route_kwargs(_Method, Endpoint, KWArgs) ->
     case map_size(KWArgs) of
         0 -> {Endpoint, <<>>};
-        _ -> {Endpoint, iolist_to_binary(json:encode(KWArgs))}
+        _ -> {Endpoint, bondy_wamp_json:encode(KWArgs)}
     end.
 
 %% ===================================================================

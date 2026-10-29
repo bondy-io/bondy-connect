@@ -749,7 +749,7 @@ stub_dispatch(_, #{<<"id">> := Id}, Req0) ->
 reply_json(Status, Headers0, Payload, Req0) ->
     Headers = Headers0#{<<"content-type">> => <<"application/json">>},
     Req = cowboy_req:reply(
-        Status, Headers, bondy_json_rpc:encode(Payload), Req0
+        Status, Headers, json:encode(Payload), Req0
     ),
     {ok, Req, stub}.
 
@@ -790,7 +790,7 @@ reply_sse(Response, Req0) ->
 sse_event(Msg) ->
     [
         <<"event: message\ndata: ">>,
-        bondy_json_rpc:encode(Msg),
+        json:encode(Msg),
         <<"\n\n">>
     ].
 

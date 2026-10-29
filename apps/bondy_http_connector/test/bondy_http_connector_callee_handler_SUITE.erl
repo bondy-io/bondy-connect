@@ -38,6 +38,7 @@ running Bondy dealer or HTTP backend.
     route_post_with_kwargs/1,
     route_put_with_kwargs/1,
     route_patch_with_kwargs/1,
+    route_post_null_kwarg/1,
 
     error_uri_302/1,
     error_uri_400/1,
@@ -102,7 +103,8 @@ groups() ->
             route_post_empty_kwargs,
             route_post_with_kwargs,
             route_put_with_kwargs,
-            route_patch_with_kwargs
+            route_patch_with_kwargs,
+            route_post_null_kwarg
         ]},
         {error_mapping, [parallel], [
             error_uri_302,
@@ -324,6 +326,16 @@ route_patch_with_kwargs(_Config) ->
     ?assertEqual(<<"https://api.example.com/items/1">>, Url),
     Decoded = json:decode(Body),
     ?assertEqual(#{<<"status">> => <<"done">>}, Decoded).
+
+%% The router decodes a JSON `null` in a WAMP payload to `undefined`
+%% (`bondy_wamp_json:decode/1`); the upstream must receive `null`.
+route_post_null_kwarg(_Config) ->
+    {_, Body} = bondy_http_connector_callee_handler:route_kwargs(
+        post,
+        <<"https://api.example.com/items">>,
+        #{<<"note">> => undefined}
+    ),
+    ?assertEqual(#{<<"note">> => null}, json:decode(Body)).
 
 %% ===================================================================
 %% Error URI mapping tests

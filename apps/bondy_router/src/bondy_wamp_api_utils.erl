@@ -21,6 +21,13 @@ realm, and refuse a session asking to operate on a realm that is not its own
 unless it is the master realm. The defaulting is the point — a session already
 in a realm should not have to name it.
 
+The defaulting stops where it would make a call ambiguous. A procedure that
+also takes an optional trailing argument (`Min < Max`) must be given the realm:
+with it omitted, a call of `Min` arguments could be the realm plus the required
+ones, or the required ones plus the optional one, and only the count would
+decide. `bondy_wamp_api_arity_SUITE` checks the refusal for each such
+procedure.
+
 **A procedure with no realm argument** takes something else first — an id, a
 name, a document, or nothing at all. Use `call_args/3,4` or
 `admin_call_args/3,4`. They check the arity EXACTLY and do nothing else.
@@ -46,12 +53,12 @@ short call against every procedure in the second family.
 -include("bondy.hrl").
 
 -export([decode_call/1]).
+-export([entry_result/3]).
 -export([error/2]).
 -export([maybe_error/2]).
 -export([deprecated_procedure_error/1]).
 -export([no_such_procedure_error/1]).
 -export([no_such_procedure_error/3]).
--export([no_such_registration_error/1]).
 -export([node_spec/0]).
 -export([dry_run/1]).
 -export([dry_run_result/3]).
@@ -169,6 +176,34 @@ dry_run_result(#call{request_id = ReqId}, Would, Detail) when
     bondy_wamp_message:result(ReqId, #{}, [
         Detail#{~"dry_run" => true, ~"would" => Would}
     ]).
+
+-doc """
+A `bondy_registry_meta` read of the registration or subscription `Id`, with
+`not_found` replaced by the WAMP error the meta API specification names for it:
+`wamp.error.no_such_registration` or `wamp.error.no_such_subscription`.
+`unavailable` is kept: a node that may hold the entry could not be reached, so
+its absence is not confirmed.
+""".
+-spec entry_result(
+    Type :: registration | subscription,
+    Id :: id(),
+    Result :: {ok, term()} | {error, not_found | unavailable}
+) -> {ok, term()} | {error, bondy_connect_error:t() | unavailable}.
+
+entry_result(_, _, {ok, _} = OK) ->
+    OK;
+entry_result(registration, Id, {error, not_found}) ->
+    {error,
+        bondy_connect_error:new(no_such_registration, #{
+            details => #{registration_id => Id}
+        })};
+entry_result(subscription, Id, {error, not_found}) ->
+    {error,
+        bondy_connect_error:new(no_such_subscription, #{
+            details => #{subscription_id => Id}
+        })};
+entry_result(_, _, {error, unavailable} = Error) ->
+    Error.
 
 -doc """
 The `N` positional arguments of a call that takes NO realm argument.
@@ -581,12 +616,6 @@ no_such_procedure_error(ProcUri, MType, ReqId) ->
     }),
     bondy_wamp_error:to_wamp(Error, MType, ReqId, #{}).
 
-no_such_registration_error(RegId) when is_integer(RegId) ->
-    Error = bondy_connect_error:new(no_such_registration, #{
-        details => #{registration_id => RegId}
-    }),
-    bondy_wamp_error:to_wamp(Error, ?UNREGISTER, RegId, #{}).
-
 %% =============================================================================
 %% PRIVATE
 %% =============================================================================
@@ -660,8 +689,9 @@ exact_args(Msg, Min, Max) ->
 %% @private
 -doc """
 Validates that the first argument of the call is a RealmUri, defaulting to
-use the session Realm's uri if one is not provided. It uses the MinArity
-to determine whether the RealmUri argument is present or not.
+use the session Realm's uri if one is not provided and the procedure takes no
+optional argument. It uses the MinArity to determine whether the RealmUri
+argument is present or not.
 Once the Realm is established it validates it is is equal to the
 session's Realm or any other in case the session's realm is the root realm.
 """.
@@ -691,6 +721,14 @@ do_validate_call_args(Msg, _, _, Max, Len, _) when Len > Max ->
         <<"The procedure accepts at most ", (integer_to_binary(Max))/binary,
             " positional arguments.">>,
         #{maximum_arity => Max}
+    ),
+    error(E);
+do_validate_call_args(Msg, _, Min, Max, Len, _) when Min < Max, Len < Min ->
+    E = arity_error(
+        Msg,
+        <<"The procedure requires at least ", (integer_to_binary(Min))/binary,
+            " positional arguments, the realm included.">>,
+        #{minimum_arity => Min}
     ),
     error(E);
 do_validate_call_args(Msg, Ctxt, Min, _, Len, AdminOnly) when Len == 0 ->

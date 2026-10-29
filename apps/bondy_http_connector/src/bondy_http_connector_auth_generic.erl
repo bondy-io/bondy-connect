@@ -125,6 +125,11 @@ Performs the HTTP request described in the `fetch` section of the config,
 extracts the token using `token_path`, and optionally reads `expires_in_path`
 to return TTL metadata for the cache.
 
+When `error_path` is set, any value at that path except JSON `null` makes the
+fetch return `{error, {upstream_error, Msg}}`
+(`bondy_http_connector_auth_integration_SUITE:gis_fetch_error_in_body/1`,
+`gis_fetch_null_error_is_no_error/1`).
+
 ## Examples
 
 ```erlang
@@ -328,6 +333,8 @@ check_error(_Data, undefined) ->
     ok;
 check_error(Data, ErrorPath) ->
     case walk_path(Data, ErrorPath) of
+        {ok, null} ->
+            ok;
         {ok, Msg} when is_binary(Msg) ->
             {error, {upstream_error, Msg}};
         {ok, _} ->

@@ -1440,41 +1440,6 @@
                         }
                     }
                 },
-                "/realms/:realm_uri/registrations_summary" : {
-                    "is_collection" : true,
-                    "options": {
-                        "action": {},
-                        "response": {
-                            "on_error": {
-                                "body": ""
-                            },
-                            "on_result": {
-                                "body": ""
-                            }
-                        }
-                    },
-                    "get" : {
-                        "action" : {
-                            "type" : "wamp_call",
-                            "procedure" : "wamp.registration.list",
-                            "options" : {},
-                            "args" : [
-                                "{{request.bindings.realm_uri}}"
-                            ],
-                            "kwargs" : {
-                            }
-                        },
-                        "response" : {
-                           "on_error" : {
-                                "body" : "{{variables.wamp_error_body}}"
-                            },
-                            "on_result" : {
-                                "body" :
-                                    "{{action.result.args |> head}}"
-                            }
-                        }
-                    }
-                },
                 "/realms/:realm_uri/registrations/:id" : {
                     "is_collection" : false,
                     "options": {
@@ -1491,7 +1456,7 @@
                     "get" : {
                         "action" : {
                             "type" : "wamp_call",
-                            "procedure" : "wamp.registration.get",
+                            "procedure" : "bondy.registration.get",
                             "options" : {},
                             "args" : [
                                 "{{request.bindings.realm_uri}}",
@@ -1527,7 +1492,7 @@
                     "get" : {
                         "action" : {
                             "type" : "wamp_call",
-                            "procedure" : "wamp.registration.list_callees",
+                            "procedure" : "bondy.registration.list_callees",
                             "options" : {},
                             "args" : [
                                 "{{request.bindings.realm_uri}}",
@@ -1564,41 +1529,6 @@
                         "action" : {
                             "type" : "wamp_call",
                             "procedure" : "bondy.subscription.list",
-                            "options" : {},
-                            "args" : [
-                                "{{request.bindings.realm_uri}}"
-                            ],
-                            "kwargs" : {
-                            }
-                        },
-                        "response" : {
-                           "on_error" : {
-                                "body" : "{{variables.wamp_error_body}}"
-                            },
-                            "on_result" : {
-                                "body" :
-                                    "{{action.result.args |> head}}"
-                            }
-                        }
-                    }
-                },
-                "/realms/:realm_uri/subscriptions_summary" : {
-                    "is_collection" : true,
-                    "options": {
-                        "action": {},
-                        "response": {
-                            "on_error": {
-                                "body": ""
-                            },
-                            "on_result": {
-                                "body": ""
-                            }
-                        }
-                    },
-                    "get" : {
-                        "action" : {
-                            "type" : "wamp_call",
-                            "procedure" : "wamp.subscription.list",
                             "options" : {},
                             "args" : [
                                 "{{request.bindings.realm_uri}}"

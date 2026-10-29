@@ -157,6 +157,7 @@
         {uri_strictness, loose}
     ]},
     {bondy_router, [
+        {json, [{float_format, [short]}]},
         %% Each name matches its option block further down, which is what makes
         %% the block reach it: a listener's options are read under its CURRENT
         %% name. The admin listener is `admin' -- the reserved name -- so

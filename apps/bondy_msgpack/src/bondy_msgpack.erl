@@ -28,12 +28,24 @@ Both str and bin decode to a binary. Extension types have no Erlang mapping
 here and are rejected, as are the reserved type `0xC1`,
 truncated input and trailing bytes. Encoding any other term, or an integer
 outside the 64-bit range, raises `badarg`.
+
+`encode/2` lets the caller map other terms. It takes an encoder with the
+contract of OTP `json:encode/2`: the encoder receives each value and the
+encoder itself, and returns the value's encoding. `encode_value/2` and
+`encode_key_value_list/2` are the building blocks it falls back on.
 """.
 
 -define(MAX_UINT64, 16#FFFFFFFFFFFFFFFF).
 -define(MIN_INT64, -16#8000000000000000).
 
+-type encoder() :: fun((term(), encoder()) -> iodata()).
+
+-export_type([encoder/0]).
+
 -export([encode/1]).
+-export([encode/2]).
+-export([encode_value/2]).
+-export([encode_key_value_list/2]).
 -export([encode_integer/1]).
 -export([encode_float/1]).
 -export([encode_binary/1]).
@@ -52,6 +64,45 @@ MessagePack form.
 
 encode(Term) ->
     encode_value(Term).
+
+-doc """
+Encodes `Term` as MessagePack, calling `Encoder` on every value, including
+`Term` and each array element and map value. Map keys are encoded as by
+`encode/1`.
+""".
+-spec encode(term(), encoder()) -> iodata() | no_return().
+
+encode(Term, Encoder) when is_function(Encoder, 2) ->
+    Encoder(Term, Encoder).
+
+-doc """
+Encodes one value as `encode/1` does, but encodes the elements of an array and
+the values of a map with `Encode`.
+""".
+-spec encode_value(term(), encoder()) -> iodata() | no_return().
+
+encode_value(List, Encode) when is_list(List) ->
+    [encode_array_head(length(List)) | [Encode(E, Encode) || E <- List]];
+encode_value(Map, Encode) when is_map(Map) ->
+    [
+        encode_map_head(map_size(Map))
+        | encode_map_pairs(maps:iterator(Map), Encode)
+    ];
+encode_value(Term, _) ->
+    encode_value(Term).
+
+-doc """
+Encodes a list of `{Key, Value}` pairs as a MessagePack map, values with
+`Encode`. Duplicate keys are not checked.
+""".
+-spec encode_key_value_list([{term(), term()}], encoder()) ->
+    iodata() | no_return().
+
+encode_key_value_list(List, Encode) when is_list(List) ->
+    [
+        encode_map_head(length(List))
+        | [[encode_value(K), Encode(V, Encode)] || {K, V} <- List]
+    ].
 
 -doc """
 Encodes an integer as the smallest MessagePack int or uint that holds it.
@@ -360,6 +411,19 @@ encode_map_pairs(Iter) ->
             [];
         {K, V, Next} ->
             [encode_value(K), encode_value(V) | encode_map_pairs(Next)]
+    end.
+
+%% @private
+encode_map_pairs(Iter, Encode) ->
+    case maps:next(Iter) of
+        none ->
+            [];
+        {K, V, Next} ->
+            [
+                encode_value(K),
+                Encode(V, Encode)
+                | encode_map_pairs(Next, Encode)
+            ]
     end.
 
 %% @private

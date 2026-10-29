@@ -235,7 +235,6 @@ get_cancellation_reaps_workers(Config) ->
 %% "no such registration"), `not_found` -> a different (registration) error URI,
 %% and `{ok, _}` -> a result, never an error.
 wamp_get_maps_engine_outcomes_to_uris(Config) ->
-    RealmUri = ?config(realm_uri, Config),
     Ctxt = ?config(context, Config),
 
     ok = meck:new(bondy_registry_meta, [passthrough]),
@@ -244,19 +243,19 @@ wamp_get_maps_engine_outcomes_to_uris(Config) ->
             bondy_registry_meta, get, fun(_, _, _) -> {error, unavailable} end
         ),
         ?assertEqual(
-            <<"bondy.error.unavailable">>, wamp_get_error_uri(RealmUri, Ctxt)
+            <<"bondy.error.unavailable">>, wamp_get_error_uri(Ctxt)
         ),
 
         ok = meck:expect(
             bondy_registry_meta, get, fun(_, _, _) -> {error, not_found} end
         ),
-        NotFoundUri = wamp_get_error_uri(RealmUri, Ctxt),
+        NotFoundUri = wamp_get_error_uri(Ctxt),
         ?assertNotEqual(<<"bondy.error.unavailable">>, NotFoundUri),
 
         ok = meck:expect(
             bondy_registry_meta, get, fun(_, _, _) -> {ok, #{id => 1}} end
         ),
-        ?assertMatch({reply, #result{}}, wamp_get(RealmUri, Ctxt))
+        ?assertMatch({reply, #result{}}, wamp_get(Ctxt))
     after
         ok = meck:unload(bondy_registry_meta)
     end.
@@ -308,16 +307,16 @@ uri(I) ->
     <<"com.meta.p.", Suffix/binary>>.
 
 %% @private
-wamp_get_error_uri(RealmUri, Ctxt) ->
-    {reply, #error{error_uri = Uri}} = wamp_get(RealmUri, Ctxt),
+wamp_get_error_uri(Ctxt) ->
+    {reply, #error{error_uri = Uri}} = wamp_get(Ctxt),
     Uri.
 
 %% @private
-wamp_get(RealmUri, Ctxt) ->
+wamp_get(Ctxt) ->
     M = #call{
         request_id = 1,
         procedure_uri = ?WAMP_REG_GET,
-        args = [RealmUri, 12345],
+        args = [12345],
         options = #{}
     },
     bondy_wamp_meta_api:handle_call(M, Ctxt).

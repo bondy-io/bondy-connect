@@ -30,7 +30,8 @@ all() ->
         callee_registers_procedure,
         callee_death_cleans_registry,
         callee_restart_can_re_register,
-        session_open_failure_stops_callee
+        session_open_failure_stops_callee,
+        callee_status_hides_auth_conf
     ].
 
 init_per_suite(Config) ->
@@ -68,6 +69,29 @@ end_per_suite(Config) ->
 %% =============================================================================
 %% TEST CASES
 %% =============================================================================
+
+%% A secret resolved before registration and a literal one from the service's
+%% configuration. Covers process status only, not messages or ETS.
+callee_status_hides_auth_conf(Config) ->
+    RealmUri = ?config(realm_uri, Config),
+    ProcUri = ~"com.example.test.proc.status_hides",
+    ok = meck:new(bondy_http_connector_manager, [passthrough, no_link]),
+    try
+        meck:expect(
+            bondy_http_connector_manager,
+            service_readiness,
+            fun(_) -> {ok, #{client_secret => ~"s3cr3t"}} end
+        ),
+        Service0 = make_service(RealmUri, ProcUri),
+        Service = Service0#{auth_conf => #{vars => #{api_key => ~"l1teral"}}},
+        Pid = start_callee(Service),
+        Status = term_to_binary(sys:get_status(Pid)),
+        stop_callee(Pid),
+        ?assertEqual(nomatch, binary:match(Status, ~"s3cr3t")),
+        ?assertEqual(nomatch, binary:match(Status, ~"l1teral"))
+    after
+        meck:unload(bondy_http_connector_manager)
+    end.
 
 callee_opens_session(Config) ->
     RealmUri = ?config(realm_uri, Config),
@@ -185,7 +209,12 @@ make_service(RealmUri, ProcUri) ->
     }.
 
 start_callee(RealmUri, ProcUri) ->
-    Service = make_service(RealmUri, ProcUri),
+    start_callee(make_service(RealmUri, ProcUri)).
+
+start_callee(
+    #{procedures := #{~"proc1" := #{uri := ProcUri, realm := RealmUri}}} =
+        Service
+) ->
     {ok, Pid} = bondy_http_connector_callee:start_link(
         RealmUri, Service, test_pool
     ),

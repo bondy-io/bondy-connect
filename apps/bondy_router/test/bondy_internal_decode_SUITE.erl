@@ -125,16 +125,17 @@ router_error_to_payload_passthru_call(Config) ->
 
 %% An ERROR the router raises describes no payload, so it carries none of the
 %% CALL's `ppt_*` options. Here the load balancer refuses the CALL's options:
-%% a `jump_consistent_hash` registration needs a routing key the CALL omits.
+%% a `partition` runmode needs the `rkey` the CALL omits.
 invalid_call_option_error_carries_no_ppt(Config) ->
     RealmUri = ?config(realm_uri, Config),
-    Uri = <<"com.example.internal.decode.jch">>,
+    Uri = <<"com.example.internal.decode.partition">>,
     Ref = bondy_ref:new(internal, self(), bondy_session_id:new()),
-    {ok, _} = bondy_dealer:register(
-        Uri, #{invoke => <<"jump_consistent_hash">>}, RealmUri, Ref
-    ),
+    {ok, _} = bondy_dealer:register(Uri, #{}, RealmUri, Ref),
     Call = bondy_wamp_message:call(
-        9, #{ppt_scheme => <<"x_custom">>}, Uri, [<<"opaque">>]
+        9,
+        #{ppt_scheme => <<"x_custom">>, runmode => <<"partition">>},
+        Uri,
+        [<<"opaque">>]
     ),
     Error =
         case bondy_router:forward(Call, session_context(RealmUri)) of

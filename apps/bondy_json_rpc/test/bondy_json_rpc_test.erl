@@ -126,7 +126,6 @@ responses_test() ->
             undefined, -32022, <<"v">>, #{<<"supported">> => [<<"x">>]}
         )
     ),
-    %% encode/1 round-trips through the json module.
     ?assertEqual(
-        Err, json:decode(bondy_json_rpc:encode(Err))
+        Err, json:decode(iolist_to_binary(json:encode(Err)))
     ).

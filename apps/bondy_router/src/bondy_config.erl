@@ -57,11 +57,6 @@ An implementation of the `app_config` behaviour.
         {tree_refresh, 1000},
         {relay_ttl, 5}
     ]},
-    {bondy_wamp, [
-        {json, [
-            {decode_opts, [{decoders, #{null => undefined}}]}
-        ]}
-    ]},
     %% Local in-memory storage
     {tuplespace, [
         %% Ring size is determined based on number of Erlang schedulers
@@ -524,7 +519,11 @@ setup_wamp() ->
     ),
 
     ok = bondy_wamp_config:set(extended_details, ?WAMP_EXT_DETAILS),
-    ok = bondy_wamp_config:set(extended_options, ?WAMP_EXT_OPTIONS).
+    ok = bondy_wamp_config:set(extended_options, ?WAMP_EXT_OPTIONS),
+    ok = bondy_wamp_config:set(
+        [serialization, json, encode],
+        bondy_wamp_json:validate_opts(get(json, []))
+    ).
 
 -doc """
 Every WAMP feature this build defines a value for, as `{Role, Feature, Value}`

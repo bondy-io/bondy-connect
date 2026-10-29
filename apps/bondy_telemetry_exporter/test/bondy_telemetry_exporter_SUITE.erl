@@ -20,19 +20,7 @@ all() ->
     [app_starts_and_stops].
 
 init_per_suite(Config) ->
-    %% bondy_metrics is a library app: its named gen_server (owner of
-    %% the tables bondy_prometheus:setup/0 writes at this app's start)
-    %% is hosted by the consumer's supervision tree — bondy_oplog_sup in
-    %% a full node. Standalone, this suite is the consumer.
-    MetricsStarted =
-        case whereis(bondy_metrics) of
-            undefined ->
-                {ok, Pid} = bondy_metrics:start_link(),
-                true = unlink(Pid),
-                true;
-            _ ->
-                false
-        end,
+    MetricsStarted = bondy_metrics_ct:ensure_registry(),
     %% A suite that ran earlier on this node may have booted Bondy, and
     %% bondy_router_app starts bondy_telemetry_exporter — so stop it (and the
     %% SDK, which reads its env only at start) before setting this
@@ -50,10 +38,9 @@ end_per_suite(Config) ->
         true ->
             %% This suite hosted the registry, so no booted node needs
             %% the sinks: leave app AND registry stopped (see the otel
-            %% suite's end_per_suite for the full rationale — orphan
-            %% registry clash / stale declares).
+            %% suite's end_per_suite).
             _ = application:stop(bondy_telemetry_exporter),
-            ok = gen_server:stop(bondy_metrics);
+            ok = bondy_metrics_ct:stop_registry(true);
         _ ->
             %% A booted node's posture: the sinks belong attached.
             {ok, _} = application:ensure_all_started(

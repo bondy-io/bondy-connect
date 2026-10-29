@@ -49,6 +49,7 @@ derivation) on top.
 
 %% API
 -export([register_provider/2]).
+-export([decode_json_object/1]).
 -export([resolve/1]).
 
 %% Built-in provider (exposed so it dispatches by the same convention).
@@ -85,6 +86,32 @@ resolve(#{provider := Provider} = Ref) when is_atom(Provider) ->
     maybe_decode(fetch(Provider, Ref), Encoding, Ref);
 resolve(Ref) ->
     {error, {invalid_ref, Ref}}.
+
+-doc """
+Decodes secret bytes that hold a JSON object, for a caller that stores several
+values in one secret. Returns `{error, secret_not_json}` for bytes that are not
+one JSON value, and `{error, secret_not_json_object}` for any other JSON value
+(`bondy_http_connector_secret_resolver_SUITE`).
+""".
+-spec decode_json_object(binary()) ->
+    {ok, map()} | {error, secret_not_json | secret_not_json_object}.
+
+decode_json_object(Bin) when is_binary(Bin) ->
+    try json:decode(Bin) of
+        Map when is_map(Map) ->
+            {ok, Map};
+        Value when
+            is_list(Value);
+            is_binary(Value);
+            is_number(Value);
+            is_atom(Value)
+        ->
+            {error, secret_not_json_object}
+    catch
+        error:unexpected_end -> {error, secret_not_json};
+        error:{invalid_byte, _} -> {error, secret_not_json};
+        error:{unexpected_sequence, _} -> {error, secret_not_json}
+    end.
 
 %% =============================================================================
 %% BUILT-IN PROVIDER — env

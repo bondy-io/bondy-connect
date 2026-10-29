@@ -1955,3 +1955,102 @@ null_maps_alike_across_encodings_test(_) ->
     ),
     ?assertEqual(Json, Msgpack),
     ?assertEqual(Cbor, Msgpack).
+
+%% A nil option means the option is absent, so the router accepts a nil
+%% `timeout` from every encoding.
+null_decodes_alike_in_wamp_messages_test(_) ->
+    Call = [48, 1, #{~"timeout" => null}, ~"a.b", [null], #{~"k" => null}],
+    Hello = [
+        1,
+        ~"realm1",
+        #{~"roles" => #{~"caller" => #{}}, ~"authextra" => #{~"k" => null}}
+    ],
+    lists:foreach(
+        fun({Sub, Encode}) ->
+            Enc = element(3, Sub),
+            Full = [
+                {partial_decode, false} | bondy_wamp_encoding:opts(Enc, decode)
+            ],
+            {[C], <<>>} = bondy_wamp_encoding:decode(Sub, Encode(Call), Full),
+            ?assertEqual(
+                {#{}, [undefined], #{~"k" => undefined}},
+                {C#call.options, C#call.args, C#call.kwargs},
+                Enc
+            ),
+            {[RC], <<>>} = bondy_wamp_encoding:decode(Sub, Encode(Call)),
+            ?assertEqual(#{}, RC#call.options, Enc),
+            {[H], <<>>} = bondy_wamp_encoding:decode(Sub, Encode(Hello)),
+            ?assertEqual(
+                #{~"k" => undefined}, maps:get(authextra, H#hello.details), Enc
+            )
+        end,
+        [
+            {{ws, text, json}, fun(T) -> iolist_to_binary(json:encode(T)) end},
+            {{ws, binary, msgpack}, fun(T) ->
+                iolist_to_binary(bondy_msgpack:encode(T))
+            end},
+            {{ws, binary, cbor}, fun(T) ->
+                iolist_to_binary(bondy_cbor:encode(T))
+            end}
+        ]
+    ).
+
+%% A datetime and a key-value list in a payload reach a peer as the same
+%% string and object, whether it negotiated JSON, CBOR or MessagePack.
+in_vm_terms_encode_alike_test(_) ->
+    DT = {{2026, 10, 29}, {1, 2, 3}},
+    Args = [
+        #{~"at" => DT, ~"atf" => {{2026, 10, 29}, {1, 2, 3.5}}},
+        [{a, 1}],
+        #{~"m" => [{~"b", DT}]}
+    ],
+    M = bondy_wamp_message:result(1, #{}, Args),
+    Expected = [
+        #{
+            ~"at" => ~"2026-10-29T01:02:03Z",
+            ~"atf" => ~"2026-10-29T01:02:03.500Z"
+        },
+        #{~"a" => 1},
+        #{~"m" => #{~"b" => ~"2026-10-29T01:02:03Z"}}
+    ],
+    lists:foreach(
+        fun({Sub, Enc}) ->
+            Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, Enc)),
+            Opts = [
+                {partial_decode, false} | bondy_wamp_encoding:opts(Enc, decode)
+            ],
+            {[R], <<>>} = bondy_wamp_encoding:decode(Sub, Bin, Opts),
+            ?assertEqual(Expected, R#result.args, Enc)
+        end,
+        [
+            {{ws, text, json}, json},
+            {{ws, binary, cbor}, cbor},
+            {{ws, binary, msgpack}, msgpack}
+        ]
+    ).
+
+%% A list whose first element is a datetime reaches a peer as a list of
+%% strings, not an object. Lists that mix shapes are not covered.
+datetime_list_encodes_as_strings_test(_) ->
+    DT = {{2026, 10, 29}, {1, 2, 3}},
+    DTf = {{2026, 10, 29}, {1, 2, 3.5}},
+    M = bondy_wamp_message:result(1, #{}, [[DT, DTf], #{~"l" => [DT]}]),
+    Expected = [
+        [~"2026-10-29T01:02:03Z", ~"2026-10-29T01:02:03.500Z"],
+        #{~"l" => [~"2026-10-29T01:02:03Z"]}
+    ],
+    lists:foreach(
+        fun({Sub, Enc}) ->
+            Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, Enc)),
+            Opts = [
+                {partial_decode, false} | bondy_wamp_encoding:opts(Enc, decode)
+            ],
+            {[R], <<>>} = bondy_wamp_encoding:decode(Sub, Bin, Opts),
+            ?assertEqual(Expected, R#result.args, Enc)
+        end,
+        [
+            {{ws, text, json}, json},
+            {{ws, binary, cbor}, cbor},
+            {{ws, binary, msgpack}, msgpack}
+        ]
+    ).

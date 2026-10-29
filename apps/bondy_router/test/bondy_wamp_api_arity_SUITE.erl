@@ -43,7 +43,8 @@ all() ->
     [
         the_scan_read_both_families,
         the_no_realm_set_is_the_declared_one,
-        a_short_call_to_a_no_realm_procedure_is_refused
+        a_short_call_to_a_no_realm_procedure_is_refused,
+        an_optional_argument_procedure_requires_the_realm
     ].
 
 %% Every `bondy.*` procedure whose first positional argument is NOT a realm,
@@ -103,6 +104,17 @@ declared_no_realm() ->
         {~"bondy.router.bridge.stop", 1},
         {~"bondy.task.catalogue", 0},
         {~"bondy.task.describe", 1}
+    ].
+
+%% Every realm-first `bondy.*` procedure that also takes an optional trailing
+%% argument, with the number of positional arguments it requires, the realm
+%% included. Defaulting the realm would make a call of that length readable
+%% two ways, so these procedures must be given the realm.
+declared_optional_args() ->
+    [
+        {~"bondy.registration.callee.list", 1},
+        {~"bondy.source.match", 2},
+        {~"bondy.user.change_password", 3}
     ].
 
 init_per_suite(Config) ->
@@ -169,6 +181,35 @@ a_short_call_to_a_no_realm_procedure_is_refused(_Config) ->
     %% Vacuity guard: a declaration reduced to the zero-argument procedures
     %% would leave nothing to drive.
     ?assert(length([x || {_, N} <- declared_no_realm(), N >= 1]) >= 20).
+
+%% From a tenant realm, so a padded call would be authorised: the realm it is
+%% padded with is the caller's own.
+an_optional_argument_procedure_requires_the_realm(_Config) ->
+    Realm = ~"com.example.arity.optional_args",
+    _ = bondy_realm:create(Realm),
+    Ctxt = bondy_context:local_context(Realm),
+    lists:foreach(
+        fun({Uri, N}) ->
+            ?assertMatch(
+                {Uri, #error{
+                    error_uri = ?WAMP_INVALID_ARGUMENT,
+                    args = [~"Invalid number of positional arguments."]
+                }},
+                {Uri, reply(Uri, N - 1, Ctxt)}
+            )
+        end,
+        declared_optional_args()
+    ).
+
+%% @private
+%% A refusal THROWS from `bondy_wamp_api_utils`; an answer is returned.
+reply(Uri, N, Ctxt) ->
+    M = bondy_wamp_message:call(1, #{}, Uri, lists:duplicate(N, ~"x")),
+    try bondy_wamp_api:handle_call(M, Ctxt) of
+        {reply, Reply} -> Reply
+    catch
+        error:#error{} = E -> E
+    end.
 
 %% @private
 %% Through `bondy_wamp_api:handle_call/2`, so the dispatch clause under test is

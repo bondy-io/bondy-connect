@@ -31,6 +31,8 @@ all() ->
         call_latency_trace,
         call_async_token_reply,
         unregister_stops_routing,
+        last_invokes_the_newest_callee,
+        random_reaches_every_callee,
         handler_error_propagates,
         handler_crash_isolation,
         per_call_timeout,
@@ -267,6 +269,33 @@ unregister_stops_routing(_) ->
 
     ok = bondy_connect_client:disconnect(Caller),
     ok = bondy_connect_client:disconnect(Callee).
+
+last_invokes_the_newest_callee(_) ->
+    Proc = <<"com.example.shared.last">>,
+    Callees = register_numbered_callees(Proc, ~"last", 3),
+    Caller = connect(),
+    ?assertEqual([3], lists:usort(call_n(Caller, Proc, 10))),
+
+    {3, Newest, RegId} = lists:keyfind(3, 1, Callees),
+    ok = bondy_connect_client:unregister(Newest, RegId),
+    ?assertEqual([2], lists:usort(call_n(Caller, Proc, 10))),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    lists:foreach(
+        fun({_, C, _}) -> ok = bondy_connect_client:disconnect(C) end, Callees
+    ).
+
+%% 60 calls over 3 callees miss one with probability about 3 * (2/3)^60.
+random_reaches_every_callee(_) ->
+    Proc = <<"com.example.shared.random">>,
+    Callees = register_numbered_callees(Proc, ~"random", 3),
+    Caller = connect(),
+    ?assertEqual([1, 2, 3], lists:usort(call_n(Caller, Proc, 60))),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    lists:foreach(
+        fun({_, C, _}) -> ok = bondy_connect_client:disconnect(C) end, Callees
+    ).
 
 handler_error_propagates(_) ->
     Callee = connect(),
@@ -772,6 +801,33 @@ collect_input_list(Input, Acc) ->
 connect() ->
     {ok, Conn} = bondy_connect_client:connect(spec()),
     Conn.
+
+%% @private
+%% Registration times have millisecond resolution; the 2 ms gap gives each
+%% callee a distinct one, so `last` has an order to honour.
+register_numbered_callees(Proc, Invoke, Count) ->
+    [
+        begin
+            Callee = connect(),
+            Reply = fun(_, _, _) -> {ok, #{args => [N]}} end,
+            {ok, RegId} = bondy_connect_client:register(
+                Callee, Proc, Reply, #{invoke => Invoke}
+            ),
+            ok = timer:sleep(2),
+            {N, Callee, RegId}
+        end
+     || N <- lists:seq(1, Count)
+    ].
+
+%% @private
+call_n(Caller, Proc, Count) ->
+    [
+        begin
+            {ok, #{args := [N]}} = bondy_connect_client:call(Caller, Proc, []),
+            N
+        end
+     || _ <- lists:seq(1, Count)
+    ].
 
 %% @private
 spec() ->

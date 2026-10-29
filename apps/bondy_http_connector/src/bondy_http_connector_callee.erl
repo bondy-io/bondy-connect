@@ -46,6 +46,11 @@ we register here — are removed.
 This is what allows the callee to be safely restarted by the supervisor:
 the new incarnation mints a fresh `SessionId` and re-registers the same
 URIs without colliding with stale entries from the prior incarnation.
+
+The service's `auth_conf`, and each registered procedure's, can hold
+credentials, so `format_status/1` replaces each with the atom `sensitive`
+before `sys:get_status/1` or a crash report sees the state
+(`bondy_http_connector_callee_lifecycle_SUITE:callee_status_hides_auth_conf/1`).
 """.
 
 -behaviour(gen_server).
@@ -73,6 +78,7 @@ URIs without colliding with stale entries from the prior incarnation.
 -export([handle_cast/2]).
 -export([handle_info/2]).
 -export([terminate/2]).
+-export([format_status/1]).
 
 %% ===================================================================
 %% Public API
@@ -158,6 +164,24 @@ handle_info(_Info, State) ->
 -doc false.
 terminate(_Reason, #state{}) ->
     ok.
+
+-doc false.
+format_status(#{state := #state{} = State} = Status) ->
+    #state{service = #{auth_conf := _} = Service} = State,
+    Registrations = maps:map(
+        fun(_, {Ref, SessionId, #http_connector_proc_conf{} = ProcConf}) ->
+            {Ref, SessionId, ProcConf#http_connector_proc_conf{
+                auth_conf = sensitive
+            }}
+        end,
+        State#state.registrations
+    ),
+    Status#{
+        state => State#state{
+            service = Service#{auth_conf => sensitive},
+            registrations = Registrations
+        }
+    }.
 
 %% =============================================================================
 %% PRIVATE

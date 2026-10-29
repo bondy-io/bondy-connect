@@ -16,9 +16,8 @@ remote Callees.
 
 ## Supported Load Balancing Strategies
 
-Bondy supports all WAMP Basic and Advanced Profile load balancing
-strategies for Shared Registrations and extends those with additional
-strategies.
+Bondy supports the WAMP invocation policies for Shared Registrations, and
+one strategy that no registration can name.
 
 ### Single
 
@@ -26,16 +25,20 @@ strategies.
 
 ### Last
 
+Invokes the callee that registered most recently.
+
 ### Random
+
+Invokes a callee chosen uniformly at random.
 
 ### Round Robin
 
 ### Jump Consistent Hash
 
-### Queue Least Loaded
-
-### Queue Least Loaded Sample
-
+The dealer selects this strategy for a CALL with `runmode = "partition"`,
+whatever the registration's invocation policy. It hashes the CALL's `rkey`
+over the callees, so while the callees do not change, calls with one key
+reach one callee (`bondy_registry_SUITE:partition_call_routes_by_rkey`).
 
 In the future we will explore implementing distributed load balancing
 algorithms such as Ant Colony, Particle Swarm Optimization and Biased Random
@@ -48,7 +51,7 @@ Sampling [See references](https://pdfs.semanticscholar.org/b9a9/52ed1b8bfae2e976
 -define(OPTS_SPEC, #{
     %% BONDY extension
     %% TODO this should be a map
-    %% #{strategy => #{id => queue_least_loaded, _prefer_local}}
+    %% #{strategy => #{id => round_robin, _prefer_local}}
     strategy => #{
         required => true,
         allow_null => false,
@@ -66,13 +69,7 @@ Sampling [See references](https://pdfs.semanticscholar.org/b9a9/52ed1b8bfae2e976
                 ?INVOKE_RANDOM,
                 round_robin,
                 ?INVOKE_ROUND_ROBIN,
-                %% BONDY extensions
-                jump_consistent_hash,
-                ?INVOKE_JUMP_CONSISTENT_HASH,
-                queue_least_loaded,
-                ?INVOKE_QUEUE_LEAST_LOADED,
-                queue_least_loaded_sample,
-                ?INVOKE_QUEUE_LEAST_LOADED_SAMPLE
+                jump_consistent_hash
             ]},
         validator => fun
             (?INVOKE_ROUND_ROBIN) ->
@@ -116,9 +113,7 @@ Sampling [See references](https://pdfs.semanticscholar.org/b9a9/52ed1b8bfae2e976
     | last
     | random
     | round_robin
-    | jump_consistent_hash
-    | queue_least_loaded
-    | queue_least_loaded_sample.
+    | jump_consistent_hash.
 -type opts() :: #{
     strategy := strategy(),
     '_prefer_local' => boolean(),
@@ -164,10 +159,6 @@ iterate(#iterator{strategy = round_robin} = Iter) ->
     next_round_robin(Iter);
 iterate(#iterator{strategy = jump_consistent_hash} = Iter) ->
     next_consistent_hash(Iter, jch);
-iterate(#iterator{strategy = queue_least_loaded} = Iter) ->
-    next_queue_least_loaded(Iter, length(Iter#iterator.entries));
-iterate(#iterator{strategy = queue_least_loaded_sample} = Iter) ->
-    next_queue_least_loaded(Iter, 2);
 iterate(#iterator{} = Iter) ->
     %%  single, first, last, random
     next(Iter).
@@ -184,8 +175,8 @@ validate_options(Opts0) ->
             error(
                 bondy_connect_error:new(missing_required_value, #{
                     message =>
-                        ~"A value for option '_routing_key' or 'rkey' is required",
-                    details => #{key => ~"_routing_key"}
+                        ~"A value for option 'rkey' is required",
+                    details => #{key => ~"rkey"}
                 })
             );
         Opts ->
@@ -207,8 +198,13 @@ prepare_entries(Entries, #{strategy := single}) ->
     Entries;
 prepare_entries(Entries, #{strategy := jump_consistent_hash}) ->
     lists:keysort(1, Entries);
-prepare_entries(Entries, #{strategy := queue_least_loaded_sample}) ->
-    lists_utils:shuffle(Entries);
+prepare_entries(Entries, #{strategy := random}) ->
+    rand:shuffle(Entries);
+prepare_entries(Entries, #{strategy := last}) ->
+    Newest = fun(A, B) ->
+        bondy_registry_entry:created(A) >= bondy_registry_entry:created(B)
+    end,
+    lists:sort(bondy_registry_entry:locality_comparator(Newest), Entries);
 prepare_entries(Entries, #{'_prefer_local' := Flag}) ->
     maybe_sort_by_locality(Flag, Entries);
 prepare_entries(Entries, _) ->
@@ -285,10 +281,7 @@ select_node(Units0, Opts) ->
                     ),
                     {ok, element(1, lists:nth(Bucket + 1, Units))}
             end;
-        _ ->
-            %% random | queue_least_loaded[_sample]: the caller cannot probe
-            %% remote mailboxes, so the node stage is weighted random; the
-            %% owner stage applies the accurate local policy.
+        random ->
             {ok, weighted_random(Units)}
     end.
 
@@ -299,7 +292,6 @@ node_strategy(?INVOKE_ROUND_ROBIN) -> round_robin;
 node_strategy(?INVOKE_RANDOM) -> random;
 node_strategy(?INVOKE_FIRST) -> first;
 node_strategy(?INVOKE_LAST) -> last;
-node_strategy(B) when is_binary(B) -> binary_to_existing_atom(B, utf8);
 node_strategy(A) when is_atom(A) -> A.
 
 %% @private
@@ -412,58 +404,6 @@ next_consistent_hash(Iter, Algo) ->
 
     NewIter = Iter#iterator{entries = lists:keydelete(EntryKey, 1, Entries)},
     {Entry, NewIter}.
-
-%% @private
--spec next_queue_least_loaded(iterator(), SampleSize :: integer()) ->
-    {bondy_registry_entry:t(), iterator()} | '$end_of_table'.
-
-next_queue_least_loaded([], _) ->
-    '$end_of_table';
-next_queue_least_loaded(Iter, SampleSize) ->
-    next_queue_least_loaded(Iter, SampleSize, 0, undefined).
-
-%% @private
-next_queue_least_loaded(Iter, SampleSize, Count, {_, Entry}) when
-    SampleSize == Count
-->
-    {Entry, Iter};
-next_queue_least_loaded(
-    #iterator{entries = [H | T]} = Iter, SampleSize, Count, Chosen
-) ->
-    NewIter = Iter#iterator{entries = T},
-
-    case bondy_registry_entry:is_local(H) of
-        true ->
-            Pid = bondy_registry_entry:pid(H),
-
-            case erlang:process_info(Pid, [message_queue_len]) of
-                undefined ->
-                    %% Process died, we continue iterating
-                    next_queue_least_loaded(NewIter, SampleSize, Count, Chosen);
-                [{message_queue_len, Len}] when Chosen == undefined ->
-                    next_queue_least_loaded(
-                        NewIter, SampleSize, Count + 1, {Len, H}
-                    );
-                [{message_queue_len, Len}] ->
-                    NewChosen =
-                        case Chosen of
-                            {Val, _} when Val =< Len -> Chosen;
-                            _ -> {Len, H}
-                        end,
-                    next_queue_least_loaded(
-                        NewIter, SampleSize, Count + 1, NewChosen
-                    )
-            end;
-        false ->
-            %% We already covered all local callees,
-            %% select the first remote callee (in effect randomnly as we already
-            %% shuffled the list of entries)
-            {H, NewIter}
-    end;
-next_queue_least_loaded(#iterator{entries = []}, _, _, undefined) ->
-    '$end_of_table';
-next_queue_least_loaded(#iterator{entries = []}, _, _, Entry) ->
-    Entry.
 
 %% @private
 -doc """

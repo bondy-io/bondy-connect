@@ -41,19 +41,8 @@ from_binary(_) -> {error, invalid_subprotocol}.
     {ok, subprotocol()} | {error, invalid_subprotocol}.
 
 validate(T) when is_binary(T) ->
-    case from_binary(T) of
-        {error, _} = Error -> Error;
-        Subprotocol -> {ok, Subprotocol}
-    end;
+    validate(from_binary(T));
 validate({ws, text, json} = S) ->
-    {ok, S};
-validate({ws, text, json_batched} = S) ->
-    {ok, S};
-validate({ws, binary, cbor_batched} = S) ->
-    {ok, S};
-validate({ws, binary, msgpack_batched} = S) ->
-    {ok, S};
-validate({ws, binary, erl_batched} = S) ->
     {ok, S};
 validate({raw, binary, json} = S) ->
     {ok, S};

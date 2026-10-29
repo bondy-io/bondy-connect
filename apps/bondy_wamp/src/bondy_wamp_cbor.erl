@@ -14,19 +14,8 @@ options over the `bondy_cbor` module.
 
 -define(DEFAULT_ENCODE_OPTS, []).
 %% Map both CBOR null and undefined to Erlang undefined for JSON compatibility
--define(DEFAULT_DECODE_OPTS, [
-    {decoders, #{null => undefined, undefined => undefined}}
-]).
--define(IS_UINT(X), (is_integer(X) andalso X >= 0)).
--define(IS_PNUM(X), (is_number(X) andalso X >= 0)).
--define(IS_DATETIME(Y, M, D, H, Mi, S),
-    (?IS_UINT(Y) andalso
-        ?IS_UINT(M) andalso
-        ?IS_UINT(D) andalso
-        ?IS_UINT(H) andalso
-        ?IS_UINT(Mi) andalso
-        ?IS_PNUM(S))
-).
+-define(DECODERS, #{null => undefined, undefined => undefined}).
+-define(DEFAULT_DECODE_OPTS, [{decoders, ?DECODERS}]).
 
 %% CBOR major types
 -define(CBOR_UINT, 0).
@@ -44,6 +33,7 @@ options over the `bondy_cbor` module.
 
 -export([decode/1]).
 -export([decode/2]).
+-export([decode_opts/0]).
 -export([decode_head/2]).
 -export([decode_tail/1]).
 -export([decode_tail/2]).
@@ -94,13 +84,21 @@ encode_with_tail(Elements, TailBin) when
 -spec decode(binary()) -> term() | no_return().
 
 decode(Term) ->
-    Opts = bondy_wamp_config:get([cbor, decode_opts], ?DEFAULT_DECODE_OPTS),
-    decode(Term, Opts).
+    decode(Term, ?DEFAULT_DECODE_OPTS).
 
 -spec decode(binary(), [decode_opt()]) -> term() | no_return().
 
 decode(Term, Opts) ->
     do_decode(Term, Opts).
+
+-doc """
+The options a WAMP message is decoded with. A null decodes as `undefined`,
+as it does in `bondy_msgpack`.
+""".
+-spec decode_opts() -> [decode_opt()].
+
+decode_opts() ->
+    ?DEFAULT_DECODE_OPTS.
 
 -doc """
 Decodes only the first N control elements from WAMP messages containing payloads,
@@ -136,8 +134,7 @@ decode_head(Bin, NumElements) ->
 -spec decode_tail(binary()) -> term() | no_return().
 
 decode_tail(Term) ->
-    Opts = bondy_wamp_config:get([cbor, decode_opts], ?DEFAULT_DECODE_OPTS),
-    decode_tail(Term, Opts).
+    decode_tail(Term, ?DEFAULT_DECODE_OPTS).
 
 -doc "Decode the CBOR tail binary back into Erlang terms.".
 -spec decode_tail(binary(), key_value:t()) -> term() | no_return().
@@ -197,14 +194,16 @@ do_encode(Term, Opts) ->
         ({{Y, M, D}, {H, Mi, S}}, _Encode) when
             ?IS_DATETIME(Y, M, D, H, Mi, S)
         ->
-            %% Encode datetime as ISO8601 text string
-            DatetimeBin = iolist_to_binary(
-                encode_datetime({{Y, M, D}, {H, Mi, S}})
-            ),
-            bondy_cbor:encode_string(DatetimeBin);
-        ([{_, _} | _] = Value, Encode) when is_list(Value), Checked == true ->
+            bondy_cbor:encode_string(
+                bondy_wamp_encoding:format_datetime({{Y, M, D}, {H, Mi, S}})
+            );
+        ([{K, _} | _] = Value, Encode) when
+            ?IS_KEY_VALUE_KEY(K), Checked == true
+        ->
             bondy_cbor:encode_key_value_list_checked(Value, Encode);
-        ([{_, _} | _] = Value, Encode) when is_list(Value), Checked == false ->
+        ([{K, _} | _] = Value, Encode) when
+            ?IS_KEY_VALUE_KEY(K), Checked == false
+        ->
             bondy_cbor:encode_key_value_list(Value, Encode);
         (Bin, _Encode) when is_binary(Bin) ->
             encode_binary(Bin);
@@ -250,65 +249,6 @@ well_formed(Decode) ->
         error:{invalid_indefinite_chunk, _} -> error(badarg);
         error:{invalid_simple_value, _} -> error(badarg)
     end.
-
-%% @private
--spec encode_datetime(calendar:datetime()) -> iodata().
-
-encode_datetime({{Y, M, D}, {H, Mi, S}}) ->
-    [
-        format_year(Y),
-        $-,
-        format2digit(M),
-        $-,
-        format2digit(D),
-        $T,
-        format2digit(H),
-        $:,
-        format2digit(Mi),
-        $:,
-        format_seconds(S),
-        $Z
-    ].
-
--spec format_year(non_neg_integer()) -> iodata().
-
-format_year(Y) when Y > 999 ->
-    integer_to_binary(Y);
-format_year(Y) ->
-    B = integer_to_binary(Y),
-    [lists:duplicate(4 - byte_size(B), $0) | B].
-
--spec format2digit(non_neg_integer()) -> iolist().
-
-format2digit(0) ->
-    "00";
-format2digit(1) ->
-    "01";
-format2digit(2) ->
-    "02";
-format2digit(3) ->
-    "03";
-format2digit(4) ->
-    "04";
-format2digit(5) ->
-    "05";
-format2digit(6) ->
-    "06";
-format2digit(7) ->
-    "07";
-format2digit(8) ->
-    "08";
-format2digit(9) ->
-    "09";
-format2digit(X) ->
-    integer_to_list(X).
-
--spec format_seconds(non_neg_integer() | float()) -> iolist().
-
-format_seconds(S) when is_integer(S) ->
-    format2digit(S);
-format_seconds(S) when is_float(S) ->
-    io_lib:format("~6.3.0f", [S]).
 
 %% =============================================================================
 %% PRIVATE: CBOR PARSING HELPERS
@@ -376,7 +316,7 @@ decode_n_elements_indefinite(Bin, N, Acc) when N > 0 ->
 %% @private
 decode_element(Bin) ->
     {Element, ok, Rest} = well_formed(fun() ->
-        bondy_cbor:decode(Bin, ok, #{})
+        bondy_cbor:decode(Bin, ok, ?DECODERS)
     end),
     {Element, Rest}.
 

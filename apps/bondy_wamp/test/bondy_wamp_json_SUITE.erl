@@ -89,24 +89,25 @@ test_float(_) ->
     ?assertError(badarg, bondy_wamp_json:encode(1.0, [{float_format, [foo]}])).
 
 test_datetime(_) ->
-    %% Test basic datetime encoding (returns unquoted datetime string)
     DT1 = {{2025, 10, 20}, {14, 30, 45}},
-    Expected1 = <<"2025-10-20T14:30:45Z">>,
-    ?assertEqual(Expected1, bondy_wamp_json:encode(DT1)),
+    ?assertEqual(<<"\"2025-10-20T14:30:45Z\"">>, bondy_wamp_json:encode(DT1)),
 
     DT2 = {{2025, 1, 1}, {0, 0, 12.345}},
-    Result2 = bondy_wamp_json:encode(DT2),
-    ?assertEqual(<<"2025-01-01T00:00:12.345Z">>, Result2),
+    ?assertEqual(
+        <<"\"2025-01-01T00:00:12.345Z\"">>, bondy_wamp_json:encode(DT2)
+    ),
 
-    %% Test year padding
     DT3 = {{999, 12, 31}, {23, 59, 59}},
-    Expected3 = <<"0999-12-31T23:59:59Z">>,
-    ?assertEqual(Expected3, bondy_wamp_json:encode(DT3)),
+    ?assertEqual(<<"\"0999-12-31T23:59:59Z\"">>, bondy_wamp_json:encode(DT3)),
 
-    %% Test year < 100
     DT4 = {{99, 5, 15}, {12, 0, 0}},
-    Expected4 = <<"0099-05-15T12:00:00Z">>,
-    ?assertEqual(Expected4, bondy_wamp_json:encode(DT4)).
+    ?assertEqual(<<"\"0099-05-15T12:00:00Z\"">>, bondy_wamp_json:encode(DT4)),
+
+    %% JSON has no date type: a datetime decodes as its ISO 8601 string.
+    ?assertEqual(
+        #{<<"created">> => <<"2025-10-20T14:30:45Z">>},
+        bondy_wamp_json:decode(bondy_wamp_json:encode(#{created => DT1}))
+    ).
 
 test_encode_basic(_) ->
     ?assertEqual(<<"1">>, bondy_wamp_json:encode(1)),

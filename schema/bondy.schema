@@ -1696,7 +1696,6 @@ end}.
 %% - "trust"
 %% - "wamp-scram"
 %% - "wampcra"
-%% - "oidc"
 %% - "oidcrp"
 %%
 %% The option also allows a single value "all" in which case all the methods
@@ -1724,7 +1723,6 @@ end}.
             <<"trust">>,
             <<"wamp-scram">>,
             <<"wampcra">>,
-            <<"oidc">>,
             <<"oidcrp">>
           ]),
           try
@@ -1744,7 +1742,7 @@ end}.
 
           catch
             throw:{invalid, List} ->
-              String = string:join(List, ", "),
+              String = string:join([binary_to_list(M) || M <- List], ", "),
               cuttlefish:invalid("invalid authmethods " ++ String)
           end;
         _ ->

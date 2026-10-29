@@ -53,7 +53,7 @@ all() ->
 init_per_suite(Config) ->
     Collector = spawn(fun collector_loop/0),
     true = register(span_collector, Collector),
-    MetricsStarted = ensure_metrics_registry(),
+    MetricsStarted = bondy_metrics_ct:ensure_registry(),
     %% A suite that ran earlier on this node may have booted Bondy, and
     %% bondy_router_app starts bondy_telemetry_exporter with the production
     %% posture (`traces_exporter = none`) — so stop it (and the SDK,
@@ -86,13 +86,10 @@ end_per_suite(Config) ->
     case ?config(metrics_started, Config) of
         true ->
             %% This suite hosted the registry, so no booted node needs
-            %% the sinks: leave app AND registry stopped. An orphan
-            %% registry would clash with bondy_oplog_sup's own
-            %% bondy_metrics child on a later suite's full boot (failing
-            %% the PERMANENT bondy_db app halts the CT node), and a
-            %% running app would hold declares made against the wiped
-            %% tables — the later boot restarts the app fresh instead.
-            ok = gen_server:stop(bondy_metrics);
+            %% the sinks: leave app AND registry stopped. A running app
+            %% would hold declares made against the wiped tables; the
+            %% later boot restarts the app fresh instead.
+            ok = bondy_metrics_ct:stop_registry(true);
         _ ->
             %% A booted node's posture: the Prometheus sinks belong
             %% attached, so leave the app running (disabled tracing).
@@ -684,23 +681,6 @@ bridge_attached() ->
         fun(#{id := Id}) -> Id =:= bondy_telemetry_exporter_otel end,
         telemetry:list_handlers([bondy, rpc, latency])
     ).
-
-%% @private
-%% bondy_metrics is a LIBRARY app: its named gen_server (which owns the
-%% counter + declaration ETS tables `bondy_prometheus:setup/0` writes)
-%% is hosted by the consumer's supervision tree — `bondy_oplog_sup` in a
-%% full node, which bondy_router_app starts before bondy_telemetry_exporter. On
-%% a standalone test node this suite is the consumer. Unlinked so the
-%% server survives this init process.
-ensure_metrics_registry() ->
-    case whereis(bondy_metrics) of
-        undefined ->
-            {ok, Pid} = bondy_metrics:start_link(),
-            true = unlink(Pid),
-            true;
-        _ ->
-            false
-    end.
 
 %% @private The full W3C trio, as the substrate events carry it.
 trace() ->

@@ -1744,7 +1744,7 @@ throw_unknown_resource(Id, _) ->
 
 %% @private
 reply(Status, Body, Req) ->
-    cowboy_req:reply(Status, ?JSON_CT, bondy_json_rpc:encode(Body), Req).
+    cowboy_req:reply(Status, ?JSON_CT, bondy_wamp_json:encode(Body), Req).
 
 %% @private
 send_frames(Frames, Req) ->

@@ -209,7 +209,7 @@ info({mcp_stream_close, Reason}, Req, #stream{id = Id} = Stream) ->
         <<"_meta">> => #{?SUBSCRIPTION_ID_META => Id}
     }),
     ok = cowboy_req:stream_events(
-        #{data => bondy_json_rpc:encode(Final)}, fin, Req
+        #{data => bondy_wamp_json:encode(Final)}, fin, Req
     ),
     {stop, Req, Stream};
 info(_Msg, Req, Stream) ->
@@ -451,7 +451,7 @@ notification(#stream{id = Id}, Method, Params) ->
 %% @private
 send(Req, Msg) ->
     cowboy_req:stream_events(
-        #{data => bondy_json_rpc:encode(Msg)}, nofin, Req
+        #{data => bondy_wamp_json:encode(Msg)}, nofin, Req
     ).
 
 %% @private

@@ -59,8 +59,11 @@ validate_map(Map, Spec, Extensions, Opts0) ->
     Opts = maps:merge(Defaults, Opts0),
     NewSpec = maybe_add_extensions(Extensions, Spec),
 
+    %% A nil option is an absent one, whichever serializer carried it.
+    Present = maps:filter(fun(_, V) -> V =/= undefined end, Map),
+
     try
-        maps_utils:validate(Map, NewSpec, Opts)
+        maps_utils:validate(Present, NewSpec, Opts)
     catch
         error:Reason when is_map(Reason) ->
             error({validation_failed, Reason})
@@ -72,12 +75,6 @@ maybe_add_extensions(Keys, Spec) when is_list(Keys) ->
 maybe_add_extensions([], Spec) ->
     Spec.
 
-maybe_add_extension({invoke, Options}, Acc) ->
-    #{datatype := {in, L}} = KeySpec = maps:get(invoke, Acc),
-    NewKeySpec = KeySpec#{
-        datatype => {in, lists:append(L, Options)}
-    },
-    maps:put(invoke, NewKeySpec, Acc);
 maybe_add_extension(Key, Acc) ->
     try
         NewKey = to_valid_extension_key(Key),

@@ -188,8 +188,8 @@ small_test(Config) ->
 large_test(Config) ->
     Mod = ?config(store, Config),
 
-    ShuffledA = list_shuffle(lists:seq(1, 1000)),
-    ShuffledB = list_shuffle(lists:seq(550, 1500)),
+    ShuffledA = rand:shuffle(lists:seq(1, 1000)),
+    ShuffledB = rand:shuffle(lists:seq(550, 1500)),
     A = lists:foldl(
         fun(N, Acc) -> bondy_mst:put(Acc, N) end,
         bondy_mst:new(#{
@@ -468,33 +468,3 @@ delete_and_read_test(Config) ->
         [{1, true}, {2, true}, {3, true}, {4, true}, {5, true}],
         bondy_mst:to_list(T7)
     ).
-
-%% =============================================================================
-%% PRIVATE
-%% =============================================================================
-
-%% @private
-randomize(1, List) ->
-    randomize(List);
-randomize(T, List) ->
-    lists:foldl(
-        fun(_E, Acc) -> randomize(Acc) end,
-        randomize(List),
-        lists:seq(1, (T - 1))
-    ).
-
-%% @private
-randomize(List) ->
-    D = lists:map(fun(A) -> {rand:uniform(), A} end, List),
-    {_, D1} = lists:unzip(lists:keysort(1, D)),
-    D1.
-
-%% -----------------------------------------------------------------------------
-%% @doc
-%% From https://erlangcentral.org/wiki/index.php/RandomShuffle
-%% @end
-%% -----------------------------------------------------------------------------
-list_shuffle([]) ->
-    [];
-list_shuffle(List) ->
-    randomize(round(math:log(length(List)) + 0.5), List).

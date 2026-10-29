@@ -57,21 +57,12 @@ groups() ->
 init_per_suite(Config) ->
     _ = application:ensure_all_started(gproc),
     {ok, _} = application:ensure_all_started(telemetry),
-    %% start_link/0 links to the calling process — init_per_suite's process
-    %% is transient (CT tears it down once this function returns), which
-    %% would take bondy_metrics' ETS tables down with it. Unlink so the
-    %% registry outlives init_per_suite for the rest of the suite.
-    MetricsPid =
-        case bondy_metrics:start_link() of
-            {ok, Pid} -> Pid;
-            {error, {already_started, Pid}} -> Pid
-        end,
-    true = unlink(MetricsPid),
+    MetricsStarted = bondy_metrics_ct:ensure_registry(),
     ok = bondy_http_connector_telemetry:init(),
-    Config.
+    [{metrics_started, MetricsStarted} | Config].
 
-end_per_suite(_Config) ->
-    ok.
+end_per_suite(Config) ->
+    bondy_metrics_ct:stop_registry(?config(metrics_started, Config)).
 
 init_per_testcase(_TC, Config) ->
     %% Start only the token cache subsystem (supervisor + registry worker),

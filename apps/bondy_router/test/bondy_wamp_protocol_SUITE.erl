@@ -36,8 +36,12 @@ all() ->
         hello_admission_disabled,
         hello_admission_under_memory_pressure,
         router_abort_close_logs_the_reason,
+        tcp_handler_status_redacts_the_protocol_state,
         unknown_authid_gets_a_challenge_like_a_known_one,
-        an_error_for_anything_but_an_invocation_is_a_protocol_violation
+        an_error_for_anything_but_an_invocation_is_a_protocol_violation,
+        the_configured_json_float_format_reaches_the_encoder,
+        a_batched_offer_falls_through_to_the_next,
+        a_batched_only_offer_is_refused
     ].
 
 init_per_suite(Config) ->
@@ -113,12 +117,8 @@ format_status(_Config) ->
     {raw, binary, json},
     {raw, binary, cbor},
     {raw, binary, msgpack},
-    {ws, binary, erl_batched},
-    {ws, binary, msgpack_batched},
     {ws, binary, msgpack},
-    {ws, binary, cbor_batched},
     {ws, binary, cbor},
-    {ws, text, json_batched},
     {ws, text, json}
 ]).
 %% Includes ?WAMP2_BERT and ?WAMP2_BERT_BATCHED, which
@@ -757,6 +757,69 @@ error_outcome(Hello, Type) ->
     end.
 
 %% -----------------------------------------------------------------------------
+%% bondy_wamp_tcp_connection_handler: format_status
+%% -----------------------------------------------------------------------------
+
+%% `sys:get_status/1` on an established RawSocket connection shows the
+%% handler's state with only its protocol state replaced, by
+%% `bondy_wamp_protocol:format_status/1`.
+tcp_handler_status_redacts_the_protocol_state(_Config) ->
+    Realm = bondy_realm:create(~"com.example.test.wamp_protocol.status"),
+    ok = bondy_realm:disable_security(Realm),
+    Port = ranch:get_port(wamp_tcp),
+    {ok, Sock} = gen_tcp:connect(
+        {127, 0, 0, 1}, Port, [binary, {active, false}], 5000
+    ),
+    try
+        ok = gen_tcp:send(Sock, <<16#7F, 15:4, 1:4, 0:8, 0:8>>),
+        {ok, <<16#7F, _:4, 1:4, 0:8, 0:8>>} = gen_tcp:recv(Sock, 4, 5000),
+        Hello = iolist_to_binary(
+            json:encode([
+                1, bondy_realm:uri(Realm), #{roles => #{caller => #{}}}
+            ])
+        ),
+        ok = gen_tcp:send(
+            Sock, <<0:5, 0:3, (byte_size(Hello)):24, Hello/binary>>
+        ),
+        {ok, <<0:5, 0:3, Len:24>>} = gen_tcp:recv(Sock, 4, 5000),
+        {ok, WelcomeBin} = gen_tcp:recv(Sock, Len, 5000),
+        ?assertMatch([2, _, #{}], json:decode(WelcomeBin)),
+        Checked = [
+            check_redacted_status(Pid)
+         || Pid <- ranch:procs(wamp_tcp, connections),
+            protocol_state_index(sys:get_state(Pid)) =/= undefined
+        ],
+        ?assertNotEqual([], Checked)
+    after
+        gen_tcp:close(Sock)
+    end.
+
+%% @private
+check_redacted_status(Pid) ->
+    Raw = sys:get_state(Pid),
+    I = protocol_state_index(Raw),
+    {status, Pid, _, [_, _, _, _, Misc]} = sys:get_status(Pid),
+    [Shown] = [St || {data, L} <- Misc, {"State", St} <- L],
+    Expected = setelement(
+        I, Raw, bondy_wamp_protocol:format_status(element(I, Raw))
+    ),
+    ?assertEqual(Expected, Shown).
+
+%% @private
+protocol_state_index(State) ->
+    Is = [
+        I
+     || {I, E} <- lists:enumerate(tuple_to_list(State)),
+        is_tuple(E),
+        tuple_size(E) > 0,
+        element(1, E) =:= wamp_state
+    ],
+    case Is of
+        [I] -> I;
+        [] -> undefined
+    end.
+
+%% -----------------------------------------------------------------------------
 %% bondy_wamp_tcp_connection_handler: a router-initiated close names its reason
 %% -----------------------------------------------------------------------------
 
@@ -806,6 +869,48 @@ router_abort_close_logs_the_reason(_Config) ->
     after
         ok = logger:remove_handler(?MODULE),
         ok = logger:set_primary_config(level, Primary)
+    end.
+
+%% `bondy_ct` configures `json.float_format` as `[short]`; the encoder's own
+%% default prints `0.1` as `0.1000000000000000`.
+the_configured_json_float_format_reaches_the_encoder(_Config) ->
+    M = bondy_wamp_message:result(1, #{}, [0.1]),
+    ?assertEqual(
+        ~"[50,1,{},[0.1]]",
+        iolist_to_binary(bondy_wamp_encoding:encode(M, json))
+    ).
+
+%% Through the WebSocket listener `bondy_ct` starts on port 18080.
+a_batched_offer_falls_through_to_the_next(_Config) ->
+    ?assertEqual(
+        {upgrade, ~"wamp.2.json"},
+        ws_handshake([~"wamp.2.json.batched", ~"wamp.2.json"])
+    ).
+
+a_batched_only_offer_is_refused(_Config) ->
+    ?assertMatch(
+        {response, Status} when Status >= 400,
+        ws_handshake([~"wamp.2.json.batched", ~"wamp.2.msgpack.batched"])
+    ).
+
+ws_handshake(Offered) ->
+    {ok, Conn} = gun:open("127.0.0.1", 18080, #{protocols => [http]}),
+    try
+        {ok, http} = gun:await_up(Conn, 5000),
+        Ref = gun:ws_upgrade(
+            Conn, "/ws", [], #{protocols => [{P, gun_ws_h} || P <- Offered]}
+        ),
+        case gun:await(Conn, Ref, 5000) of
+            {upgrade, [~"websocket"], Headers} ->
+                {_, Chosen} = lists:keyfind(
+                    ~"sec-websocket-protocol", 1, Headers
+                ),
+                {upgrade, Chosen};
+            {response, _IsFin, Status, _Headers} ->
+                {response, Status}
+        end
+    after
+        ok = gun:close(Conn)
     end.
 
 %% logger handler callback for the case above: forwards the handler's close

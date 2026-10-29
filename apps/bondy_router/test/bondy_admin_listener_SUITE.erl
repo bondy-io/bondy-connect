@@ -20,6 +20,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("kernel/include/file.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include("bondy.hrl").
 
 -export([all/0]).
 -export([init_per_suite/1]).
@@ -29,6 +30,8 @@
 -export([stored_specs_are_absent_from_the_admin_listeners/1]).
 -export([admin_local_is_injected_without_configuration/1]).
 -export([admin_local_socket_is_bound_and_serves/1]).
+-export([registry_routes_read_the_named_realm/1]).
+-export([on_call/3]).
 
 -define(ADMIN, admin).
 -define(PUBLIC, api_gateway_http).
@@ -56,7 +59,8 @@ all() ->
         listener_scope_http_budget_is_enforced,
         realm_scope_http_budget_is_enforced,
         oauth2_draws_from_the_auth_class,
-        the_ready_probe_follows_a_blocking_alarm
+        the_ready_probe_follows_a_blocking_alarm,
+        registry_routes_read_the_named_realm
     ].
 
 init_per_suite(Config) ->
@@ -373,6 +377,51 @@ load_stored_spec() ->
 %% returned depends on authentication, which this suite does not exercise.
 %% A handler crash is a 500 on a route that exists, which a not-404 assertion
 %% alone passes.
+%% The Admin API calls its procedures from the master realm. A `wamp.*` meta
+%% procedure reads only the caller's realm, so these routes reach a tenant
+%% realm's registry only through the realm-first `bondy.*` procedures. The
+%% request is anonymous, so the case grants `anonymous` `wamp.call` on every
+%% URI for its duration: a route still calling a `wamp.*` procedure then fails
+%% on its arguments rather than on authorisation.
+registry_routes_read_the_named_realm(_Config) ->
+    Realm = ~"com.example.adminsplit.registry",
+    _ = bondy_realm:create(Realm),
+    {ok, Id} = bondy_dealer:register(
+        ~"com.example.adminsplit.registry.proc",
+        #{},
+        Realm,
+        bondy_ref:new(internal, {?MODULE, on_call})
+    ),
+    Grant = bondy_rbac:request(#{
+        roles => [~"anonymous"],
+        permissions => [~"wamp.call"],
+        uri => ~"",
+        match => ~"prefix"
+    }),
+    ok = bondy_rbac:grant(?MASTER_REALM_URI, Grant),
+    try
+        Path = ["/realms/", Realm, "/registrations/", integer_to_list(Id)],
+        ?assertMatch(#{~"id" := Id}, json_body(get_path(?ADMIN, Path))),
+        ?assertEqual([], json_body(get_path(?ADMIN, [Path, "/callees"]))),
+        ?assertMatch(
+            {ok, 404, _, _},
+            get_path(?ADMIN, ["/realms/", Realm, "/registrations_summary"])
+        )
+    after
+        ok = bondy_rbac:revoke(?MASTER_REALM_URI, Grant)
+    end.
+
+%% The internal callee registered by `registry_routes_read_the_named_realm/1`;
+%% the case never calls it.
+on_call(_Arg, _KWArgs, _Details) ->
+    {ok, #{}, [], #{}}.
+
+%% @private
+json_body({ok, Status, _, Ref}) ->
+    {ok, Body} = hackney:body(Ref),
+    ?assertEqual(200, Status, Body),
+    json:decode(Body).
+
 assert_routed(Status) ->
     ct:pal("status ~p", [Status]),
     ?assertNotEqual(404, Status),

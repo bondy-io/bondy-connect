@@ -113,8 +113,8 @@ are not exported.
 %% =============================================================================
 
 -doc """
-Declares the WAMP extensions the client uses, merging them into the
-`wamp` application's environment. Idempotent; runs at application start.
+Declares the WAMP extensions the client uses in the `wamp` application's
+environment. Idempotent; runs at application start.
 
 The client SENDS extension options — `_deadline` on CALL (the absolute
 cap for a progressive call) and the W3C trace-context trio
@@ -124,8 +124,9 @@ extension details. Extensions are validated against the `wamp`
 application's environment, which in a router node is populated by
 `bondy_config` — but a standalone client deployment has no router: an
 undeclared option is silently stripped by the client's own encoder, and
-an undeclared detail by its own decoder. Merge (never replace) so this
-is safe in either start order when co-located with `bondy_router`.
+an undeclared detail by its own decoder. It sets the same constants
+`bondy_config` sets in a router node, so the start order does not matter
+(`bondy_connect_trace_test:ensure_wamp_extensions_test/0`).
 """.
 -spec ensure_wamp_extensions() -> ok.
 
