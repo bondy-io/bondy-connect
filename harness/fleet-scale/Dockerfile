@@ -89,4 +89,4 @@ EXPOSE 18080/tcp
 EXPOSE 18081/tcp
 EXPOSE 18086/tcp
 
-ENTRYPOINT ["bondy", "foreground"]
+ENTRYPOINT ["bondy-connect", "foreground"]

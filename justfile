@@ -280,7 +280,7 @@ devrun:
     #!/usr/bin/env bash
     set -euo pipefail
     {{rebar}} as dev release
-    etc=_build/dev/rel/bondy/etc
+    etc=_build/dev/rel/bondy-connect/etc
     cp examples/config/api_spec.json "$etc/api_spec.json"
     cp examples/config/broker_bridge_config.json "$etc/broker_bridge_config.json"
     if [ -f examples/config/security_config.json ]; then
@@ -289,7 +289,7 @@ devrun:
       echo "note: examples/config/security_config.json absent — starting without it."
       echo "      Copy examples/config/security_config.json.template and fill it in."
     fi
-    _build/dev/rel/bondy/bin/bondy console
+    _build/dev/rel/bondy-connect/bin/bondy-connect console
 
 # Build the prod release and open a console on it.
 prodrun:
@@ -297,7 +297,7 @@ prodrun:
     RELX_REPLACE_OS_VARS=true \
       BONDY_ERL_NODENAME={{erl_nodename}} \
       BONDY_ERL_DISTRIBUTED_COOKIE={{erl_cookie}} \
-      _build/prod/rel/bondy/bin/bondy console
+      _build/prod/rel/bondy-connect/bin/bondy-connect console
 
 # Exercises the artefact operators actually receive, not the build tree.
 
@@ -305,7 +305,7 @@ prodrun:
 prodtarrun: release-tar
     BONDY_ERL_NODENAME={{erl_nodename}} \
       BONDY_ERL_DISTRIBUTED_COOKIE={{erl_cookie}} \
-      _build/tar/bin/bondy console
+      _build/tar/bin/bondy-connect console
 
 # -----------------------------------------------------------------------------
 # Local dev cluster
@@ -325,7 +325,7 @@ _node prof port:
     set -euo pipefail
     {{rebar}} as {{prof}} release
     if [ -f .env ]; then set -a; . ./.env; set +a; fi
-    ERL_DIST_PORT={{port}} _build/{{prof}}/rel/bondy/bin/bondy console
+    ERL_DIST_PORT={{port}} _build/{{prof}}/rel/bondy-connect/bin/bondy-connect console
 
 # Build and run dev cluster node 1 (ERL_DIST_PORT 27781).
 node1: (_node "node1" "27781")
@@ -344,7 +344,7 @@ edge1:
     if [ -f .env ]; then set -a; . ./.env; set +a; fi
     EDGE1_DEVICE1_PRIVKEY=4ffddd896a530ce5ee8c86b83b0d31835490a97a9cd718cb2f09c9fd31c4a7d71766c9e6ec7d7b354fd7a2e4542753a23cae0b901228305621e5b8713299ccdd \
       ERL_DIST_PORT=27784 \
-      _build/edge1/rel/bondy/bin/bondy console
+      _build/edge1/rel/bondy-connect/bin/bondy-connect console
 
 run-edge1:
     #!/usr/bin/env bash
@@ -352,13 +352,13 @@ run-edge1:
     if [ -f .env ]; then set -a; . ./.env; set +a; fi
     EDGE1_DEVICE1_PRIVKEY=4ffddd896a530ce5ee8c86b83b0d31835490a97a9cd718cb2f09c9fd31c4a7d71766c9e6ec7d7b354fd7a2e4542753a23cae0b901228305621e5b8713299ccdd \
       ERL_DIST_PORT=27784 \
-      _build/edge1/rel/bondy/bin/bondy console
+      _build/edge1/rel/bondy-connect/bin/bondy-connect console
 
 _run-node prof port:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ -f .env ]; then set -a; . ./.env; set +a; fi
-    ERL_DIST_PORT={{port}} _build/{{prof}}/rel/bondy/bin/bondy console
+    ERL_DIST_PORT={{port}} _build/{{prof}}/rel/bondy-connect/bin/bondy-connect console
 
 # Reopen a console on an already-built node release (no rebuild).
 run-node1: (_run-node "node1" "27781")
@@ -996,7 +996,7 @@ rel-jepsen-bondy:
     docker image inspect bondy-prod:latest >/dev/null 2>&1 || \
       { echo "bondy-prod:latest not found; run 'just docker-build' first" >&2; exit 1; }
     vsn=$(docker run --rm --entrypoint sh bondy-prod:latest -c 'ls /bondy/releases | grep -v RELEASES | head -1')
-    out="{{justfile_directory()}}/jepsen/jepsen.bondy/bondy-${vsn}.tar.gz"
+    out="{{justfile_directory()}}/jepsen/jepsen.bondy/bondy-connect-${vsn}.tar.gz"
     cid=$(docker create bondy-prod:latest)
     trap 'docker rm -f "$cid" >/dev/null' EXIT
     # `docker cp` streams the directory as a tar with a `bondy/` top level;

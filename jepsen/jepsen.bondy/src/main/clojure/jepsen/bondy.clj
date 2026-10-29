@@ -166,10 +166,10 @@
 (def log-dir (str dir "/log"))
 (def conf-file (str dir "/etc/bondy.conf"))
 (def security-config-file (str dir "/etc/security_config.json"))
-(def binary (str dir "/bin/bondy"))
+(def binary (str dir "/bin/bondy-connect"))
 
 (defn env-variables
-  "The environment `bin/bondy` needs: relx expands `${BONDY_ERL_NODENAME}`
+  "The environment `bin/bondy-connect` needs: relx expands `${BONDY_ERL_NODENAME}`
    and `${BONDY_ERL_DISTRIBUTED_COOKIE}` in vm.args only when
    RELX_REPLACE_OS_VARS is set (config/prod/vm.args), and wires the
    epmd-less distribution port only when ERL_DIST_PORT is set
@@ -521,7 +521,7 @@
   []
   (let [files (->> (.listFiles (java.io.File. ^String archive-dir))
                    (filter (fn [^java.io.File f]
-                             (re-matches #"bondy-.*\.tar\.gz" (.getName f))))
+                             (re-matches #"bondy-connect-.*\.tar\.gz" (.getName f))))
                    (sort-by (fn [^java.io.File f] (.lastModified f))))]
     (when-let [^java.io.File f (last files)]
       (str "file://" (.getAbsolutePath f)))))

@@ -170,16 +170,16 @@ Clone this repository and `cd` to the location where you cloned it.
 All build, test and run tasks are driven by [just](https://just.systems/); run
 `just` with no arguments to list every recipe.
 
-To generate a Bondy release to be used in production execute the following command which will generate a tarball containing the release at `$(PWD)/_build/prod/rel/`.
+To generate a Bondy release to be used in production execute the following command which will generate a tarball containing the release at `$(PWD)/_build/prod/rel/bondy-connect/`.
 
 ```shell
-just release
+just release-tar
 ```
 
-Untar and copy the resulting tarball to the location where you want to install Bondy e.g. `~/tmp/bondy`.
+Untar the resulting tarball into the location where you want to install Bondy e.g. `~/tmp/bondy`.
 
 ```shell
-tar -zxvf _build/prod/rel/bondy-1.0.0.tar.gz -C ~/tmp/bondy
+tar -zxvf _build/prod/rel/bondy-connect/bondy-connect-1.0.0.tar.gz -C ~/tmp/bondy
 ```
 
 #### Running
@@ -187,19 +187,19 @@ tar -zxvf _build/prod/rel/bondy-1.0.0.tar.gz -C ~/tmp/bondy
 To run Bondy, `cd` to the location where you installed it e.g. `~/tmp/bondy` and run the following command which will print all the options.
 
 ```shell
-bin/bondy
+bin/bondy-connect
 ```
 
 For example, to run Bondy with output to stdout do
 
 ```shell
-bin/bondy foreground
+bin/bondy-connect foreground
 ```
 
 And to run Bondy with an interactive Erlang shell do
 
 ```shell
-bin/bondy console
+bin/bondy-connect console
 ```
 
 ## Local cluster testing

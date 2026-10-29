@@ -31,7 +31,7 @@
 #   bondy_oplog_mst_rebuilt_total  the self-heal gave up and rebuilt a tree
 #   bondy_mst:gc_aborts()          the full forensic ring behind either
 #
-# Queried through `bondy eval`, NOT by scraping /metrics: the runtime image
+# Queried through `bondy-connect eval`, NOT by scraping /metrics: the runtime image
 # ships neither curl nor wget, so an HTTP probe silently returns nothing.
 #
 # A PROBE FAILURE IS NOT A PASS. An earlier version of this script counted an
@@ -67,7 +67,7 @@ MACHINES=$(fly machines list --app "$APP" --json \
 # --- readiness gate --------------------------------------------------------
 # Wait until each node actually answers before probing it for real.
 #
-# Why this matters: relx's generated `bin/bondy` runs `check_replace_os_vars
+# Why this matters: relx's generated `bin/bondy-connect` runs `check_replace_os_vars
 # vm.args` at the TOP of the script -- above the case statement, so for EVERY
 # subcommand including `eval`, and even when that subcommand then fails --
 # rewriting the shared releases/<vsn>/vm.args from the invoking shell's
@@ -95,7 +95,7 @@ while :; do
         IP=$(fly machines list --app "$APP" --json \
             | jq -r --arg m "$M" '.[]|select(.id==$m)|.private_ip')
         fly ssh console --app "$APP" --machine "$M" \
-            --command "env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy eval ok." \
+            --command "env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy-connect eval ok." \
             >/dev/null 2>&1 || PENDING=$((PENDING + 1))
     done
     [ "$PENDING" -eq 0 ] && { green "  all $(echo "$MACHINES" | wc -w | tr -d ' ') nodes answering"; break; }
@@ -127,7 +127,7 @@ for M in $MACHINES; do
     IP=$(fly machines list --app "$APP" --json \
         | jq -r --arg m "$M" '.[]|select(.id==$m)|.private_ip')
     NODE=$(fly ssh console --app "$APP" --machine "$M" \
-            --command "env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy eval partisan:node()." \
+            --command "env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy-connect eval partisan:node()." \
             2>/dev/null \
           | tr -d " '\r" | grep -oE '^bondy@.+$' | tail -1)
     if [ -z "$NODE" ]; then
@@ -158,7 +158,7 @@ for M in $MACHINES; do
     IP=$(fly machines list --app "$APP" --json \
         | jq -r --arg m "$M" '.[]|select(.id==$m)|.private_ip')
     RAW=$(fly ssh console --app "$APP" --machine "$M" \
-            --command "env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy eval $READ" \
+            --command "env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy-connect eval $READ" \
             2>/dev/null \
           | tr -d ' \r' | grep -oE '\{-?[0-9]+,-?[0-9]+,-?[0-9]+\}' | tail -1)
 
@@ -180,7 +180,7 @@ for M in $MACHINES; do
     if [ "$G" -gt 0 ]; then
         red "  -- in-node forensic ring --"
         fly ssh console --app "$APP" --machine "$M" \
-            --command "env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy eval bondy_mst:gc_aborts()." \
+            --command "env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy-connect eval bondy_mst:gc_aborts()." \
             2>/dev/null | sed 's/^/    /'
     fi
 done

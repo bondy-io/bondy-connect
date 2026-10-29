@@ -149,7 +149,7 @@ fi
 # 6. Signal capability — can we signal the BEAM? (do NOT actually kill it)
 # =============================================================================
 # Match the process NAME (comm=beam.smp); `pgrep -f` would miss it because the
-# BEAM's argv is "/bondy/bin/bondy ...", which does not contain "beam.smp".
+# BEAM's argv is "/bondy/bin/bondy-connect ...", which does not contain "beam.smp".
 BEAM=$(pgrep -x beam.smp | head -1)
 if [ -n "$BEAM" ]; then
   kill -0 "$BEAM" 2>/dev/null
