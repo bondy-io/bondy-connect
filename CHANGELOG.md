@@ -3,6 +3,7 @@
 
 ### Action required
 * The release and its start script are named `bondy-connect`: run `bin/bondy-connect` in place of `bin/bondy`, and the tarball is `bondy-connect-1.0.0.tar.gz`. The Docker images start `bondy-connect foreground`. The `/bondy` paths, node names, `BONDY_*` environment variables and `etc/bondy.conf` are unchanged.
+* Images are published as `leapsight/bondy-connect` on Docker Hub and `ghcr.io/bondy-io/bondy-connect` on GHCR, and the repository is `github.com/bondy-io/bondy-connect`. Update image references and git remotes. The `leapsight/bondy` and `ghcr.io/bondy-io/bondy` images stay pullable but receive no new tags.
 * Upgrading from `1.0.0-rc.65` (or previous versions) requires a new cluster: PlumDB data is not readable by this release. See the [migration guide](doc/guides/configuration/migrating_from_1.0.0-rc.65.md).
 * A single-node deployment must set `cluster.enabled = off`; with `on` and no other member, compaction, reclamation, origin retirement and the authentication freshness fence hold. See [Clustering](doc/guides/configuration/clustering.md#running-a-single-node).
 * Listeners are declared under `listeners.$name.*`; the fixed per-scheme listener keys are removed, and every enabled `tls` listener must state its certificate. See [Listeners](doc/guides/configuration/listeners.md#migrating-from-the-pre-10-keys).

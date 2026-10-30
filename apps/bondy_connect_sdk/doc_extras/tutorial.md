@@ -79,7 +79,7 @@ project, depend on it via `git_subdir` in `rebar.config`:
 ```erlang
 {deps, [
     {bondy_connect_sdk,
-        {git_subdir, "https://github.com/bondy-io/bondy.git",
+        {git_subdir, "https://github.com/bondy-io/bondy-connect.git",
             {branch, "master"}, "apps/bondy_connect_sdk"}}
 ]}.
 ```

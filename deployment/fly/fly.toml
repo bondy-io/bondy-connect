@@ -13,7 +13,7 @@ kill_timeout = "30s"
   entrypoint = ["/bin/bash", "-c", "source /bondy/setup.sh && exec bin/bondy-connect foreground"]
 
 [build]
-  image = "leapsight/bondy:develop-alpine"
+  image = "leapsight/bondy-connect:develop-alpine"
 
 [deploy]
   strategy = "rolling"

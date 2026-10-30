@@ -1,6 +1,6 @@
 (defproject jepsen.bondy "0.1.0-SNAPSHOT"
   :description "Jepsen tests for the Bondy router (3-node cluster, durable RBAC users under partition and crash)"
-  :url "https://github.com/bondy-io/bondy"
+  :url "https://github.com/bondy-io/bondy-connect"
   :source-paths ["src/main/clojure"]
   :java-source-paths ["src/main/java"]
   :jvm-opts ["-Xmx12g"]
