@@ -30,6 +30,10 @@ groups() ->
             register_invoke_single,
             concurrent_single_registrations_admit_one,
             register_shared,
+            extension_invoke_policies_are_refused,
+            partition_call_routes_by_rkey,
+            random_reaches_every_local_callee,
+            last_reaches_the_newest_local_callee,
             register_callback,
             pattern_based_registration_is_not_optional,
             registry_rib_dual_write,
@@ -698,6 +702,185 @@ register_shared(Config) ->
         bondy_dealer:register(Uri, Opts, RealmUri, Ref)
     ).
 
+%% `REGISTER.Options.invoke` takes only the WAMP invocation policies.
+extension_invoke_policies_are_refused(_Config) ->
+    lists:foreach(
+        fun(Invoke) ->
+            ?assertError(
+                {validation_failed, #{code := invalid_datatype, key := invoke}},
+                bondy_wamp_message:register(
+                    1, #{~"invoke" => Invoke}, ~"com.example.options"
+                ),
+                Invoke
+            )
+        end,
+        [
+            ~"jump_consistent_hash",
+            ~"jch",
+            ~"queue_least_loaded",
+            ~"qll",
+            ~"queue_least_loaded_sample",
+            ~"qlls"
+        ]
+    ).
+
+%% A CALL with `runmode = "partition"` goes to the callee its `rkey` hashes
+%% to, whatever the registration's invocation policy: repeated calls with one
+%% key reach one callee, and eight keys over four callees reach more than one.
+partition_call_routes_by_rkey(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Callees = forwarding_callees(4),
+    _ = [
+        {ok, _} = bondy_dealer:register(
+            Uri, #{invoke => ?INVOKE_ROUND_ROBIN}, RealmUri, callee_ref(Pid)
+        )
+     || Pid <- Callees
+    ],
+    Route = {caller, caller_context(RealmUri)},
+    Keys = [<<"key-", (integer_to_binary(N))/binary>> || N <- lists:seq(1, 8)],
+    Chosen = lists:map(
+        fun({N, Key}) ->
+            Opts = #{~"runmode" => ~"partition", ~"rkey" => Key},
+            [Pid] = lists:usort([
+                invoked_callee(Route, N * 10 + I, Opts, Uri)
+             || I <- lists:seq(1, 3)
+            ]),
+            Pid
+        end,
+        lists:enumerate(Keys)
+    ),
+    ?assert(length(lists:usort(Chosen)) > 1, Chosen),
+    stop_callees(Callees).
+
+%% Four callees on this node share a `random` registration. Sixty CALLs made
+%% on this node, and sixty completed here for another node, each reach all
+%% four. A policy that took the registry's order would reach one; a uniform
+%% choice misses a callee in sixty calls with probability below 1e-6.
+random_reaches_every_local_callee(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Callees = forwarding_callees(4),
+    _ = [
+        {ok, _} = bondy_dealer:register(
+            Uri, #{invoke => ?INVOKE_RANDOM}, RealmUri, callee_ref(Pid)
+        )
+     || Pid <- Callees
+    ],
+    lists:foreach(
+        fun(Route) ->
+            Reached = [
+                invoked_callee(Route, ReqId, #{}, Uri)
+             || ReqId <- lists:seq(1, 60)
+            ],
+            ?assertEqual(lists:sort(Callees), lists:usort(Reached), Route)
+        end,
+        [{caller, caller_context(RealmUri)}, {owner, RealmUri}]
+    ),
+    stop_callees(Callees).
+
+%% Four callees on this node share a `last` registration. Every CALL, made on
+%% this node or completed here for another node, reaches the newest; after it
+%% unregisters, every CALL reaches the one registered before it. The registry
+%% orders entries by key, not by age, so the second check catches a policy
+%% that only happened to agree with that order.
+last_reaches_the_newest_local_callee(Config) ->
+    RealmUri = key_value:get(realm_uri, Config),
+    Uri = <<"com.example.", (bondy_router_utils:generate_fragment(12))/binary>>,
+    Callees = forwarding_callees(4),
+    %% `created` has millisecond resolution and `last` does not order ties.
+    RegIds = lists:map(
+        fun(Pid) ->
+            ok = timer:sleep(2),
+            {ok, RegId} = bondy_dealer:register(
+                Uri, #{invoke => ?INVOKE_LAST}, RealmUri, callee_ref(Pid)
+            ),
+            RegId
+        end,
+        Callees
+    ),
+    Routes = [{caller, caller_context(RealmUri)}, {owner, RealmUri}],
+    Reached = fun() ->
+        lists:usort([
+            invoked_callee(Route, ReqId, #{}, Uri)
+         || Route <- Routes, ReqId <- lists:seq(1, 10)
+        ])
+    end,
+    ?assertEqual([lists:nth(4, Callees)], Reached()),
+    ok = bondy_dealer:unregister(lists:nth(4, RegIds), RealmUri),
+    ?assertEqual([lists:nth(3, Callees)], Reached()),
+    stop_callees(Callees).
+
+%% @private
+forwarding_callees(N) ->
+    Self = self(),
+    [
+        spawn_link(fun Forward() ->
+            receive
+                {?BONDY_REQ, _, _, #invocation{}} = M ->
+                    Self ! {invoked, self(), M},
+                    Forward()
+            end
+        end)
+     || _ <- lists:seq(1, N)
+    ].
+
+%% @private
+callee_ref(Pid) ->
+    bondy_ref:new(internal, Pid, bondy_session_id:new()).
+
+%% @private
+stop_callees(Pids) ->
+    lists:foreach(
+        fun(Pid) ->
+            true = unlink(Pid),
+            true = exit(Pid, kill)
+        end,
+        Pids
+    ).
+
+%% @private
+%% The callee a CALL reached. `{caller, Ctxt}` makes the CALL on this node;
+%% `{owner, RealmUri}` delivers it as a node-addressed CALL that another node
+%% forwarded here for owner-side completion.
+invoked_callee({caller, Ctxt}, ReqId, Opts, Uri) ->
+    ok = bondy_dealer:forward(bondy_wamp_message:call(ReqId, Opts, Uri), Ctxt),
+    await_invoked(ReqId);
+invoked_callee({owner, RealmUri}, ReqId, Opts, Uri) ->
+    ok = bondy_dealer:forward(
+        rib_call(ReqId, Opts, Uri), bondy_ref:new(internal), #{
+            realm_uri => RealmUri,
+            from => bondy_ref:new(internal),
+            rib_completion => true
+        }
+    ),
+    await_invoked(ReqId).
+
+%% @private
+await_invoked(ReqId) ->
+    receive
+        {invoked, Pid, _} -> Pid;
+        {?BONDY_REQ, _, _, Other} -> error({ReqId, Other})
+    after 5000 ->
+        error({ReqId, no_invocation})
+    end.
+
+%% @private
+caller_context(RealmUri) ->
+    {ok, Session} = bondy_session_manager:open(
+        bondy_session_id:new(),
+        RealmUri,
+        #{
+            type => internal,
+            roles => #{caller => #{}},
+            agent => ~"bondy_registry_SUITE",
+            is_anonymous => true
+        }
+    ),
+    bondy_context:new(
+        {{127, 0, 0, 1}, 0}, {ws, text, json}, #{session => Session}
+    ).
+
 register_callback(Config) ->
     RealmUri = key_value:get(realm_uri, Config),
 
@@ -1000,19 +1183,7 @@ local_call_to_a_crashing_callback_is_answered(Config) ->
     {ok, _} = bondy_dealer:register(
         Uri, #{invoke => ?INVOKE_SINGLE}, RealmUri, Callee
     ),
-    {ok, Session} = bondy_session_manager:open(
-        bondy_session_id:new(),
-        RealmUri,
-        #{
-            type => internal,
-            roles => #{caller => #{}},
-            agent => ~"bondy_registry_SUITE",
-            is_anonymous => true
-        }
-    ),
-    Ctxt = bondy_context:new(
-        {{127, 0, 0, 1}, 0}, {ws, text, json}, #{session => Session}
-    ),
+    Ctxt = caller_context(RealmUri),
     ok = bondy_dealer:forward(bondy_wamp_message:call(1, #{}, Uri), Ctxt),
     await_internal_error(RealmUri, 1).
 

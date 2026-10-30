@@ -71,20 +71,15 @@ init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(gproc),
     {ok, _} = application:ensure_all_started(bondy_regulator),
 
-    %% `bondy_metrics` declares no `{mod, _}`: starting the application does
-    %% not start its registry, so it is started here by hand. Unlinked, or its
-    %% exit would take this process's tables with it when the suite's init
-    %% process finishes.
-    {ok, Pid} = start_metrics(),
-    true = unlink(Pid),
+    MetricsStarted = bondy_metrics_ct:ensure_registry(),
 
     {ok, Port} = mock_smtp_server:start(),
-    [{port, Port} | Config].
+    [{port, Port}, {metrics_started, MetricsStarted} | Config].
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
     _ = application:stop(bondy_mail),
     ok = mock_smtp_server:stop(),
-    ok.
+    bondy_metrics_ct:stop_registry(?config(metrics_started, Config)).
 
 init_per_testcase(_Case, Config) ->
     ok = mock_smtp_server:clear(),
@@ -571,13 +566,6 @@ counter_value(Name, Label) ->
     case bondy_metrics:value(#{name => Name, label => Label}) of
         undefined -> 0;
         Value -> Value
-    end.
-
-%% @private
-start_metrics() ->
-    case bondy_metrics:start_link() of
-        {ok, Pid} -> {ok, Pid};
-        {error, {already_started, Pid}} -> {ok, Pid}
     end.
 
 %% @private

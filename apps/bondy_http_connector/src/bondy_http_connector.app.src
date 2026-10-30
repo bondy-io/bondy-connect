@@ -18,7 +18,8 @@
         erlcloud,
         telemetry,
         bondy_metrics,
-        bondy_connect_lib
+        bondy_connect_lib,
+        bondy_wamp
     ]},
     {env, []},
     {modules, []},

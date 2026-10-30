@@ -745,12 +745,21 @@ do_compute_available_methods(#{user_id := UserId} = Ctxt, RealmAllowed) ->
             bondy_rbac:anonymous_allowed(source_ip(Ctxt)) andalso
                 matches_requirements(Method, Ctxt);
         ({_Order, Method}) ->
-            matches_requirements(Method, Ctxt)
+            has_wamp_auth(Method) andalso matches_requirements(Method, Ctxt)
     end,
 
     Available = lists:usort(lists:filtermap(Filter, Allowed)),
 
     [Method || {_, Method} <- Available].
+
+%% @private
+%% `tls` and `oidcrp` name how a user may authenticate outside a WAMP HELLO, so
+%% they have no callback module and are never offered to a session.
+has_wamp_auth(Method) ->
+    case maps:get(Method, ?BONDY_AUTHMETHODS_INFO) of
+        #{callback_mod := undefined} -> false;
+        #{callback_mod := _} -> true
+    end.
 
 %% @private
 matches_requirements(Method, #{user_id := UserId, user := User}) ->

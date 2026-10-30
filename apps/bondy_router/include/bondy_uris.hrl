@@ -167,8 +167,20 @@
 -define(BONDY_REGISTRATION_LIST, <<"bondy.registration.list">>).
 -define(BONDY_REGISTRATION_MATCH, <<"bondy.registration.match">>).
 -define(BONDY_REGISTRATION_CALLEE_LIST, <<"bondy.registration.callee.list">>).
+-define(BONDY_REGISTRATION_GET, <<"bondy.registration.get">>).
+-define(BONDY_REGISTRATION_LIST_CALLEES, <<"bondy.registration.list_callees">>).
+-define(BONDY_REGISTRATION_COUNT_CALLEES,
+    <<"bondy.registration.count_callees">>
+).
 -define(BONDY_SUBSCRIPTION_LIST, <<"bondy.subscription.list">>).
 -define(BONDY_SUBSCRIPTION_MATCH, <<"bondy.subscription.match">>).
+-define(BONDY_SUBSCRIPTION_GET, <<"bondy.subscription.get">>).
+-define(BONDY_SUBSCRIPTION_LIST_SUBSCRIBERS,
+    <<"bondy.subscription.list_subscribers">>
+).
+-define(BONDY_SUBSCRIPTION_COUNT_SUBSCRIBERS,
+    <<"bondy.subscription.count_subscribers">>
+).
 
 %% =============================================================================
 %% TOPIC URIS

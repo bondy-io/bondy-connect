@@ -21,13 +21,15 @@ HTTP header, etc.).
 -export([fetch_token/1, apply_auth/4]).
 
 fetch_token(#{url := Url, api_key := Key}) ->
-    case httpc:request(get, {binary_to_list(Url), []}, [], []) of
+    Request = {binary_to_list(Url), [{"x-api-key", binary_to_list(Key)}]},
+    case httpc:request(get, Request, [], [{body_format, binary}]) of
         {ok, {{_, 200, _}, _, Body}} ->
-            Token = proplists:get_value(<<"token">>, json:decode(Body)),
-            %% Return metadata so the cache knows when to refresh
+            #{<<"token">> := Token} = json:decode(Body),
             {ok, {Token, #{expires_in => 3600}}};
-        _ ->
-            {error, token_fetch_failed}
+        {ok, {{_, Status, _}, _, _}} ->
+            {error, {http_status, Status}};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 apply_auth(Token, Url, Headers, _Config) ->
@@ -57,7 +59,8 @@ scheduling.
 fetch_token(Config) ->
     {ok, <<"abc123">>}.
 
-%% With expiry — cache will refresh 60 s before this
+%% With expiry — the cache refreshes `refresh_margin` seconds (default 60)
+%% before this
 fetch_token(Config) ->
     {ok, {<<"abc123">>, #{expires_in => 7200}}}.
 ```

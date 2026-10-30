@@ -33,7 +33,7 @@
 # doing its job. A flat refusal count with failing handshakes is NOT the
 # regulator — look at the run queue instead.
 #
-# Same discipline as check-tripwires.sh: `bondy eval`, not /metrics (the
+# Same discipline as check-tripwires.sh: `bondy-connect eval`, not /metrics (the
 # runtime image ships no curl); `-1` is an in-band "could not read" sentinel so
 # a failed probe can never be mistaken for a zero.
 #
@@ -67,7 +67,7 @@ MACHINES=$(fly machines list --app "$APP" --json \
 # id -> private_ip, resolved ONCE (this script samples in a loop; one API call
 # per sample per machine would dominate the sampling interval).
 #
-# Each `bondy eval` below is prefixed with the machine's own
+# Each `bondy-connect eval` below is prefixed with the machine's own
 # BONDY_ERL_NODENAME because relx rewrites the shared releases/<vsn>/vm.args on
 # every `bondy` subcommand, using the invoking shell's environment. Unprefixed,
 # the SSH session supplies the Dockerfile default and the rewrite bakes
@@ -83,7 +83,7 @@ for _ in $(seq 1 "$SAMPLES"); do
     TS=$(date -u +%H:%M:%S)
     for M in $MACHINES; do
         RAW=$(fly ssh console --app "$APP" --machine "$M" \
-                --command "env BONDY_ERL_NODENAME=bondy@$(ip_of "$M") /bondy/bin/bondy eval $(printf '%s' "$READ" | tr -d '\n')" \
+                --command "env BONDY_ERL_NODENAME=bondy@$(ip_of "$M") /bondy/bin/bondy-connect eval $(printf '%s' "$READ" | tr -d '\n')" \
                 2>/dev/null \
               | tr -d ' \r' | grep -oE '\{-?[0-9]+,-?[0-9]+,-?[0-9]+,-?[0-9]+\}' | tail -1)
         if [ -z "$RAW" ]; then

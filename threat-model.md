@@ -252,7 +252,7 @@ A finding matters only if it meets its family's precondition:
 
 ## 1.5 Assumptions about the environment
 
-- **Runtime** — Erlang/OTP 28 or 29 (releases ship 29). `rebar.config` sets `minimum_otp_vsn` to `R28`. *(documented, `README.md` "Requirements")*
+- **Runtime** — Erlang/OTP 29 or later (releases ship 29). `rebar.config` sets `minimum_otp_vsn` to `29`. *(documented, `README.md` "Requirements")*
 - **Concurrency** — Bondy is a BEAM application. Per-session state is confined to its own process (P-SESSION-CONFINEMENT), but Bondy is **not** share-nothing: the projection, the clock, the registry, and the rate-limit buckets are deliberately shared, each with its own discipline. The model assumes the BEAM's process isolation, its scheduler, and the `atomics`/ETS concurrency semantics hold. *(maintainer, 2026-08)*
 - **Clock** — replication uses hybrid logical clocks. Each replica's clock is strictly monotonic (P-HLC-MONOTONIC), but nothing bounds skew *between* replicas (D-CLOCK-SKEW). Keeping node clocks synchronized is therefore an operator responsibility with a correctness consequence, not merely an operational nicety. *(maintainer, 2026-08)*
 - **Filesystem** — the data directory is private to the Bondy user. The release Docker image runs as a non-root `bondy:bondy` user. *(documented, `deployment/Dockerfile:131` and `deployment/alpine.Dockerfile:117` — `USER bondy:bondy`)*

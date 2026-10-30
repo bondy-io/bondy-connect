@@ -2,6 +2,8 @@
 ## 1.0.0
 
 ### Action required
+* The release and its start script are named `bondy-connect`: run `bin/bondy-connect` in place of `bin/bondy`, and the tarball is `bondy-connect-1.0.0.tar.gz`. The Docker images start `bondy-connect foreground`. The `/bondy` paths, node names, `BONDY_*` environment variables and `etc/bondy.conf` are unchanged.
+* Images are published as `leapsight/bondy-connect` on Docker Hub and `ghcr.io/bondy-io/bondy-connect` on GHCR, and the repository is `github.com/bondy-io/bondy-connect`. Update image references and git remotes. The `leapsight/bondy` and `ghcr.io/bondy-io/bondy` images stay pullable but receive no new tags.
 * Upgrading from `1.0.0-rc.65` (or previous versions) requires a new cluster: PlumDB data is not readable by this release. See the [migration guide](doc/guides/configuration/migrating_from_1.0.0-rc.65.md).
 * A single-node deployment must set `cluster.enabled = off`; with `on` and no other member, compaction, reclamation, origin retirement and the authentication freshness fence hold. See [Clustering](doc/guides/configuration/clustering.md#running-a-single-node).
 * Listeners are declared under `listeners.$name.*`; the fixed per-scheme listener keys are removed, and every enabled `tls` listener must state its certificate. See [Listeners](doc/guides/configuration/listeners.md#migrating-from-the-pre-10-keys).
@@ -10,7 +12,11 @@
 * `advanced.config` stanzas for the router move from `{bondy, …}` to `{bondy_router, …}`, and remote-console module names changed. See the [migration guide](doc/guides/configuration/migrating_from_1.0.0-rc.65.md).
 * A custom `bondy_oplog_cache_adapter` must implement `ticket/1` and `fill/5` in place of `put/4`.
 * An API Gateway specification with a key the parser does not know is refused, at the host, version, path, method, action and response levels, in `defaults` and in a security scheme; a misspelt key used to be dropped and its default applied. A security scheme's `scopes` is refused: the gateway checks no OAuth2 scope.
+* The `wamp.registration.*`, `wamp.subscription.*`, `wamp.session.get` and `wamp.reflection.*` procedures take the arguments the WAMP specification gives and read the caller's realm; none takes a realm argument. A client that named the realm as the first argument drops it, and a master-realm session that read another realm calls the realm-first `bondy.*` procedure instead: `bondy.registration.get`, `bondy.registration.list_callees`, `bondy.registration.count_callees`, `bondy.subscription.get`, `bondy.subscription.list_subscribers` and `bondy.subscription.count_subscribers` are new for this. `wamp.registration.match` returns one id; `wamp.registration.get` and `wamp.subscription.get` take no `details` argument.
+* `bondy.registration.callee.list`, `bondy.user.change_password` and `bondy.source.match` require the realm as their first argument: each also takes an optional trailing argument, so an omitted realm made a call readable two ways.
+* The Admin API's `/realms/:realm_uri/registrations_summary` and `/realms/:realm_uri/subscriptions_summary` are removed; `/realms/:realm_uri/registrations` and `/realms/:realm_uri/subscriptions` list every id with its match policy.
 * The `wamp_call` action's `retry_timeout` is removed. Its `retries` becomes the CALL option `_retries` when the action's `options` set none, so the dealer retries only a registration that set `_idempotent`.
+* `REGISTER.Options.invoke` takes only the WAMP invocation policies (`single`, `roundrobin`, `random`, `first`, `last`): `jump_consistent_hash`, `queue_least_loaded`, `queue_least_loaded_sample` and their short names `jch`, `qll` and `qlls` are refused. The `_routing_key` option of CALL, CANCEL and PUBLISH is removed; a partitioned CALL names its key with `rkey`.
 
 ### New Features
 * New storage and replication stack replacing PlumDB/RocksDB: `bondy_db` on `bondy_oplog` and the vendored `bondy_mst`. See [Database architecture](doc/guides/architecture/db_architecture.md) and [Database options](doc/guides/configuration/database_options.md).
@@ -49,7 +55,7 @@
 * An SSO user that other realms link to, and a realm that other realms use as prototype or SSO realm, can no longer be removed.
 
 ### Improvements
-* Built and shipped on Erlang/OTP 29; OTP 28 still builds the tree. See [Runtime requirements](doc/guides/deployment/runtime_requirements.md).
+* Built and shipped on Erlang/OTP 29, which is now the minimum version to build. See [Runtime requirements](doc/guides/deployment/runtime_requirements.md).
 * New `listeners.$name.http.*` options: `max_authorization_header_value_length`, `max_cookie_header_value_length`, `max_authority_length`, `invalid_response_headers`, `max_concurrent_streams` and `max_cookies`. See [Listeners](doc/guides/configuration/listeners.md#request-limits).
 * Prometheus metrics for the storage stack, the router and the BEAM, and a bundled Prometheus and Grafana stack under `monitoring/`. See [Metrics](doc/guides/reference/metrics.md).
 * `bondy_http_connector` metrics, dashboard and per-service liveness probe. See [HTTP connector](doc/guides/configuration/http_connector.md).
@@ -166,6 +172,24 @@
 * The `forward` action garbled upstream bodies: JSON was decoded and re-encoded, text was quoted, and every body was labelled `application/json`. The upstream's bytes and content type are sent as received.
 * The HTTP connector reported pending credentials and a failed token fetch as `bondy.error.bad_gateway` (502) instead of `bondy.error.unavailable` (503), and its own crashes as `bad_gateway` instead of `bondy.error.internal_error` (500).
 * `bondy_connect_sdk` failed a call that asked for `_retries` after its first timeout.
+* A MessagePack client that called `wamp.registration.get` or `wamp.subscription.get` lost its connection. `created` is sent as an ISO 8601 string to every client, as the WAMP specification defines it.
+* A `null` in a WAMP payload reached HTTP connector upstreams and MCP clients as the string `"undefined"`. The HTTP connector request body and every MCP response use the WAMP JSON encoder, so `null` stays `null`. Floats are written with 16 decimals, as WAMP JSON clients receive them.
+* A JSON or CBOR `null` reached the router as a different term from a MessagePack nil, so the same message got a different outcome per serializer. A nil option such as `timeout` was rejected from MessagePack and CBOR clients, and a JSON client using `bondy_connect_sdk` received `null` in payloads where MessagePack gave `undefined`. Every serializer now decodes nil as `undefined`, and a nil option is treated as absent.
+* A datetime or a key-value list in a payload from an in-VM callee ended a MessagePack client's connection. MessagePack sends them as the RFC 3339 string and the object that JSON and CBOR send.
+* A list of datetimes in a payload from an in-VM callee failed to encode for JSON, CBOR and MessagePack clients alike. It goes out as a list of RFC 3339 strings.
+* `serializers.json.float_format` in `bondy.conf` had no effect: WAMP JSON always used `[{decimals, 16}]`. The configured format reaches the encoder.
+* An HTTP connector `auth.fetch.error_path` that found JSON `null` in a token response failed the token fetch with `Unknown error`. A `null` there is no error.
+* An HTTP connector secret field whose value was JSON `null` was sent as the literal string `null`. It is reported as `secret_field_not_found`, as a missing field is.
+* An AWS Secrets Manager secret that was not a JSON object failed with an internal reason (`badmap`, `case_clause`, `invalid_byte`). It fails with `secret_not_json` or `secret_not_json_object`, and a field that is not a string with `secret_field_not_string`.
+* With no AWS credentials, the `aws_sm` secret provider failed with `{aws_sm, {badmatch, undefined}}`. It fails with `aws_credentials_not_found`. Any other failure inside `erlcloud` now raises to the caller instead of coming back as `{error, {aws_sm, _}}`, whose reason could carry the secret's bytes.
+* An exception raised inside `erlcloud` while fetching an `aws_sm` secret kept its arguments in the top stack frame, so a crash report could print the secret. The frame carries their arity instead.
+* `sys:get_status/1` and crash reports of an HTTP connector callee or of the connector manager printed each service's `auth_conf`, including resolved secrets and credentials written in `bondy.conf`. They show the atom `sensitive` in its place.
+* The WebSocket listener accepted the batched subprotocols (`wamp.2.json.batched`, `wamp.2.cbor.batched`, `wamp.2.msgpack.batched`, `wamp.2.erl.batched`) and then closed the connection on the first message, because Bondy cannot decode them. They are no longer negotiated: the listener picks the client's next offer, or refuses the handshake.
+* A user whose RBAC sources included `tls` or `oidcrp` could not open a WAMP session with any method: `bondy_auth:init/5` failed with `unsupported_method`. Methods that have no WAMP authentication are now skipped when Bondy computes the methods a HELLO may use.
+* The `oidc` authmethod named a module that does not exist. It is removed: a realm or source that lists it fails validation, and so does `security.ticket.authmethods`. OIDC sign-in issues tickets with `oidcrp`, which is unchanged.
+* An invalid value for `security.ticket.authmethods` crashed config generation with `badarg` instead of naming the invalid method.
+* A CALL with `runmode = "partition"` was routed by the registration's invocation policy, ignoring its `rkey`. It is now routed by a consistent hash of `rkey`, and without `rkey` it fails with `wamp.error.invalid_argument`.
+* `sys:get_status/1` on a RawSocket (TCP or TLS) connection, and any crash report for one, showed `format_status/1 crashed` in place of the connection's state.
 * Session-scoped ids wrapped to 0, and a session without a counter created one on demand.
 * An `erl`-encoded improper list or tuple crashed the connection instead of being answered with a `protocol_violation` `ABORT`.
 * Mops dropped spaces inside quoted literals, so `get('first name')` read `firstname`.

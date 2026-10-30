@@ -30,7 +30,7 @@ import java.util.stream.Collectors;
  *
  * Everything here is written against contracts read from the Bondy source:
  *
- *  - The release script `bin/bondy` cd's to the release root and its
+ *  - The release script `bin/bondy-connect` cd's to the release root and its
  *    pre-start hook renders `etc/bondy.conf` with the release's own schema,
  *    so the conf is written relative to the install dir (`/bondy`, see
  *    {@link #INSTALL_DIR}).

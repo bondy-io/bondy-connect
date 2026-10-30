@@ -456,7 +456,7 @@ notify_manifest_changed(_, []) ->
     ok;
 notify_manifest_changed(RealmUri, Kinds) ->
     Encoded = [
-        bondy_json_rpc:encode(
+        bondy_wamp_json:encode(
             bondy_json_rpc:notification(
                 <<"notifications/", (atom_to_binary(Kind))/binary,
                     "/list_changed">>,
@@ -1123,7 +1123,7 @@ translate(#event{subscription_id = SubId}, Subs) ->
     case maps:find(SubId, Subs) of
         {ok, Uri} ->
             {true,
-                bondy_json_rpc:encode(
+                bondy_wamp_json:encode(
                     bondy_json_rpc:notification(
                         <<"notifications/resources/updated">>,
                         #{<<"uri">> => Uri}

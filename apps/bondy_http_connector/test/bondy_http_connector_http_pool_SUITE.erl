@@ -51,23 +51,14 @@ init_per_suite(Config) ->
     %% `sasl`, not `kernel` — a bare CT run doesn't have it running
     %% otherwise.
     {ok, _} = application:ensure_all_started(sasl),
-    %% start_link/0 links to the calling process — init_per_suite's process
-    %% is transient (CT tears it down once this function returns), which
-    %% would take bondy_metrics' ETS tables down with it. Unlink so the
-    %% registry outlives init_per_suite for the rest of the suite.
-    MetricsPid =
-        case bondy_metrics:start_link() of
-            {ok, Pid} -> Pid;
-            {error, {already_started, Pid}} -> Pid
-        end,
-    true = unlink(MetricsPid),
+    MetricsStarted = bondy_metrics_ct:ensure_registry(),
     ok = bondy_http_connector_telemetry:init(),
     {ok, Port} = mock_auth_http_server:start(),
-    [{port, Port} | Config].
+    [{port, Port}, {metrics_started, MetricsStarted} | Config].
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
     mock_auth_http_server:stop(),
-    ok.
+    bondy_metrics_ct:stop_registry(?config(metrics_started, Config)).
 
 init_per_testcase(TC, Config) ->
     %% mock_auth_http_server:start/0 is idempotent (re-inits ETS) but the

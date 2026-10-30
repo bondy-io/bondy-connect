@@ -134,13 +134,13 @@ hardcodes that path; it is not relocatable), writes `etc/bondy.conf`
 every node's `bondy@<ip>:18086` under `cluster.peer_discovery.config.addresses`
 for `partisan_peer_discovery_list`, anti-entropy on) and
 `etc/security_config.json` (the workload realm, applied on every boot), then
-starts `bin/bondy daemon` with `RELX_REPLACE_OS_VARS=true` and
+starts `bin/bondy-connect daemon` with `RELX_REPLACE_OS_VARS=true` and
 `BONDY_ERL_NODENAME=bondy@<ip>` — the same naming a Fly deployment uses — and
 blocks until `/ready` answers 204. A node that boots degraded (its durable
 store failed to open) answers 503 and fails setup instead of taking part.
 
 The `kill-erlang-vm` nemesis is `killall -9 beam.smp` followed by
-`bin/bondy daemon` on the same data directory, so it also exercises WAL
+`bin/bondy-connect daemon` on the same data directory, so it also exercises WAL
 replay and MST recovery on restart.
 
 ## Tear down

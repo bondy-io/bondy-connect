@@ -79,7 +79,7 @@ globally (for now). Entries are immutable.
 }.
 -type wamp_meta_ext() :: #{
     id => id(),
-    created => calendar:date(),
+    created => binary(),
     uri => uri(),
     match => binary()
 }.
@@ -766,7 +766,7 @@ mg_comparator(Fun) ->
 
 -doc """
 Sorts entries based in their invocation_policy in the following order:
-`single < roundrobin < random < first < last < qll < qlls < jch`.
+`single < first < last < random < roundrobin`.
 """.
 -spec invocation_policy_comparator() -> comparator().
 
@@ -775,7 +775,7 @@ invocation_policy_comparator() ->
 
 -doc """
 Sorts entries based in their invocation_policy in the following order:
-`single < first < jch < last < qll < qlls < random < roundrobin`.
+`single < first < last < random < roundrobin`.
 Meant to work on registration type entries only.
 """.
 -spec invocation_policy_comparator(comparator()) -> comparator().
@@ -859,8 +859,10 @@ validate_match_policy(_, Options) when is_map(Options) ->
     end.
 
 %% @private
-created_format(Secs) ->
-    calendar:system_time_to_universal_time(Secs, millisecond).
+created_format(Millis) ->
+    list_to_binary(
+        calendar:system_time_to_rfc3339(Millis div 1000, [{offset, "Z"}])
+    ).
 
 %% @private
 -doc """

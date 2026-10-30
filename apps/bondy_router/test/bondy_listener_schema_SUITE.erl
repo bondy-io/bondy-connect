@@ -50,6 +50,7 @@
 -export([linger_timeout_is_in_seconds/1]).
 -export([a_security_header_can_be_switched_off_on_its_own/1]).
 -export([all_116_keys_reach_their_documented_paths/1]).
+-export([the_generated_conf_names_no_instance/1]).
 
 all() ->
     [
@@ -75,7 +76,8 @@ all() ->
         linger_timeout_rejects_below_minus_one,
         linger_timeout_is_in_seconds,
         a_security_header_can_be_switched_off_on_its_own,
-        all_116_keys_reach_their_documented_paths
+        all_116_keys_reach_their_documented_paths,
+        the_generated_conf_names_no_instance
     ].
 
 init_per_suite(Config) ->
@@ -911,6 +913,36 @@ all_116_keys_reach_their_documented_paths(Config) ->
         }
     },
     ?assertEqual(Expected, Spec).
+
+%% The release ships the conf cuttlefish generates from the schemas. A live
+%% line for a `$name` key declares an instance named after the variable, which
+%% the translation then validates as a real one.
+the_generated_conf_names_no_instance(Config) ->
+    Schema = cuttlefish_schema:files(
+        filelib:wildcard(filename:join(?config(schema_dir, Config), "*.schema"))
+    ),
+    {_, Mappings, _} = Schema,
+    Generated = cuttlefish_conf:generate(Mappings),
+    Live = [
+        hd(string:split(Line, " = "))
+     || Line <- Generated, Line =/= "", not lists:prefix("##", Line)
+    ],
+    Phantoms = [
+        cuttlefish_variable:format(
+            cuttlefish_variable:replace_match(Var, undefined)
+        )
+     || M <- Mappings,
+        Var <- [cuttlefish_mapping:variable(M)],
+        lists:any(fun(Token) -> hd(Token) =:= $$ end, Var),
+        cuttlefish_mapping:include_default(M) =:= undefined
+    ],
+    ?assertEqual([], [Key || Key <- Live, lists:member(Key, Phantoms)]),
+    File = filename:join(?config(priv_dir, Config), "generated.conf"),
+    ok = file:write_file(File, [[Line, $\n] || Line <- Generated]),
+    ?assertMatch(
+        [_ | _],
+        cuttlefish_generator:map(Schema, cuttlefish_conf:file(File))
+    ).
 
 %% =============================================================================
 %% HELPERS

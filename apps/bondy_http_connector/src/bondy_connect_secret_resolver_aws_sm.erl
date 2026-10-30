@@ -32,6 +32,13 @@ Fetches a secret from AWS Secrets Manager.
 `Ref` requires `secret_id` and `region`; an optional `field` extracts a single
 key from a JSON `SecretString`. Returns the raw bytes (or the field's value) as a
 `binary()`.
+
+Returns `{error, aws_credentials_not_found}` when `erlcloud` finds no
+credentials, and the provider's reason when AWS rejects the request. Anything
+else `erlcloud` raises propagates to the caller with the arguments in its top
+stack frame replaced by their arity, since they can hold the secret
+(`bondy_http_connector_secret_resolver_SUITE:aws_sm_no_credentials/1`,
+`aws_sm_unexpected_raise_propagates/1`, `aws_sm_raise_carries_no_arguments/1`).
 """.
 -spec fetch(bondy_connect_secret_resolver:ref()) ->
     {ok, binary()} | {error, term()}.
@@ -39,39 +46,23 @@ key from a JSON `SecretString`. Returns the raw bytes (or the field's value) as 
 fetch(#{secret_id := SecretId, region := Region} = Ref) ->
     try
         ok = ensure_transport(),
-        {ok, Config0} = erlcloud_aws:auto_config(),
-        Config = erlcloud_aws:service_config(
-            <<"sm">>, to_list(Region), Config0
-        ),
-        case erlcloud_sm:get_secret_value(SecretId, [], Config) of
-            {ok, Proplist} ->
-                SecretString = proplists:get_value(
-                    <<"SecretString">>, Proplist
+        case erlcloud_aws:auto_config() of
+            {ok, Config0} ->
+                Config = erlcloud_aws:service_config(
+                    <<"sm">>, to_list(Region), Config0
                 ),
-                extract(SecretString, maps:get(field, Ref, undefined));
-            {error, Reason} ->
+                get_secret_value(SecretId, Region, Ref, Config);
+            undefined ->
                 ?LOG_ERROR(#{
-                    description =>
-                        <<"Failed to fetch secret from AWS Secrets Manager">>,
+                    description => <<"No AWS credentials found">>,
                     secret_id => SecretId,
-                    region => Region,
-                    reason => Reason
+                    region => Region
                 }),
-                %% Return the raw provider reason; callers add their own context
-                %% (e.g. `{secret_resolution_failed, Service, Reason}`).
-                {error, Reason}
+                {error, aws_credentials_not_found}
         end
     catch
-        Class:CatchReason:Stacktrace ->
-            ?LOG_ERROR(#{
-                description => <<"Error resolving AWS Secrets Manager secret">>,
-                secret_id => SecretId,
-                region => Region,
-                class => Class,
-                reason => CatchReason,
-                stacktrace => Stacktrace
-            }),
-            {error, {aws_sm, CatchReason}}
+        error:Reason:Stacktrace ->
+            bondy_sensitive:raise(error, Reason, Stacktrace)
     end;
 fetch(Ref) ->
     {error, {invalid_ref, Ref}}.
@@ -114,14 +105,37 @@ ensure_transport() ->
 %% =============================================================================
 
 %% @private
+get_secret_value(SecretId, Region, Ref, Config) ->
+    case erlcloud_sm:get_secret_value(SecretId, [], Config) of
+        {ok, Proplist} ->
+            SecretString = proplists:get_value(<<"SecretString">>, Proplist),
+            extract(SecretString, maps:get(field, Ref, undefined));
+        {error, Reason} ->
+            ?LOG_ERROR(#{
+                description =>
+                    <<"Failed to fetch secret from AWS Secrets Manager">>,
+                secret_id => SecretId,
+                region => Region,
+                reason => Reason
+            }),
+            %% Return the raw provider reason; callers add their own context
+            %% (e.g. `{secret_resolution_failed, Service, Reason}`).
+            {error, Reason}
+    end.
+
+%% @private
 extract(SecretString, undefined) when is_binary(SecretString) ->
     {ok, SecretString};
 extract(SecretString, Field) when is_binary(SecretString) ->
-    case json:decode(SecretString) of
-        #{Field := Value} when is_binary(Value) ->
+    case bondy_connect_secret_resolver:decode_json_object(SecretString) of
+        {ok, #{Field := Value}} when is_binary(Value) ->
             {ok, Value};
-        #{} ->
-            {error, {secret_field_not_found, Field}}
+        {ok, #{Field := _}} ->
+            {error, {secret_field_not_string, Field}};
+        {ok, #{}} ->
+            {error, {secret_field_not_found, Field}};
+        {error, _} = Error ->
+            Error
     end;
 extract(_Other, _Field) ->
     {error, secret_string_missing}.

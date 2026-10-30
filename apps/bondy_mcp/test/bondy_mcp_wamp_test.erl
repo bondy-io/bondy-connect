@@ -74,6 +74,23 @@ call_result_test() ->
     #{<<"content">> := [#{<<"text">> := Text}]} = R,
     ?assertEqual(#{<<"total">> => 3}, json:decode(Text)).
 
+%% The router decodes a JSON `null` in a WAMP payload to `undefined`
+%% (`bondy_wamp_json:decode/1`), so each text rendering must turn it back
+%% into `null`, not the string "undefined".
+null_payload_value_test() ->
+    Result = #{
+        request_id => 1,
+        details => #{},
+        args => [],
+        kwargs => #{<<"a">> => undefined}
+    },
+    #{<<"content">> := [#{<<"text">> := CallText}]} =
+        bondy_mcp_wamp:call_result(Result),
+    ?assertEqual(#{<<"a">> => null}, json:decode(CallText)),
+    #{<<"contents">> := [#{<<"text">> := ReadText}]} =
+        bondy_mcp_wamp:read_result(<<"users:///1">>, Result),
+    ?assertEqual(#{<<"a">> => null}, json:decode(ReadText)).
+
 call_error_classification_test() ->
     Retryable = fun(Uri) ->
         #{

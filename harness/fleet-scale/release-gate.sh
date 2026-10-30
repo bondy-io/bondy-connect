@@ -55,7 +55,7 @@ evalf() {
     local IP; IP=$(ip_of "$M")
     local B64; B64=$(sed -e "s/@@VICTIM@@/$V/" "$F" | base64 | tr -d '\n')
     fly ssh console -a $APP --machine "$M" \
-        -C "sh -c 'echo $B64 | base64 -d > /tmp/probe.erl; env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy eval \"\$(cat /tmp/probe.erl)\"'" \
+        -C "sh -c 'echo $B64 | base64 -d > /tmp/probe.erl; env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy-connect eval \"\$(cat /tmp/probe.erl)\"'" \
         2>&1 < /dev/null | tr -d '\r' | grep -vE '^\s*$|^Connecting to'
 }
 oneline() { tr -d '\r\n ' ; echo; }
@@ -64,7 +64,7 @@ health() {
     for M in $(machines); do
         local IP; IP=$(ip_of "$M")
         echo "  $M $(fly ssh console -a $APP --machine "$M" \
-            --command "env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy eval {bondy_router_app:is_ready(),bondy_alarm_api:local_alarms()}." \
+            --command "env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy-connect eval {bondy_router_app:is_ready(),bondy_alarm_api:local_alarms()}." \
             2>&1 < /dev/null | tail -1)"
     done
 }

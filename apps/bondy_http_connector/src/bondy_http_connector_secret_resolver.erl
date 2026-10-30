@@ -55,6 +55,11 @@ Resolve secrets for a single service without crashing.
 
 Returns `{ok, ResolvedVars}` on success or `{error, Reason}` on failure.
 Used by the manager for resilient startup with retry.
+
+A mapped field that is absent from the secret, or whose value is JSON `null`,
+fails with `{secret_field_not_found, ServiceName, VarName, Field}`
+(`bondy_http_connector_secret_resolver_SUITE:resolve_services_missing_field/1`,
+`resolve_services_null_field/1`).
 """.
 -spec resolve_service_secrets(SecretsSpec :: map(), ServiceName :: binary()) ->
     {ok, ResolvedVars :: map()} | {error, term()}.
@@ -146,7 +151,14 @@ fetch_secret(
     Ref = maps:with([provider, secret_id, region], Spec),
     case bondy_connect_secret_resolver:resolve(Ref) of
         {ok, SecretString} ->
-            json:decode(SecretString);
+            case
+                bondy_connect_secret_resolver:decode_json_object(SecretString)
+            of
+                {ok, SecretMap} ->
+                    SecretMap;
+                {error, Reason} ->
+                    error({secret_resolution_failed, ServiceName, Reason})
+            end;
         {error, Reason} ->
             ?LOG_ERROR(#{
                 description =>
@@ -162,6 +174,10 @@ resolve_var_mappings(VarMappings, SecretMap, ServiceName) ->
         fun(VarName, #{field := Field} = Mapping) ->
             Transform = maps:get(transform, Mapping, none),
             case maps:find(Field, SecretMap) of
+                {ok, null} ->
+                    error(
+                        {secret_field_not_found, ServiceName, VarName, Field}
+                    );
                 {ok, RawValue} ->
                     apply_transform(RawValue, Transform);
                 error ->

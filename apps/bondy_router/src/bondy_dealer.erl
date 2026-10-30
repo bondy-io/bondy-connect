@@ -2742,15 +2742,15 @@ choose([H | T], CallOpts, LastGroup, Acc, Cont) ->
 
 %% @private
 -doc """
-Adds support for
-[Sharded Registration](https://wamp-proto.org/_static/gen/wamp_latest.html#sharded-registration)
-by transforming the call runmode and rkey properties into the ones
-expected by the extensions to `REGISTER.Options` in order to reuse Bondy's
-`jump_consistent_hash` load balancing strategy.
+The load balancer options for a CALL, built from the CALL's options in
+`Opts`. A CALL with `runmode = "partition"` is routed by
+`jump_consistent_hash` over its `rkey` instead of the registration's
+invocation policy
+([Sharded Registration](https://wamp-proto.org/_static/gen/wamp_latest.html#sharded-registration),
+caller side only).
 """.
-lb_opts(Strategy, CallOpts0) ->
-    CallOpts1 = coerce_strategy(Strategy, CallOpts0),
-    coerce_routing_key(CallOpts1).
+lb_opts(Strategy, Opts) ->
+    coerce_routing_key(coerce_strategy(Strategy, call_opts(Opts))).
 
 %% @private
 coerce_strategy(_, #{runmode := <<"partition">>} = CallOpts) ->
@@ -2960,59 +2960,8 @@ choose_rib(Matches, RealmUri, ProcUri, Opts) ->
         end,
     Locals = [E || E <- Entries, bondy_registry_entry:is_local(E)],
     StubGroups = bondy_registry_rib:match_stubs(RealmUri, ProcUri),
-    try_rib_groups(rib_groups(Locals, StubGroups), RealmUri, ProcUri, Opts).
-
-%% @private
-%% Merge local entries and remote stubs into per-(pattern, policy) groups,
-%% ordered by match-policy precedence (exact, then prefix most-specific
-%% first, then wildcard).
-rib_groups(Locals, StubGroups) ->
-    M0 = lists:foldr(
-        fun(E, Acc) ->
-            K = {
-                bondy_registry_entry:uri(E),
-                bondy_registry_entry:match_policy(E)
-            },
-            Invoke = bondy_registry_entry:get_option(
-                invoke, E, ?INVOKE_SINGLE
-            ),
-            maps:update_with(
-                K,
-                fun({Inv, Es, Ss}) -> {Inv, [E | Es], Ss} end,
-                {Invoke, [E], []},
-                Acc
-            )
-        end,
-        #{},
-        Locals
-    ),
-    M1 = lists:foldl(
-        fun({Pattern, Policy, Ns}, Acc) ->
-            K = {Pattern, Policy},
-            Invoke =
-                case Ns of
-                    [{_, S} | _] -> maps:get(invoke, S, ?INVOKE_SINGLE);
-                    [] -> ?INVOKE_SINGLE
-                end,
-            maps:update_with(
-                K,
-                fun({Inv, Es, _}) -> {Inv, Es, Ns} end,
-                {Invoke, [], Ns},
-                Acc
-            )
-        end,
-        M0,
-        StubGroups
-    ),
-    Keys = lists:sort(
-        fun(A, B) -> rib_rank(A) =< rib_rank(B) end, maps:keys(M1)
-    ),
-    [{K, maps:get(K, M1)} || K <- Keys].
-
-%% @private
-rib_rank({Pattern, ?EXACT_MATCH}) -> {0, -byte_size(Pattern)};
-rib_rank({Pattern, ?PREFIX_MATCH}) -> {1, -byte_size(Pattern)};
-rib_rank({Pattern, _}) -> {2, -byte_size(Pattern)}.
+    Groups = bondy_registry_rib:rank_groups(Locals, StubGroups),
+    try_rib_groups(Groups, RealmUri, ProcUri, Opts).
 
 %% @private
 %% Node-stage selection per group: `self` (summarised from the group's local

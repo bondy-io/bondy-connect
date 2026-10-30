@@ -176,4 +176,4 @@ EXPOSE 18086/tcp
 # accept the bind.
 VOLUME ["/bondy/etc", "/bondy/data", "/bondy/log", "/bondy/tmp"]
 
-ENTRYPOINT ["bondy", "foreground"]
+ENTRYPOINT ["bondy-connect", "foreground"]

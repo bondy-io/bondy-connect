@@ -18,7 +18,7 @@ kill_timeout   = "30s"
 
 [experimental]
   # Source the bring-up hook (node name from 6PN IP) then exec Bondy.
-  entrypoint = ["/bin/bash", "-c", "source /bondy/setup.sh && exec bin/bondy foreground"]
+  entrypoint = ["/bin/bash", "-c", "source /bondy/setup.sh && exec bin/bondy-connect foreground"]
 
 [env]
   BONDY_DATA_DIR                = "/bondy/data"

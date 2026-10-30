@@ -5,15 +5,20 @@
 
 -module(bondy_registry_api).
 -moduledoc """
-The `bondy.*` registry introspection procedures — the **paginated** family
-(`bondy.registration.list|match`, `bondy.subscription.list|match`,
-`bondy.registration.callee.list`).
+The `bondy.*` registry introspection procedures. Each takes the realm it reads
+as its first argument, so a master-realm session can read any realm; the
+`wamp.*` meta procedures in `bondy_wamp_meta_api` read the caller's own realm
+only.
 
-A thin adapter over `bondy_registry_meta`: it reads the `limit` / `cursor`
-KWArgs (bounded by `bondy_registry_meta:{default,max}_page_size/0`),
-runs the distributed keyset page, and externalises it with
-`bondy_pagination:to_external/1`. The spec-frozen, bounded `wamp.*` equivalents
-live in `bondy_wamp_meta_api`.
+The enumerations are **paginated** (`bondy.registration.list|match`,
+`bondy.subscription.list|match`, `bondy.registration.callee.list`): a thin
+adapter over `bondy_registry_meta` reads the `limit` / `cursor` KWArgs (bounded
+by `bondy_registry_meta:{default,max}_page_size/0`), runs the distributed
+keyset page, and externalises it with `bondy_pagination:to_external/1`.
+
+The procedures addressed by an id (`bondy.registration.get|list_callees|
+count_callees`, `bondy.subscription.get|list_subscribers|count_subscribers`)
+return what their `wamp.*` namesakes return for the caller's realm.
 """.
 -behaviour(bondy_wamp_api).
 
@@ -50,6 +55,36 @@ handle_call(?BONDY_REGISTRATION_MATCH, M, Ctxt) ->
 handle_call(?BONDY_REGISTRATION_CALLEE_LIST, M, Ctxt) ->
     Args = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 1, 2),
     reply_page(M, paginated_callees(Args, M));
+handle_call(?BONDY_REGISTRATION_GET, M, Ctxt) ->
+    [RealmUri, Id] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
+    reply_value(
+        M,
+        registration,
+        Id,
+        bondy_registry_meta:get(
+            registration, RealmUri, Id
+        )
+    );
+handle_call(?BONDY_REGISTRATION_LIST_CALLEES, M, Ctxt) ->
+    [RealmUri, Id] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
+    reply_value(
+        M,
+        registration,
+        Id,
+        bondy_registry_meta:list_members(
+            registration, RealmUri, Id
+        )
+    );
+handle_call(?BONDY_REGISTRATION_COUNT_CALLEES, M, Ctxt) ->
+    [RealmUri, Id] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
+    reply_value(
+        M,
+        registration,
+        Id,
+        bondy_registry_meta:count_members(
+            registration, RealmUri, Id
+        )
+    );
 %% -----------------------------------------------------------------------------
 %% bondy.subscription.*
 %% -----------------------------------------------------------------------------
@@ -59,6 +94,36 @@ handle_call(?BONDY_SUBSCRIPTION_LIST, M, Ctxt) ->
 handle_call(?BONDY_SUBSCRIPTION_MATCH, M, Ctxt) ->
     [RealmUri, Uri] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
     reply_page(M, paginated_match(subscription, RealmUri, Uri, M));
+handle_call(?BONDY_SUBSCRIPTION_GET, M, Ctxt) ->
+    [RealmUri, Id] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
+    reply_value(
+        M,
+        subscription,
+        Id,
+        bondy_registry_meta:get(
+            subscription, RealmUri, Id
+        )
+    );
+handle_call(?BONDY_SUBSCRIPTION_LIST_SUBSCRIBERS, M, Ctxt) ->
+    [RealmUri, Id] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
+    reply_value(
+        M,
+        subscription,
+        Id,
+        bondy_registry_meta:list_members(
+            subscription, RealmUri, Id
+        )
+    );
+handle_call(?BONDY_SUBSCRIPTION_COUNT_SUBSCRIBERS, M, Ctxt) ->
+    [RealmUri, Id] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
+    reply_value(
+        M,
+        subscription,
+        Id,
+        bondy_registry_meta:count_members(
+            subscription, RealmUri, Id
+        )
+    );
 handle_call(_, M, _) ->
     E = bondy_wamp_api_utils:no_such_procedure_error(M),
     {reply, E}.
@@ -66,6 +131,15 @@ handle_call(_, M, _) ->
 %% =============================================================================
 %% PRIVATE
 %% =============================================================================
+
+%% @private
+reply_value(M, Type, Id, Result) ->
+    case bondy_wamp_api_utils:entry_result(Type, Id, Result) of
+        {ok, Value} ->
+            {reply, bondy_wamp_message:result(M#call.request_id, #{}, [Value])};
+        {error, Reason} ->
+            {reply, bondy_wamp_api_utils:error(Reason, M)}
+    end.
 
 %% @private
 reply_page(M, {ok, PageMap}) ->

@@ -278,7 +278,7 @@ send_message(Conn, Msg) ->
 %% POST with auth applied, retrying once on a 401/403 with a fresh token
 %% (the connector's own posture for an upstream auth rejection).
 post(#{url := Url, pool := Pool} = Conn, Msg) ->
-    Body = bondy_json_rpc:encode(Msg),
+    Body = bondy_wamp_json:encode(Msg),
     Headers0 = [
         {~"content-type", ~"application/json"},
         {~"accept", ~"application/json, text/event-stream"}

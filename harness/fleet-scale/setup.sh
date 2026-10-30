@@ -32,4 +32,4 @@ echo "nofile after (root):  soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
 # and is not guaranteed to forward signals cleanly.
 cd /bondy
 exec setpriv --reuid=bondy --regid=bondy --clear-groups --inh-caps=-all \
-    bin/bondy foreground
+    bin/bondy-connect foreground

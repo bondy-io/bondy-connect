@@ -28,7 +28,7 @@ structural deletion, truncation, and a durable packfile store.
 | **Operations** | `bondy_mst_admin` | Cold backup and restore of a storage directory, with a SHA-256 manifest and verification. |
 
 This library is the primitive. The operation-log datastore of the
-[Bondy umbrella](https://github.com/bondy-io/bondy) is built on it:
+[Bondy umbrella](https://github.com/bondy-io/bondy-connect) is built on it:
 `bondy_oplog` is the write and replication framework, and `bondy_db` is the
 database facade. Use them when you want typed tables, a write-ahead log,
 compaction and replication schedulers.
@@ -367,7 +367,7 @@ storage path and give the snapshot to `backup/2,3`.
 | [Backup and restore](doc_extras/architecture/08_backup_and_restore.md) | Operator runbook for `bondy_mst_admin`. |
 
 The layers built on this library are described in the
-[Bondy umbrella](https://github.com/bondy-io/bondy), under
+[Bondy umbrella](https://github.com/bondy-io/bondy-connect), under
 `apps/bondy_db/doc_extras/architecture/`. The MST and Canteen papers are under
 [`reference/`](reference/).
 
@@ -391,7 +391,7 @@ rebar3 `git_subdir` dependency:
 ```erlang
 {deps, [
     {bondy_mst,
-        {git_subdir, "https://github.com/bondy-io/bondy.git",
+        {git_subdir, "https://github.com/bondy-io/bondy-connect.git",
             {branch, "develop"}, "apps/bondy_mst"}}
 ]}.
 ```

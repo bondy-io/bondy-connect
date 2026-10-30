@@ -320,7 +320,7 @@ read_result(Uri, #{args := Args, kwargs := KwArgs}) ->
             #{
                 <<"uri">> => Uri,
                 <<"mimeType">> => <<"application/json">>,
-                <<"text">> => iolist_to_binary(json:encode(Structured))
+                <<"text">> => bondy_wamp_json:encode(Structured)
             }
         ]
     }.
@@ -533,7 +533,7 @@ is_input_request(_) ->
 text_content(Structured) ->
     #{
         <<"type">> => <<"text">>,
-        <<"text">> => iolist_to_binary(json:encode(Structured))
+        <<"text">> => bondy_wamp_json:encode(Structured)
     }.
 
 %% @private

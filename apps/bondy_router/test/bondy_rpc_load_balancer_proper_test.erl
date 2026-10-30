@@ -126,8 +126,7 @@ prop_jch_deterministic() ->
         end
     ).
 
-%% `random` (and the queue_least_loaded family, which the node stage maps
-%% to weighted random): node frequencies over many draws must match the
+%% `random`: node frequencies over many draws must match the
 %% count weights — the node stage contributes P(node) = count/Σcount, so
 %% composed with the owner's uniform 1/count the per-entry distribution is
 %% uniform, exactly as single-stage random selection over all entries.

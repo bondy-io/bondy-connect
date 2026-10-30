@@ -37,6 +37,10 @@ distributed query. This module runs that query:
   `not_found` from `unavailable`. A "here is a page" answer is understood as
   best-effort; a "the entry does not exist" answer must not lie.
 
+- **`best_match/3`** — the registration a `CALL` would reach: the best-ranked
+  group from the local entries and the RIB stubs, then that group's oldest
+  entry, read locally or from the one node whose stub summary is earliest.
+
 - **`page_members/4`** — the same walk with a different projection: each value
   is the `{node, session_id}` of a callee/subscriber rather than the entry
   itself. Backs `bondy.registration.callee.list`.
@@ -94,12 +98,14 @@ from its own local registry. The node-local leg reads full entries
 -export_type([page_opts/0]).
 
 %% API
+-export([best_match/3]).
 -export([count/3]).
 -export([count_members/3]).
 -export([default_page_size/0]).
 -export([get/3]).
 -export([list/3]).
 -export([list_members/3]).
+-export([lookup/4]).
 -export([page_members/4]).
 -export([match/4]).
 -export([max_page_size/0]).
@@ -140,9 +146,10 @@ list(Type, RealmUri, Opts) ->
     do_page(Type, RealmUri, ?ALL, entry, Opts).
 
 -doc """
-As `list/3`, but restricted to the entries whose registered/subscribed URI
-matches `Uri` according to each entry's match policy (the meta `match`
-operation). Same page shape and cursor discipline as `list/3`.
+As `list/3`, but restricted to the entries whose registered or subscribed
+pattern matches `Uri` under the entry's own match policy: the entries the
+router would route `Uri` to. Same page shape and cursor discipline as
+`list/3`.
 """.
 -spec match(
     Type :: entry_type(),
@@ -154,6 +161,27 @@ operation). Same page shape and cursor discipline as `list/3`.
 
 match(Type, RealmUri, Uri, Opts) when is_binary(Uri) ->
     do_page(Type, RealmUri, Uri, entry, Opts).
+
+-doc """
+The registration a `CALL` to `Uri` would be routed to: the oldest entry of the
+best-ranked `(Pattern, Policy)` group (`bondy_registry_rib:rank_groups/2`).
+Each callee of a shared registration is its own entry with its own id, so the
+group's oldest entry names it.
+
+The group's local entries are read here; a group held only by peers is
+resolved by asking the node whose stub summary has the earliest entry. When
+that node no longer holds one, or cannot be reached, the next candidate and
+then the next group are tried. Returns `{error, unavailable}` when a candidate
+could not be reached and no other answered, `{error, not_found}` otherwise.
+""".
+-spec best_match(registration, RealmUri :: uri(), Uri :: uri()) ->
+    {ok, map()} | {error, not_found | unavailable}.
+
+best_match(registration, RealmUri, Uri) when is_binary(Uri) ->
+    Locals = local_find_matches(registration, RealmUri, Uri),
+    StubGroups = bondy_registry_rib:match_stubs(RealmUri, Uri),
+    Groups = bondy_registry_rib:rank_groups(Locals, StubGroups),
+    oldest_in_groups(Groups, RealmUri, not_found).
 
 -doc """
 The cluster-wide number of entries of `Type` matching `Uri` in `RealmUri`,
@@ -168,7 +196,7 @@ disagree with an enumerated `match` page under churn.
 ) -> {ok, non_neg_integer()}.
 
 count(Type, RealmUri, Uri) when is_binary(Uri) ->
-    Local = length(local_match(Type, RealmUri, Uri)),
+    Local = length(local_find_matches(Type, RealmUri, Uri)),
     Remote = lists:sum([
         maps:get(count, Summary, 0)
      || {_Node, Summary} <-
@@ -177,11 +205,12 @@ count(Type, RealmUri, Uri) when is_binary(Uri) ->
     {ok, Local + Remote}.
 
 -doc """
-The number of callees (`registration`) / subscribers (`subscription`) for the
-entry identified by `Id`, cluster-wide. `Id` is first resolved to its
-procedure/topic URI (a broadcast `get/3`), then counted as `count/3` for that
-URI: the members whose registration/subscription matches it (routing demand),
-which for a plain exact registration is exactly its callee count. Best-effort AP.
+The number of callees (`registration`) / subscribers (`subscription`) attached
+to the entry identified by `Id`, cluster-wide. `Id` is first resolved to its
+`(Uri, Policy)` key (a broadcast `get/3`); the count is this node's own entries
+under that key plus the stub summary counts the RIB holds for it. Entries under
+another policy are other registrations/subscriptions and are not counted, even
+when their pattern matches `Uri`. Best-effort AP.
 
 Backs the WAMP `count_callees` / `count_subscribers` meta procedures. Returns
 `{error, not_found}` when `Id` exists on no reachable node, or `{error,
@@ -194,15 +223,22 @@ unavailable}` when a node could not be reached to confirm the id's absence.
 ) -> {ok, non_neg_integer()} | {error, not_found | unavailable}.
 
 count_members(Type, RealmUri, Id) ->
-    with_resolved_uri(Type, RealmUri, Id, fun(Uri) ->
-        count(Type, RealmUri, Uri)
+    with_resolved_key(Type, RealmUri, Id, fun(Uri, Policy) ->
+        Local = length(local_key_entries(Type, RealmUri, Uri, Policy)),
+        Remote = lists:sum([
+            maps:get(count, Summary, 0)
+         || {_, Summary} <-
+                bondy_registry_rib:stub_nodes(Type, RealmUri, Policy, Uri)
+        ]),
+        {ok, Local + Remote}
     end).
 
 -doc """
 The WAMP session ids of the callees (`registration`) / subscribers
-(`subscription`) for the entry identified by `Id`, cluster-wide. `Id` is resolved
-to its URI (a broadcast `get/3`); then every node the RIB says holds a matching
-entry is asked for its LOCAL member session ids and the union is returned. The
+(`subscription`) attached to the entry identified by `Id`, cluster-wide. `Id` is
+resolved to its `(Uri, Policy)` key (a broadcast `get/3`); then every node the
+RIB says holds an entry under that key is asked for its LOCAL member session ids
+and the union is returned. The
 session ids themselves are never replicated (only summary counts are), so they
 are gathered from each owner on demand. Best-effort AP: an unreachable node's
 members are silently omitted.
@@ -218,21 +254,45 @@ Backs the WAMP `list_callees` / `list_subscribers` meta procedures. Returns
 ) -> {ok, [id()]} | {error, not_found | unavailable}.
 
 list_members(Type, RealmUri, Id) ->
-    with_resolved_uri(Type, RealmUri, Id, fun(Uri) ->
-        {ok, gather_members(Type, RealmUri, Uri)}
+    with_resolved_key(Type, RealmUri, Id, fun(Uri, Policy) ->
+        {ok, gather_members(Type, RealmUri, Uri, Policy)}
     end).
+
+-doc """
+The entry managing `Uri` under `Policy`: of the entries stored under exactly
+that `(Uri, Policy)` key, cluster-wide, the oldest. Each callee or subscriber
+holds its own entry, so the oldest names the key. The local entries are read
+here and peers holding the key are asked in stub-summary age order.
+
+Backs the WAMP `lookup` meta procedures. Returns `{error, unavailable}` when a
+peer holding the key could not be reached and no other answered,
+`{error, not_found}` otherwise.
+""".
+-spec lookup(
+    Type :: entry_type(),
+    RealmUri :: uri(),
+    Uri :: uri(),
+    Policy :: binary()
+) -> {ok, map()} | {error, not_found | unavailable}.
+
+lookup(Type, RealmUri, Uri, Policy) when is_binary(Uri) ->
+    Locals = local_key_entries(Type, RealmUri, Uri, Policy),
+    Stubs = bondy_registry_rib:stub_nodes(Type, RealmUri, Policy, Uri),
+    oldest_candidate(
+        candidates(Locals, Stubs), Type, RealmUri, Uri, Policy, not_found
+    ).
 
 -doc """
 As `list_members/3`, but addressed by URI rather than by entry id, and pairing
 each session id with the node that holds it — `{Nodestring, SessionId}`.
 
-`Uri` is either a procedure/topic URI (members whose entry matches it) or the
-atom `all` (every member in the realm).
+`Uri` is either a procedure/topic URI (the members of the entries stored under
+exactly `(Uri, exact)`) or the atom `all` (every member in the realm). A
+pattern entry that would route `Uri` is not one of its members.
 
 Same cursor discipline, node walk and `page_opts()` as `list/3` and `match/4` —
 this is the same keyset walk with a different projection, not a second
-mechanism. `Query` is a procedure/topic URI (members whose entry matches it) or
-the atom `all` (every member in the realm).
+mechanism.
 
 Values are `#{node => Nodestring, session_id => Id}`. The node is the point:
 `list_members/3` returns a bare union of session ids because its caller (the
@@ -264,7 +324,7 @@ Two consequences of paging an ENTRY-keyed walk, both deliberate:
 page_members(Type, RealmUri, all, Opts) ->
     do_page(Type, RealmUri, ?ALL, callee, Opts);
 page_members(Type, RealmUri, Uri, Opts) when is_binary(Uri) ->
-    do_page(Type, RealmUri, Uri, callee, Opts).
+    do_page(Type, RealmUri, {Uri, ?EXACT_MATCH}, callee, Opts).
 
 -doc "Default page size for the `bondy.*` paginated procedures.".
 -spec default_page_size() -> pos_integer().
@@ -380,10 +440,23 @@ handle_call({get, Type, RealmUri, Id}, From, State) ->
         )
     end),
     {noreply, State};
-handle_call({members, Type, RealmUri, Uri}, From, State) ->
+handle_call({oldest, Type, RealmUri, Pattern, Policy}, From, State) ->
     _ = spawn(fun() ->
         partisan_gen_server:reply(
-            From, peer_reply(fun() -> local_members(Type, RealmUri, Uri) end)
+            From,
+            peer_reply(fun() ->
+                local_oldest(Type, RealmUri, Pattern, Policy)
+            end)
+        )
+    end),
+    {noreply, State};
+handle_call({members, Type, RealmUri, Uri, Policy}, From, State) ->
+    _ = spawn(fun() ->
+        partisan_gen_server:reply(
+            From,
+            peer_reply(fun() ->
+                local_members(Type, RealmUri, Uri, Policy)
+            end)
         )
     end),
     {noreply, State};
@@ -524,26 +597,29 @@ remote_page(Type, RealmUri, Query, Kind, Node, AfterId, Need) ->
 %% @private
 %% This node's leg: `{Id, External}` pairs of `Type` in `RealmUri`, ascending by
 %% `EntryId`, up to `Need`, strictly past `AfterId`. `list` (Query = `?ALL`) is a
-%% bounded ordered-ETS keyset select; `match` materialises the (small) local
-%% matched set and slices it by id.
+%% bounded ordered-ETS keyset select; a URI query (routing direction) or a
+%% `{Uri, Policy}` query (key direction) materialises the (small) local set and
+%% slices it by id.
 local_page(Type, RealmUri, ?ALL, Kind, AfterId, Need) ->
     Entries = bondy_registry:list_local(Type, RealmUri, AfterId, Need),
     [external_pair(E, Kind) || E <- Entries];
+local_page(Type, RealmUri, {Uri, Policy}, Kind, AfterId, Need) ->
+    Entries = local_key_entries(Type, RealmUri, Uri, Policy),
+    page_slice(Entries, Kind, AfterId, Need);
 local_page(Type, RealmUri, Uri, Kind, AfterId, Need) when is_binary(Uri) ->
-    %% `match` has no id-ordered index, so the local matched set is materialised
-    %% and sliced per page — O(local matches) per page. That cardinality is the
-    %% registrations/subscriptions for ONE uri (bounded by the invocation
-    %% policy: 1 for `single`, the callee count for a shared registration), so
-    %% it is cheap in practice; only a very-high-fanout shared registration pays
-    %% a per-page cost. Filter by the keyset bound BEFORE sorting so later pages
-    %% sort a smaller set.
-    Matches = local_match(Type, RealmUri, Uri),
+    page_slice(local_find_matches(Type, RealmUri, Uri), Kind, AfterId, Need).
+
+%% @private
+%% Neither query direction has an id-ordered index, so each page re-reads and
+%% sorts the set for ONE uri: one entry per callee or subscriber. Filtering by
+%% the keyset bound before sorting lets later pages sort a smaller set.
+page_slice(Entries, Kind, AfterId, Need) ->
     Seeked =
         case AfterId of
             undefined ->
-                Matches;
+                Entries;
             _ ->
-                [E || E <- Matches, bondy_registry_entry:id(E) > AfterId]
+                [E || E <- Entries, bondy_registry_entry:id(E) > AfterId]
         end,
     Sorted = lists:sort(
         fun(A, B) ->
@@ -575,10 +651,106 @@ external_pair(Entry, callee) ->
     {bondy_registry_entry:id(Entry), Member}.
 
 %% @private
-%% This node's local matched entries for `Uri` as a plain entry list. Reads only
-%% local full entries.
-local_match(Type, RealmUri, Uri) ->
-    extract_entries(bondy_registry:match(Type, RealmUri, Uri, #{})).
+%% This node's own entries stored under exactly `(Uri, Policy)`: the key
+%% direction, one registration or subscription.
+local_key_entries(Type, RealmUri, Uri, Policy) ->
+    Matches = bondy_registry:match(Type, RealmUri, Uri, #{match => Policy}),
+    [E || E <- extract_entries(Matches), bondy_registry_entry:is_local(E)].
+
+%% @private
+%% This node's own entries whose pattern matches `Uri`: the routing direction.
+%% The store can also hold replicated full entries owned by peers; those are
+%% answered by their owners, so they are left out here.
+local_find_matches(Type, RealmUri, Uri) ->
+    Matches = bondy_registry:find_matches(Type, RealmUri, Uri, #{}),
+    [E || E <- extract_entries(Matches), bondy_registry_entry:is_local(E)].
+
+%% @private
+oldest_in_groups([], _RealmUri, Reason) ->
+    {error, Reason};
+oldest_in_groups(
+    [{{Pattern, Policy}, {_, Locals, Stubs}} | Rest], RealmUri, Reason0
+) ->
+    Candidates = candidates(Locals, Stubs),
+    case
+        oldest_candidate(
+            Candidates, registration, RealmUri, Pattern, Policy, Reason0
+        )
+    of
+        {ok, _} = OK ->
+            OK;
+        {error, Reason} ->
+            oldest_in_groups(Rest, RealmUri, Reason)
+    end.
+
+%% @private
+%% A key's holders in age order: each local entry by its creation time, each
+%% peer by the earliest creation time its stub summary reports.
+candidates(Locals, Stubs) ->
+    Self = bondy_config:nodestring(),
+    lists:sort(
+        [{bondy_registry_entry:created(E), Self, {local, E}} || E <- Locals] ++
+            [{maps:get(earliest, S, 0), N, {remote, N}} || {N, S} <- Stubs]
+    ).
+
+%% @private
+oldest_candidate([], _, _, _, _, Reason) ->
+    {error, Reason};
+oldest_candidate([{_, _, {local, Entry}} | _], _, _, _, _, _) ->
+    {ok, bondy_registry_entry:to_external(Entry, wamp_meta)};
+oldest_candidate(
+    [{_, _, {remote, Nodestring}} | Rest],
+    Type,
+    RealmUri,
+    Pattern,
+    Policy,
+    Reason
+) ->
+    case remote_oldest(Type, RealmUri, Pattern, Policy, Nodestring) of
+        {ok, _} = OK ->
+            OK;
+        {error, not_found} ->
+            oldest_candidate(Rest, Type, RealmUri, Pattern, Policy, Reason);
+        {error, unavailable} ->
+            oldest_candidate(
+                Rest, Type, RealmUri, Pattern, Policy, unavailable
+            )
+    end.
+
+%% @private
+remote_oldest(Type, RealmUri, Pattern, Policy, Nodestring) ->
+    case rib_nodes([Nodestring]) of
+        [] ->
+            {error, not_found};
+        [Node] ->
+            Msg = {oldest, Type, RealmUri, Pattern, Policy},
+            Opts = [{timeout, ?NODE_TIMEOUT}],
+            try partisan_gen_server:call({?MODULE, Node}, Msg, Opts) of
+                {ok, {found, External}} ->
+                    {ok, External};
+                {ok, not_found} ->
+                    {error, not_found};
+                {error, unknown_request} ->
+                    {error, unavailable}
+            catch
+                exit:_ ->
+                    {error, unavailable}
+            end
+    end.
+
+%% @private
+%% This node's oldest own entry stored under exactly `(Pattern, Policy)`.
+local_oldest(Type, RealmUri, Pattern, Policy) ->
+    Entries = [
+        {bondy_registry_entry:created(E), bondy_registry_entry:id(E), E}
+     || E <- local_key_entries(Type, RealmUri, Pattern, Policy)
+    ],
+    case lists:sort(Entries) of
+        [] ->
+            not_found;
+        [{_, _, Oldest} | _] ->
+            {found, bondy_registry_entry:to_external(Oldest, wamp_meta)}
+    end.
 
 %% @private
 %% Normalise every documented shape of the routing match return to an entry
@@ -598,41 +770,44 @@ extract_entries(Entries) when is_list(Entries) ->
     Entries.
 
 %% @private
-%% Resolve `Id` to its URI via the broadcast `get/3`, then apply `Fun(Uri)`.
-%% `get/3`'s `not_found` / `unavailable` are propagated unchanged.
-with_resolved_uri(Type, RealmUri, Id, Fun) ->
+%% Resolve `Id` to its `(Uri, Policy)` key via the broadcast `get/3`, then apply
+%% `Fun(Uri, Policy)`. `get/3`'s `not_found` / `unavailable` are propagated
+%% unchanged.
+with_resolved_key(Type, RealmUri, Id, Fun) ->
     case get(Type, RealmUri, Id) of
-        {ok, External} ->
-            Fun(maps:get(uri, External));
+        {ok, #{uri := Uri, match := Policy}} ->
+            Fun(Uri, Policy);
         {error, _} = Error ->
             Error
     end.
 
 %% @private
-%% The union of every RIB-targeted node's LOCAL member session ids for `Uri`,
-%% node-at-a-time (the same uri-scoped node set as a `match` walk). Best-effort:
-%% an unreachable node contributes none.
-gather_members(Type, RealmUri, Uri) ->
+%% The union of the LOCAL member session ids of this node and of every node the
+%% RIB says holds an entry under `(Uri, Policy)`. Best-effort: an unreachable
+%% node contributes none.
+gather_members(Type, RealmUri, Uri, Policy) ->
+    Stubs = bondy_registry_rib:stub_nodes(Type, RealmUri, Policy, Uri),
+    Nodes = with_local(rib_nodes([N || {N, _} <- Stubs])),
     PerNode = [
-        node_members(Type, RealmUri, Uri, Node)
-     || Node <- node_set(Type, RealmUri, Uri)
+        node_members(Type, RealmUri, Uri, Policy, Node)
+     || Node <- Nodes
     ],
     lists:usort(lists:append(PerNode)).
 
 %% @private
-node_members(Type, RealmUri, Uri, Node) ->
+node_members(Type, RealmUri, Uri, Policy, Node) ->
     case Node =:= partisan:node() of
         true ->
-            local_members(Type, RealmUri, Uri);
+            local_members(Type, RealmUri, Uri, Policy);
         false ->
-            remote_members(Type, RealmUri, Uri, Node)
+            remote_members(Type, RealmUri, Uri, Policy, Node)
     end.
 
 %% @private
 %% Best-effort: an unreachable or erroring peer contributes an empty member list.
-remote_members(Type, RealmUri, Uri, Node) ->
+remote_members(Type, RealmUri, Uri, Policy, Node) ->
     Target = {?MODULE, Node},
-    Msg = {members, Type, RealmUri, Uri},
+    Msg = {members, Type, RealmUri, Uri, Policy},
     try partisan_gen_server:call(Target, Msg, [{timeout, ?NODE_TIMEOUT}]) of
         {ok, Members} when is_list(Members) ->
             Members;
@@ -644,10 +819,10 @@ remote_members(Type, RealmUri, Uri, Node) ->
     end.
 
 %% @private
-%% This node's local member session ids for `Uri`: the WAMP session id of each
-%% local matching entry that has a session. Internal / callback entries have no
-%% session and are skipped.
-local_members(Type, RealmUri, Uri) ->
+%% This node's local member session ids under `(Uri, Policy)`: the WAMP session
+%% id of each local entry under that key that has a session. Internal /
+%% callback entries have no session and are skipped.
+local_members(Type, RealmUri, Uri, Policy) ->
     lists:filtermap(
         fun(Entry) ->
             case bondy_registry_entry:session_id(Entry) of
@@ -657,7 +832,7 @@ local_members(Type, RealmUri, Uri) ->
                     false
             end
         end,
-        local_match(Type, RealmUri, Uri)
+        local_key_entries(Type, RealmUri, Uri, Policy)
     ).
 
 %% @private
@@ -789,10 +964,14 @@ values(callee, Tagged) ->
 %% @private
 %% The node set for a list/match walk: the local node plus ONLY the nodes the
 %% RIB says hold a matching entry (realm-scoped for `list`, uri-scoped for
-%% `match`), so the walk skips peers that could only answer empty. A node never
+%% `match`, key-scoped for a `{Uri, Policy}` query), so the walk skips peers
+%% that could only answer empty. A node never
 %% stubs itself, so unioning the local node in is exactly the full owner set.
 node_set(Type, RealmUri, ?ALL) ->
     with_local(rib_nodes(bondy_registry_rib:realm_nodestrings(Type, RealmUri)));
+node_set(Type, RealmUri, {Uri, Policy}) ->
+    Stubs = bondy_registry_rib:stub_nodes(Type, RealmUri, Policy, Uri),
+    with_local(rib_nodes([Nodestring || {Nodestring, _} <- Stubs]));
 node_set(Type, RealmUri, Uri) when is_binary(Uri) ->
     Nodestrings = [
         Nodestring

@@ -20,7 +20,6 @@
 
 -define(PASSWORD_AUTH, <<"password">>).
 -define(OAUTH2_AUTH, <<"oauth2">>).
--define(OIDC_AUTH, <<"oidc">>).
 -define(OIDCRP_AUTH, <<"oidcrp">>).
 -define(TRUST_AUTH, <<"trust">>).
 
@@ -51,9 +50,6 @@
     },
     ?OAUTH2_AUTH => #{
         callback_mod => bondy_auth_oauth2
-    },
-    ?OIDC_AUTH => #{
-        callback_mod => bondy_auth_oidc
     },
     ?OIDCRP_AUTH => #{
         callback_mod => undefined

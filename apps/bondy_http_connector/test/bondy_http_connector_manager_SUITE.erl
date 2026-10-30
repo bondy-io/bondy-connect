@@ -50,7 +50,8 @@ all() ->
         service_without_secrets_starts_pool_and_is_ready,
         service_with_secrets_resolves_and_becomes_ready,
         service_with_bad_secrets_stays_not_ready,
-        multiple_services_are_independent
+        multiple_services_are_independent,
+        status_hides_auth_conf
     ].
 
 %% ===================================================================
@@ -65,12 +66,7 @@ init_per_suite(Config) ->
     %% otherwise, and a started pool's `mark_up/1` unconditionally calls
     %% `alarm_handler:clear_alarm/1`.
     {ok, _} = application:ensure_all_started(sasl),
-    MetricsPid =
-        case bondy_metrics:start_link() of
-            {ok, Pid} -> Pid;
-            {error, {already_started, Pid}} -> Pid
-        end,
-    true = unlink(MetricsPid),
+    MetricsStarted = bondy_metrics_ct:ensure_registry(),
     ok = bondy_http_connector_telemetry:init(),
 
     %% Shared across all tests: pools are named per-service, so different
@@ -96,9 +92,15 @@ init_per_suite(Config) ->
 
     {ok, Port} = mock_auth_http_server:start(),
     BaseUrl = mock_auth_http_server:base_url(),
-    [{port, Port}, {base_url, BaseUrl}, {pool_sup, PoolSup} | Config].
+    [
+        {port, Port},
+        {base_url, BaseUrl},
+        {pool_sup, PoolSup},
+        {metrics_started, MetricsStarted}
+        | Config
+    ].
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
     try
         meck:unload(erlcloud_sm)
     catch
@@ -110,7 +112,7 @@ end_per_suite(_Config) ->
         _:_ -> ok
     end,
     mock_auth_http_server:stop(),
-    ok.
+    bondy_metrics_ct:stop_registry(?config(metrics_started, Config)).
 
 init_per_testcase(_TC, Config) ->
     Port = ?config(port, Config),
@@ -227,6 +229,15 @@ service_with_secrets(Name, BaseUrl, SecretId, VarsSpec) ->
 %% ===================================================================
 %% Tests
 %% ===================================================================
+
+status_hides_auth_conf(Config) ->
+    Service0 = plain_service(~"literal", ?config(base_url, Config)),
+    Service = Service0#{auth_conf => #{vars => #{api_key => ~"l1teral"}}},
+    ok = application:set_env(bondy_http_connector, services, []),
+    {ok, Pid} = bondy_http_connector_manager:start_link(),
+    _ = sys:replace_state(Pid, fun(State) -> setelement(2, State, [Service]) end),
+    Status = term_to_binary(sys:get_status(Pid)),
+    ?assertEqual(nomatch, binary:match(Status, ~"l1teral")).
 
 no_services_configured_is_idle(_Config) ->
     ok = application:set_env(bondy_http_connector, services, []),

@@ -8,8 +8,8 @@ builds from `erlang:29.1.2` and `deployment/alpine.Dockerfile` from
 includes the Erlang runtime (`include_erts`), so an image runs the OTP it was
 built with and needs no Erlang on the host.
 
-To build from source you need Erlang/OTP 28 or later: `rebar.config` sets
-`minimum_otp_vsn` to `"R28"`.
+To build from source you need Erlang/OTP 29 or later: `rebar.config` sets
+`minimum_otp_vsn` to `"29"`.
 
 ## TLS
 

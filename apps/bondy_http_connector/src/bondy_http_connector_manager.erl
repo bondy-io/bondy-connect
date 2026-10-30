@@ -32,6 +32,11 @@ The WAMP handler checks readiness on each call by reading this table via
 `service_readiness/1`. Callees registered before their secrets resolve
 serve calls through a slow fallback path that merges secrets per call
 until the callee is recycled by the supervisor for an unrelated reason.
+
+A service's `auth_conf` can hold credentials, so `format_status/1` replaces it
+with the atom `sensitive` before `sys:get_status/1` or a crash report sees the
+state
+(`bondy_http_connector_manager_SUITE:status_hides_auth_conf/1`).
 """.
 
 -behaviour(gen_server).
@@ -65,6 +70,7 @@ until the callee is recycled by the supervisor for an unrelated reason.
 -export([handle_info/2]).
 -export([terminate/2]).
 -export([code_change/3]).
+-export([format_status/1]).
 -export([handle_continue/2]).
 -export([handle_call/3]).
 -export([handle_cast/2]).
@@ -234,9 +240,23 @@ code_change(_OldVsn, State, _Extra) ->
 terminate(_Reason, #state{}) ->
     ok.
 
+-doc false.
+format_status(#{state := #state{services = Services} = State} = Status) ->
+    Status#{
+        state => State#state{
+            services = [sensitive_auth_conf(S) || S <- Services]
+        }
+    }.
+
 %% =============================================================================
 %% PRIVATE
 %% =============================================================================
+
+%% @private
+sensitive_auth_conf(#{auth_conf := _} = Service) ->
+    Service#{auth_conf => sensitive};
+sensitive_auth_conf(#{} = Service) ->
+    Service.
 
 resolve_secrets(Services) ->
     lists:foldl(

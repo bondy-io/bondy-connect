@@ -56,7 +56,10 @@ all() ->
         multiple_source_cidrs,
 
         %% The AE fence refuses non-bearer methods too
-        aae_fence_refuses_password_when_stale
+        aae_fence_refuses_password_when_stale,
+
+        oidc_is_not_an_authmethod,
+        a_source_for_a_method_without_wamp_auth_is_skipped
     ].
 
 init_per_suite(Config) ->
@@ -227,6 +230,35 @@ add_multi_cidr_realm(RealmUri) ->
     },
     _ = bondy_realm:create(Config),
     ok.
+
+oidc_is_not_an_authmethod(_Config) ->
+    ?assertError(
+        #{code := invalid_datatype, key := ~"authmethods"},
+        bondy_realm:create(#{
+            uri => ~"com.example.test.auth_password_oidc",
+            authmethods => [?PASSWORD_AUTH, ~"oidc"],
+            security_enabled => true
+        })
+    ).
+
+%% `tls` and `oidcrp` have no WAMP authentication module. A source that names
+%% one for a user must not stop that user from using another method.
+a_source_for_a_method_without_wamp_auth_is_skipped(_Config) ->
+    RealmUri = ~"com.example.test.auth_password_no_wamp_auth",
+    _ = bondy_realm:create(#{
+        uri => RealmUri,
+        authmethods => [?PASSWORD_AUTH, ?WAMP_TLS_AUTH, ?OIDCRP_AUTH],
+        security_enabled => true,
+        users => [#{username => ?U1, password => ?P1, groups => []}],
+        sources => [
+            #{usernames => [?U1], authmethod => M, cidr => ~"0.0.0.0/0"}
+         || M <- [?PASSWORD_AUTH, ?WAMP_TLS_AUTH, ?OIDCRP_AUTH]
+        ]
+    }),
+    {ok, Ctxt} = bondy_auth:init(
+        bondy_session_id:new(), RealmUri, ?U1, [], {127, 0, 0, 1}
+    ),
+    ?assertEqual([?PASSWORD_AUTH], bondy_auth:available_methods(Ctxt)).
 
 test_1(Config) ->
     RealmUri = ?config(realm_uri, Config),

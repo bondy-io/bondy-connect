@@ -82,6 +82,13 @@ groups() ->
             resolve_services_without_secrets,
             resolve_services_merges_with_existing_vars,
             resolve_services_missing_field,
+            resolve_services_null_field,
+            resolve_services_non_object_secret,
+            aws_sm_field_from_non_object_secret,
+            aws_sm_field_not_a_string,
+            aws_sm_no_credentials,
+            aws_sm_unexpected_raise_propagates,
+            aws_sm_raise_carries_no_arguments,
             resolve_services_aws_error,
             resolve_services_removes_secrets_from_auth_conf
         ]},
@@ -156,7 +163,9 @@ mock_secret_json() ->
     }.
 
 mock_sm_success(SecretJson) ->
-    SecretString = iolist_to_binary(json:encode(SecretJson)),
+    mock_sm_string(iolist_to_binary(json:encode(SecretJson))).
+
+mock_sm_string(SecretString) ->
     meck:expect(
         erlcloud_sm,
         get_secret_value,
@@ -367,6 +376,109 @@ resolve_services_missing_field(_Config) ->
             <<"MISSING_FIELD">>},
         bondy_http_connector_secret_resolver:resolve_services([Service])
     ).
+
+resolve_services_null_field(_Config) ->
+    mock_sm_success(#{~"FIELD" => null}),
+
+    SecretsSpec = #{
+        provider => aws_sm,
+        secret_id => ~"/test",
+        region => ~"us-east-1",
+        vars => #{my_var => #{field => ~"FIELD", transform => none}}
+    },
+    Service = make_service(~"null-svc", SecretsSpec),
+
+    ?assertError(
+        {secret_field_not_found, ~"null-svc", my_var, ~"FIELD"},
+        bondy_http_connector_secret_resolver:resolve_services([Service])
+    ).
+
+resolve_services_non_object_secret(_Config) ->
+    mock_sm_success([1]),
+
+    SecretsSpec = #{
+        provider => aws_sm,
+        secret_id => ~"/test",
+        region => ~"us-east-1",
+        vars => #{my_var => #{field => ~"FIELD", transform => none}}
+    },
+    Service = make_service(~"svc", SecretsSpec),
+
+    ?assertError(
+        {secret_resolution_failed, ~"svc", secret_not_json_object},
+        bondy_http_connector_secret_resolver:resolve_services([Service])
+    ).
+
+aws_sm_field_from_non_object_secret(_Config) ->
+    Ref = #{secret_id => ~"/test", region => ~"us-east-1", field => ~"k"},
+    mock_sm_success([1]),
+    ?assertEqual(
+        {error, secret_not_json_object},
+        bondy_connect_secret_resolver_aws_sm:fetch(Ref)
+    ),
+    mock_sm_string(~"abc"),
+    ?assertEqual(
+        {error, secret_not_json},
+        bondy_connect_secret_resolver_aws_sm:fetch(Ref)
+    ).
+
+aws_sm_field_not_a_string(_Config) ->
+    mock_sm_success(#{~"k" => 5}),
+    ?assertEqual(
+        {error, {secret_field_not_string, ~"k"}},
+        bondy_connect_secret_resolver_aws_sm:fetch(
+            #{secret_id => ~"/test", region => ~"us-east-1", field => ~"k"}
+        )
+    ).
+
+aws_sm_no_credentials(_Config) ->
+    meck:expect(erlcloud_aws, auto_config, fun() -> undefined end),
+    try
+        ?assertEqual(
+            {error, aws_credentials_not_found},
+            bondy_connect_secret_resolver_aws_sm:fetch(
+                #{secret_id => ~"/test", region => ~"us-east-1"}
+            )
+        )
+    after
+        meck:expect(erlcloud_aws, auto_config, fun() -> {ok, mock_config} end)
+    end.
+
+aws_sm_unexpected_raise_propagates(_Config) ->
+    meck:expect(
+        erlcloud_sm, get_secret_value, fun(_, [], _) -> error(boom) end
+    ),
+    ?assertError(
+        boom,
+        bondy_connect_secret_resolver_aws_sm:fetch(
+            #{secret_id => ~"/test", region => ~"us-east-1"}
+        )
+    ).
+
+%% `erlang:error/2` puts its arguments in the top stack frame, as a
+%% `function_clause` does. Covers that frame; a secret inside the reason is not.
+aws_sm_raise_carries_no_arguments(_Config) ->
+    Secret = ~"s3cr3t",
+    meck:expect(
+        erlcloud_sm,
+        get_secret_value,
+        fun(_, [], _) -> erlang:error(function_clause, [Secret]) end
+    ),
+    try
+        bondy_connect_secret_resolver_aws_sm:fetch(
+            #{secret_id => ~"/test", region => ~"us-east-1"}
+        )
+    of
+        Result ->
+            ct:fail({expected_raise, Result})
+    catch
+        error:function_clause:Stacktrace ->
+            [{_, _, Arity, _} | _] = Stacktrace,
+            ?assert(is_integer(Arity)),
+            ?assertEqual(
+                nomatch, binary:match(term_to_binary(Stacktrace), Secret)
+            )
+    end.
 
 resolve_services_aws_error(_Config) ->
     meck:expect(

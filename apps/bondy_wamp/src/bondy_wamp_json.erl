@@ -15,17 +15,8 @@ options over the Erlang `json` module.
 %% For backwards compat with jsx lib used in previous versions
 -define(DEFAULT_FLOAT_FORMAT, [{decimals, 16}]).
 -define(DEFAULT_ENCODE_OPTS, [{float_format, ?DEFAULT_FLOAT_FORMAT}]).
--define(DEFAULT_DECODE_OPTS, [{decoders, #{null => undefined}}]).
--define(IS_UINT(X), (is_integer(X) andalso X >= 0)).
--define(IS_PNUM(X), (is_number(X) andalso X >= 0)).
--define(IS_DATETIME(Y, M, D, H, Mi, S),
-    (?IS_UINT(Y) andalso
-        ?IS_UINT(M) andalso
-        ?IS_UINT(D) andalso
-        ?IS_UINT(H) andalso
-        ?IS_UINT(Mi) andalso
-        ?IS_PNUM(S))
-).
+-define(DECODERS, #{null => undefined}).
+-define(DEFAULT_DECODE_OPTS, [{decoders, ?DECODERS}]).
 
 -type encode_opt() ::
     {float_format, [float_format()]}
@@ -44,6 +35,7 @@ options over the Erlang `json` module.
 
 -export([decode/1]).
 -export([decode/2]).
+-export([decode_opts/0]).
 -export([decode_head/2]).
 -export([decode_tail/1]).
 -export([decode_tail/2]).
@@ -101,8 +93,7 @@ Raises `badarg` if the input is not one JSON value.
 -spec decode(binary()) -> term() | no_return().
 
 decode(Term) ->
-    Opts = bondy_wamp_config:get([json, decode_opts], ?DEFAULT_DECODE_OPTS),
-    decode(Term, Opts).
+    decode(Term, ?DEFAULT_DECODE_OPTS).
 
 -doc """
 Decodes one JSON value with `Opts`.
@@ -113,6 +104,15 @@ Raises `badarg` if the input is not one JSON value.
 
 decode(Term, Opts) ->
     do_decode(Term, Opts).
+
+-doc """
+The options a WAMP message is decoded with. A null decodes as `undefined`,
+as it does in `bondy_msgpack`.
+""".
+-spec decode_opts() -> [decode_opt()].
+
+decode_opts() ->
+    ?DEFAULT_DECODE_OPTS.
 
 -doc """
 Decodes only the first N control elements WAMP messages containing payloads,
@@ -151,8 +151,7 @@ check_tail(Tail) ->
 -spec decode_tail(binary()) -> term() | no_return().
 
 decode_tail(Term) ->
-    Opts = bondy_wamp_config:get([json, decode_opts], ?DEFAULT_DECODE_OPTS),
-    decode_tail(Term, Opts).
+    decode_tail(Term, ?DEFAULT_DECODE_OPTS).
 
 -doc "Decode the JSON tail binary back into Erlang terms.".
 -spec decode_tail(binary(), key_value:t()) -> term() | no_return().
@@ -252,10 +251,16 @@ do_encode(Term, Opts) ->
         ({{Y, M, D}, {H, Mi, S}}, _Encode) when
             ?IS_DATETIME(Y, M, D, H, Mi, S)
         ->
-            encode_datetime({{Y, M, D}, {H, Mi, S}});
-        ([{_, _} | _] = Value, Encode) when is_list(Value), Checked == true ->
+            json:encode_binary(
+                bondy_wamp_encoding:format_datetime({{Y, M, D}, {H, Mi, S}})
+            );
+        ([{K, _} | _] = Value, Encode) when
+            ?IS_KEY_VALUE_KEY(K), Checked == true
+        ->
             json:encode_key_value_list_checked(Value, Encode);
-        ([{_, _} | _] = Value, Encode) when is_list(Value), Checked == false ->
+        ([{K, _} | _] = Value, Encode) when
+            ?IS_KEY_VALUE_KEY(K), Checked == false
+        ->
             json:encode_key_value_list(Value, Encode);
         (Value, Encode) ->
             json:encode_value(Value, Encode)
@@ -316,64 +321,6 @@ decode_value(Term, Opts) ->
 %%
 %% =============================================================================
 
--spec encode_datetime(calendar:datetime()) -> iodata().
-
-encode_datetime({{Y, M, D}, {H, Mi, S}}) ->
-    [
-        format_year(Y),
-        $-,
-        format2digit(M),
-        $-,
-        format2digit(D),
-        $T,
-        format2digit(H),
-        $:,
-        format2digit(Mi),
-        $:,
-        format_seconds(S),
-        $Z
-    ].
-
--spec format_year(non_neg_integer()) -> iodata().
-
-format_year(Y) when Y > 999 ->
-    integer_to_binary(Y);
-format_year(Y) ->
-    B = integer_to_binary(Y),
-    [lists:duplicate(4 - byte_size(B), $0) | B].
-
--spec format2digit(non_neg_integer()) -> iolist().
-
-format2digit(0) ->
-    "00";
-format2digit(1) ->
-    "01";
-format2digit(2) ->
-    "02";
-format2digit(3) ->
-    "03";
-format2digit(4) ->
-    "04";
-format2digit(5) ->
-    "05";
-format2digit(6) ->
-    "06";
-format2digit(7) ->
-    "07";
-format2digit(8) ->
-    "08";
-format2digit(9) ->
-    "09";
-format2digit(X) ->
-    integer_to_list(X).
-
--spec format_seconds(non_neg_integer() | float()) -> iolist().
-
-format_seconds(S) when is_integer(S) ->
-    format2digit(S);
-format_seconds(S) when is_float(S) ->
-    io_lib:format("~6.3.0f", [S]).
-
 %% =============================================================================
 %% PRIVATE: PARTIAL DECODING/ENCODING
 %% =============================================================================
@@ -385,7 +332,7 @@ extract_elements(Bin, N, Acc) ->
 
     case find_element_end(Bin1) of
         {ok, ElementBin, Rest} ->
-            Element = do_decode(ElementBin, []),
+            Element = do_decode(ElementBin, ?DEFAULT_DECODE_OPTS),
 
             Rest1 = skip_whitespace(Rest),
             Rest2 =

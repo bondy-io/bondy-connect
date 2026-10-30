@@ -12,8 +12,6 @@ An implementation of `app_config` behaviour.
 -define(APP, wamp).
 -define(JSON_ENCODE_OPTS, []).
 
--define(JSON_DECODE_OPTS, []).
-
 -export([get/1]).
 -export([get/2]).
 -export([init/0]).
@@ -70,14 +68,6 @@ init_json_serialization_opts() ->
         EncodeOpts0 ->
             EncodeOpts = validate_json_opts(EncodeOpts0, ?JSON_ENCODE_OPTS),
             set([serialization, json, encode], EncodeOpts)
-    end,
-
-    case get([serialization, json, decode], undefined) of
-        undefined ->
-            set([serialization, json, decode], ?JSON_DECODE_OPTS);
-        DecodeOpts0 ->
-            DecodeOpts = validate_json_opts(DecodeOpts0, ?JSON_DECODE_OPTS),
-            set([serialization, json, decode], DecodeOpts)
     end,
 
     ok.

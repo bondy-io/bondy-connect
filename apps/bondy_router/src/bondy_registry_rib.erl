@@ -167,6 +167,7 @@ so the two views agree and report no divergence.
 -export([init/0]).
 -export([ensure_stubs_table/0]).
 -export([match_stubs/2]).
+-export([rank_groups/2]).
 -export([match_summaries/3]).
 -export([realm_nodestrings/2]).
 -export([on_entry_added/3]).
@@ -670,6 +671,69 @@ match_stubs(RealmUri, ProcUri) ->
         registration, RealmUri, ProcUri, ?WILDCARD_MATCH
     ),
     Exact ++ Prefix ++ Wildcard.
+
+-doc """
+Merges a node's local registration entries for a procedure with the remote
+stub groups from `match_stubs/2` into one group per `(Pattern, Policy)`.
+Each group is `{{Pattern, Policy}, {Invoke, LocalEntries, StubNodes}}`.
+
+The groups are ranked in match-policy precedence: exact first, then prefix
+patterns most specific first, then wildcard. The dealer tries them in this
+order to route a `CALL`, and `wamp.registration.match` answers with the first.
+""".
+-spec rank_groups(
+    Locals :: [bondy_registry_entry:t()],
+    StubGroups :: [{uri(), binary(), [{binary(), map()}]}]
+) ->
+    [
+        {
+            {uri(), binary()},
+            {binary(), [bondy_registry_entry:t()], [{binary(), map()}]}
+        }
+    ].
+
+rank_groups(Locals, StubGroups) ->
+    M0 = lists:foldr(
+        fun(E, Acc) ->
+            K = {
+                bondy_registry_entry:uri(E),
+                bondy_registry_entry:match_policy(E)
+            },
+            Invoke = bondy_registry_entry:get_option(
+                invoke, E, ?INVOKE_SINGLE
+            ),
+            maps:update_with(
+                K,
+                fun({Inv, Es, Ss}) -> {Inv, [E | Es], Ss} end,
+                {Invoke, [E], []},
+                Acc
+            )
+        end,
+        #{},
+        Locals
+    ),
+    M1 = lists:foldl(
+        fun({Pattern, Policy, Ns}, Acc) ->
+            K = {Pattern, Policy},
+            Invoke =
+                case Ns of
+                    [{_, S} | _] -> maps:get(invoke, S, ?INVOKE_SINGLE);
+                    [] -> ?INVOKE_SINGLE
+                end,
+            maps:update_with(
+                K,
+                fun({Inv, Es, _}) -> {Inv, Es, Ns} end,
+                {Invoke, [], Ns},
+                Acc
+            )
+        end,
+        M0,
+        StubGroups
+    ),
+    Keys = lists:sort(
+        fun(A, B) -> group_rank(A) =< group_rank(B) end, maps:keys(M1)
+    ),
+    [{K, maps:get(K, M1)} || K <- Keys].
 
 -doc """
 All remote stub summaries whose registered/subscribed pattern matches `Uri`,
@@ -1351,3 +1415,8 @@ db_table_for(Name) ->
         Table ->
             Table
     end.
+
+%% @private
+group_rank({Pattern, ?EXACT_MATCH}) -> {0, -byte_size(Pattern)};
+group_rank({Pattern, ?PREFIX_MATCH}) -> {1, -byte_size(Pattern)};
+group_rank({Pattern, _}) -> {2, -byte_size(Pattern)}.

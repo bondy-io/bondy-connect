@@ -2410,7 +2410,7 @@ cuttlefish_sources() ->
     [
         {ebin, "_build/default/plugins/cuttlefish/ebin"},
         {escript, "bin/cuttlefish"},
-        {escript, "_build/default/rel/bondy/bin/cuttlefish"}
+        {escript, "_build/default/rel/bondy-connect/bin/cuttlefish"}
     ].
 
 try_cuttlefish_sources([]) ->

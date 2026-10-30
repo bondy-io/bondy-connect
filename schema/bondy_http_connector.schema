@@ -92,7 +92,8 @@
 {mapping, "http_connector.services.$service.prefix",
           "bondy_http_connector.services", [
   {datatype, string},
-  {default, "/"}
+  {default, "/"},
+  {commented, "/"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -104,7 +105,8 @@
 {mapping, "http_connector.services.$service.auth_mod",
           "bondy_http_connector.services", [
   {datatype, {enum, [generic]}},
-  {default, generic}
+  {default, generic},
+  {commented, generic}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -115,7 +117,8 @@
 {mapping, "http_connector.services.$service.timeout",
           "bondy_http_connector.services", [
   {datatype, {duration, ms}},
-  {default, "30s"}
+  {default, "30s"},
+  {commented, "30s"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -127,6 +130,7 @@
           "bondy_http_connector.services", [
   {datatype, integer},
   {default, 3},
+  {commented, 3},
   {validators, ["non_negative_integer"]}
 ]}.
 
@@ -141,7 +145,8 @@
 {mapping, "http_connector.services.$service.tls_verify",
           "bondy_http_connector.services", [
   {datatype, {enum, [verify_peer, verify_none]}},
-  {default, verify_peer}
+  {default, verify_peer},
+  {commented, verify_peer}
 ]}.
 
 
@@ -168,6 +173,7 @@
           "bondy_http_connector.services", [
   {datatype, integer},
   {default, 25},
+  {commented, 25},
   {validators, ["positive_integer"]}
 ]}.
 
@@ -179,7 +185,8 @@
 {mapping, "http_connector.services.$service.pool.checkout_timeout",
           "bondy_http_connector.services", [
   {datatype, {duration, ms}},
-  {default, "5s"}
+  {default, "5s"},
+  {commented, "5s"}
 ]}.
 
 
@@ -190,7 +197,8 @@
 {mapping, "http_connector.services.$service.pool.connect_timeout",
           "bondy_http_connector.services", [
   {datatype, {duration, ms}},
-  {default, "8s"}
+  {default, "8s"},
+  {commented, "8s"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -200,7 +208,8 @@
 {mapping, "http_connector.services.$service.pool.idle_timeout",
           "bondy_http_connector.services", [
   {datatype, {duration, ms}},
-  {default, "5m"}
+  {default, "5m"},
+  {commented, "5m"}
 ]}.
 
 
@@ -211,7 +220,8 @@
 {mapping, "http_connector.services.$service.pool.recv_timeout",
           "bondy_http_connector.services", [
   {datatype, {duration, ms}},
-  {default, "60s"}
+  {default, "60s"},
+  {commented, "60s"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -221,7 +231,8 @@
 {mapping, "http_connector.services.$service.pool.follow_redirect",
           "bondy_http_connector.services", [
   {datatype, {flag, on, off}},
-  {default, off}
+  {default, off},
+  {commented, off}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -232,6 +243,7 @@
           "bondy_http_connector.services", [
   {datatype, integer},
   {default, 5},
+  {commented, 5},
   {validators, ["positive_integer"]}
 ]}.
 
@@ -272,7 +284,8 @@
 {mapping, "http_connector.services.$service.liveness.enabled",
           "bondy_http_connector.services", [
   {datatype, {flag, on, off}},
-  {default, on}
+  {default, on},
+  {commented, on}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -283,7 +296,8 @@
 {mapping, "http_connector.services.$service.liveness.path",
           "bondy_http_connector.services", [
   {datatype, string},
-  {default, "/"}
+  {default, "/"},
+  {commented, "/"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -293,7 +307,8 @@
 {mapping, "http_connector.services.$service.liveness.method",
           "bondy_http_connector.services", [
   {datatype, {enum, [get, head]}},
-  {default, head}
+  {default, head},
+  {commented, head}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -303,7 +318,8 @@
 {mapping, "http_connector.services.$service.liveness.interval",
           "bondy_http_connector.services", [
   {datatype, {duration, ms}},
-  {default, "30s"}
+  {default, "30s"},
+  {commented, "30s"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -313,7 +329,8 @@
 {mapping, "http_connector.services.$service.liveness.timeout",
           "bondy_http_connector.services", [
   {datatype, {duration, ms}},
-  {default, "5s"}
+  {default, "5s"},
+  {commented, "5s"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -326,6 +343,7 @@
           "bondy_http_connector.services", [
   {datatype, integer},
   {default, 3},
+  {commented, 3},
   {validators, ["positive_integer"]}
 ]}.
 
@@ -343,6 +361,7 @@
           "bondy_http_connector.services", [
   {datatype, integer},
   {default, 1},
+  {commented, 1},
   {validators, ["positive_integer"]}
 ]}.
 
@@ -434,7 +453,8 @@
 {mapping, "http_connector.services.$service.procedures.$proc.method",
           "bondy_http_connector.services", [
   {datatype, {enum, [get, post, put, patch, delete, head]}},
-  {default, get}
+  {default, get},
+  {commented, get}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -455,7 +475,8 @@
 {mapping, "http_connector.services.$service.procedures.$proc.path",
           "bondy_http_connector.services", [
   {datatype, string},
-  {default, "/"}
+  {default, "/"},
+  {commented, "/"}
 ]}.
 
 
@@ -470,7 +491,8 @@
 {mapping, "http_connector.services.$service.auth.fetch.method",
           "bondy_http_connector.services", [
   {datatype, {enum, [get, post]}},
-  {default, post}
+  {default, post},
+  {commented, post}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -492,7 +514,8 @@
 {mapping, "http_connector.services.$service.auth.fetch.body_encoding",
           "bondy_http_connector.services", [
   {datatype, {enum, [form, json, none]}},
-  {default, none}
+  {default, none},
+  {commented, none}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -602,7 +625,8 @@
 {mapping, "http_connector.services.$service.auth.apply.placement",
           "bondy_http_connector.services", [
   {datatype, {enum, [query_param, header]}},
-  {default, header}
+  {default, header},
+  {commented, header}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -725,7 +749,8 @@
 {mapping, "http_connector.services.$service.auth.secrets.vars.$var.transform",
           "bondy_http_connector.services", [
   {datatype, {enum, [none, basic_username, basic_password]}},
-  {default, none}
+  {default, none},
+  {commented, none}
 ]}.
 
 
@@ -743,7 +768,8 @@
 {mapping, "http_connector.services.$service.auth.cache.default_ttl",
           "bondy_http_connector.services", [
   {datatype, {duration, s}},
-  {default, "1h"}
+  {default, "1h"},
+  {commented, "1h"}
 ]}.
 
 %% -----------------------------------------------------------------------------
@@ -759,7 +785,8 @@
 {mapping, "http_connector.services.$service.auth.cache.refresh_margin",
           "bondy_http_connector.services", [
   {datatype, {duration, s}},
-  {default, "1m"}
+  {default, "1m"},
+  {commented, "1m"}
 ]}.
 
 

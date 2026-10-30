@@ -8,12 +8,12 @@
 %% `tracestate` and `baggage` are never surfaced without a `traceparent` (the
 %% W3C rule), and never invented; `attach(Opts, undefined)` is exactly `Opts`,
 %% and attach never disturbs unrelated option keys; `ensure_wamp_extensions/0`
-%% MERGES the client's declarations into the `wamp` environment — pre-existing
-%% entries survive, nothing is duplicated, and a second run changes nothing
-%% (both start orders when co-located with a router).
+%% sets the `wamp` environment to the constants `bondy_config` also sets in a
+%% router node, which declare the trace keys, and a second run changes nothing.
 -module(bondy_connect_trace_test).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
 
 -define(TP, <<"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01">>).
 -define(TS, <<"congo=t61rcWkgMzE">>).
@@ -72,36 +72,37 @@ extract_test() ->
 
 ensure_wamp_extensions_test() ->
     ok = bondy_wamp_config:init(),
-    Saved = [{P, bondy_wamp_config:get(P, [])} || P <- ?EXT_PATHS],
+    Keys = [extended_options, extended_details],
+    Saved = [{K, bondy_wamp_config:get(K, [])} || K <- Keys],
     try
-        %% A pre-existing (router-set) entry must survive the merge.
-        ok = bondy_wamp_config:set([extended_options, call], ['_routing_key']),
-        ok = lists:foreach(
-            fun(P) -> bondy_wamp_config:set(P, []) end, tl(?EXT_PATHS)
-        ),
+        _ = [ok = bondy_wamp_config:set(K, []) || K <- Keys],
         ok = bondy_connect_config:ensure_wamp_extensions(),
-        Expected = ['_traceparent', '_tracestate', '_baggage'],
-        Call1 = bondy_wamp_config:get([extended_options, call]),
-        ?assert(lists:member('_routing_key', Call1)),
-        ?assert(lists:member('_deadline', Call1)),
-        ok = lists:foreach(
-            fun(K) -> ?assert(lists:member(K, Call1)) end, Expected
+        ?assertEqual(
+            ?WAMP_EXT_OPTIONS, bondy_wamp_config:get(extended_options)
+        ),
+        ?assertEqual(
+            ?WAMP_EXT_DETAILS, bondy_wamp_config:get(extended_details)
+        ),
+        ?assert(
+            lists:member(
+                '_deadline', bondy_wamp_config:get([extended_options, call])
+            )
         ),
         ok = lists:foreach(
             fun(P) ->
-                Keys = bondy_wamp_config:get(P),
+                Declared = bondy_wamp_config:get(P),
                 lists:foreach(
-                    fun(K) -> ?assert(lists:member(K, Keys)) end, Expected
+                    fun(K) -> ?assert(lists:member(K, Declared)) end,
+                    ['_traceparent', '_tracestate', '_baggage']
                 )
             end,
-            tl(?EXT_PATHS)
+            ?EXT_PATHS
         ),
-        %% Idempotent: a second run adds nothing (no duplicates).
-        Before = [bondy_wamp_config:get(P) || P <- ?EXT_PATHS],
+        Before = [bondy_wamp_config:get(K) || K <- Keys],
         ok = bondy_connect_config:ensure_wamp_extensions(),
-        ?assertEqual(Before, [bondy_wamp_config:get(P) || P <- ?EXT_PATHS])
+        ?assertEqual(Before, [bondy_wamp_config:get(K) || K <- Keys])
     after
         lists:foreach(
-            fun({P, V}) -> bondy_wamp_config:set(P, V) end, Saved
+            fun({K, V}) -> bondy_wamp_config:set(K, V) end, Saved
         )
     end.

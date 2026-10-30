@@ -23,7 +23,8 @@
         cowboy,
         telemetry,
         bondy_metrics,
-        bondy_json_rpc
+        bondy_json_rpc,
+        bondy_wamp
     ]},
     %% Defaults mirror `schema/bondy_mcp.schema` — in a released node the
     %% schema default is authoritative and these are dead; keep the two

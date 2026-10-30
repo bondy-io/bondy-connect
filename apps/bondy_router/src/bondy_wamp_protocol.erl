@@ -187,14 +187,6 @@ validate_subprotocol(T) when is_binary(T) ->
     validate_subprotocol(subprotocol(T));
 validate_subprotocol({ws, text, json} = S) ->
     {ok, S};
-validate_subprotocol({ws, text, json_batched} = S) ->
-    {ok, S};
-validate_subprotocol({ws, binary, cbor_batched} = S) ->
-    {ok, S};
-validate_subprotocol({ws, binary, msgpack_batched} = S) ->
-    {ok, S};
-validate_subprotocol({ws, binary, erl_batched} = S) ->
-    {ok, S};
 validate_subprotocol({raw, binary, json} = S) ->
     {ok, S};
 validate_subprotocol({raw, binary, erl} = S) ->

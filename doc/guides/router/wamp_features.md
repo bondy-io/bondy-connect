@@ -58,12 +58,12 @@ the features the client announced with its own table for that role:
 | `pattern_based_subscription` | `true` |
 | `event_retention` | `true` |
 | `session_meta_api` | `true` |
+| `subscription_meta_api` | `true` |
 | `reflection` | `true` |
 | `sharded_subscription` | `false` |
 | `publication_trustlevels` | `false` |
 | `event_history` | `false` |
 | `subscription_revocation` | `false` |
-| `subscription_meta_api` | `false` |
 | `acknowledge_event_received` (non-standard) | `false` |
 | `acknowledge_subscriber_received` (non-standard) | `false` |
 

@@ -16,6 +16,7 @@ Handles the packing/unpacking and encoding/decoding of WAMP messages.
 -export([decode/2]).
 -export([decode/3]).
 -export([opts/2]).
+-export([format_datetime/1]).
 -export([is_encoding/1]).
 
 -export([message_name/1]).
@@ -121,9 +122,31 @@ encode(Message, json, Opts) when is_list(Message) ->
 encode(Message, cbor, Opts) when is_list(Message) ->
     bondy_wamp_cbor:encode(Message, Opts);
 encode(Message, msgpack, _) when is_list(Message) ->
-    bondy_msgpack:encode(Message);
+    bondy_msgpack:encode(Message, fun msgpack_encode/2);
 encode(Message, Format, _) when is_list(Message) ->
     error({unsupported_encoding, Format}).
+
+-doc """
+Formats a `calendar:datetime()` as the RFC 3339 UTC string a WAMP peer
+receives for it, with three decimals when the seconds are a float.
+""".
+-spec format_datetime(calendar:datetime()) -> binary().
+
+format_datetime({{Y, M, D}, {H, Mi, S}}) ->
+    iolist_to_binary([
+        format_year(Y),
+        $-,
+        format2digit(M),
+        $-,
+        format2digit(D),
+        $T,
+        format2digit(H),
+        $:,
+        format2digit(Mi),
+        $:,
+        format_seconds(S),
+        $Z
+    ]).
 
 -doc """
 Returns a message in WAMP list format.
@@ -501,13 +524,13 @@ opts(bert, _) ->
 opts(json, encode) ->
     bondy_wamp_config:get([serialization, json, encode]);
 opts(json, decode) ->
-    bondy_wamp_config:get([serialization, json, decode]);
+    bondy_wamp_json:decode_opts();
 opts(msgpack, _) ->
     [];
 opts(cbor, encode) ->
     [];
 opts(cbor, decode) ->
-    [].
+    bondy_wamp_cbor:decode_opts().
 
 %% @private
 do_decode_message_name(<<131, 108, _:32, 97, Type, _/binary>>, erl) ->
@@ -672,6 +695,35 @@ request_info({Head, {_Enc, Tail}}) when is_binary(Tail) ->
 %% =============================================================================
 %% PRIVATE: UTILS
 %% =============================================================================
+
+%% @private
+msgpack_encode({{Y, M, D}, {H, Mi, S}}, _Encode) when
+    ?IS_DATETIME(Y, M, D, H, Mi, S)
+->
+    bondy_msgpack:encode_string(format_datetime({{Y, M, D}, {H, Mi, S}}));
+msgpack_encode([{K, _} | _] = Value, Encode) when ?IS_KEY_VALUE_KEY(K) ->
+    bondy_msgpack:encode_key_value_list(Value, Encode);
+msgpack_encode(Value, Encode) ->
+    bondy_msgpack:encode_value(Value, Encode).
+
+%% @private
+format_year(Y) when Y > 999 ->
+    integer_to_binary(Y);
+format_year(Y) ->
+    B = integer_to_binary(Y),
+    [lists:duplicate(4 - byte_size(B), $0) | B].
+
+%% @private
+format2digit(X) when X >= 0, X < 10 ->
+    [$0, $0 + X];
+format2digit(X) ->
+    integer_to_list(X).
+
+%% @private
+format_seconds(S) when is_integer(S) ->
+    format2digit(S);
+format_seconds(S) when is_float(S) ->
+    io_lib:format("~6.3.0f", [S]).
 
 %% @private
 -doc """

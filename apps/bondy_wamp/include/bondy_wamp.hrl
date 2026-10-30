@@ -7,6 +7,25 @@
 %% COMMON
 %% =============================================================================
 
+%% A `calendar:datetime()`. JSON, CBOR and MessagePack send one as the same
+%% RFC 3339 string (`bondy_wamp_encoding_SUITE:in_vm_terms_encode_alike_test/1`).
+-define(IS_DATETIME(Y, M, D, H, Mi, S),
+    (is_integer(Y) andalso Y >= 0 andalso
+        is_integer(M) andalso M >= 0 andalso
+        is_integer(D) andalso D >= 0 andalso
+        is_integer(H) andalso H >= 0 andalso
+        is_integer(Mi) andalso Mi >= 0 andalso
+        is_number(S) andalso S >= 0)
+).
+
+%% A key OTP `json` can encode (`json.erl`, `key/2`). JSON, CBOR and
+%% MessagePack send a list headed by a pair with such a key as an object. A
+%% list headed by a datetime goes out as an array of strings
+%% (`bondy_wamp_encoding_SUITE:datetime_list_encodes_as_strings_test/1`).
+-define(IS_KEY_VALUE_KEY(K),
+    (is_binary(K) orelse is_atom(K) orelse is_integer(K) orelse is_float(K))
+).
+
 -define(WAMP2_JSON, <<"wamp.2.json">>).
 -define(WAMP2_MSGPACK, <<"wamp.2.msgpack">>).
 -define(WAMP2_BERT, <<"wamp.2.bert">>).
@@ -474,7 +493,6 @@ end).
 
 -define(WAMP_EXT_OPTIONS, [
     {call, [
-        '_routing_key',
         %% Total distinct cluster nodes a CALL may be routed to before a
         %% routing failure is final (default 2 — the original candidate
         %% plus one retry). Consulted by the dealer's bounded
@@ -492,10 +510,7 @@ end).
         '_retries'
         | ?WAMP_TRACE_ATTRS
     ]},
-    {cancel, [
-        '_routing_key'
-        | ?WAMP_TRACE_ATTRS
-    ]},
+    {cancel, ?WAMP_TRACE_ATTRS},
     {interrupt, [
         'x_session_info',
         '_session_info'
@@ -511,21 +526,12 @@ end).
         '_idempotent',
         %% number of concurrent, outstanding calls that can exist
         %% for a single endpoint
-        'x_concurrency',
-        {invoke, [
-            <<"jump_consistent_hash">>,
-            <<"jch">>,
-            <<"queue_least_loaded">>,
-            <<"qll">>,
-            <<"queue_least_loaded_sample">>,
-            <<"qlls">>
-        ]}
+        'x_concurrency'
         | ?WAMP_TRACE_ATTRS
     ]},
     {publish, [
         %% The ttl for retained events
-        '_retained_ttl',
-        '_routing_key'
+        '_retained_ttl'
         | ?WAMP_TRACE_ATTRS
     ]},
     {subscribe, [

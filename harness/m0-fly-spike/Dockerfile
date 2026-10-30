@@ -113,4 +113,4 @@ EXPOSE 18086/tcp
 ## (created + chowned above) so the durable core DB tree is writable without a
 ## Fly volume. Real perf/correctness runs (M6) mount a per-machine volume.
 
-ENTRYPOINT ["bondy", "foreground"]
+ENTRYPOINT ["bondy-connect", "foreground"]

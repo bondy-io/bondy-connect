@@ -342,7 +342,7 @@ set_online_sync_complex(Config) ->
 
     _ = [
         gen_server:call(Peer1, {put, X}, ?TIMEOUT_XXL)
-     || X <- list_shuffle(L)
+     || X <- rand:shuffle(L)
     ],
 
     L1 = [K || {K, true} <- gen_server:call(Peer1, list, ?TIMEOUT_XXL)],
@@ -367,7 +367,7 @@ set_anti_entropy_fwd(Config) ->
 
     _ = [
         gen_server:call(Peer1, {put, X}, ?TIMEOUT_XXL)
-     || X <- list_shuffle(L)
+     || X <- rand:shuffle(L)
     ],
 
     L1 = [K || {K, true} <- gen_server:call(Peer1, list, ?TIMEOUT_XXL)],
@@ -398,7 +398,7 @@ set_bidirectional_sync(Config) ->
     L = lists:seq(1, 1000),
     _ = [
         gen_server:call(Peer2, {put, X}, ?TIMEOUT_XXL)
-     || X <- list_shuffle(L)
+     || X <- rand:shuffle(L)
     ],
     L2 = [K || {K, true} <- gen_server:call(Peer2, list, ?TIMEOUT_XXL)],
     ?assertEqual(L, L2),
@@ -491,7 +491,7 @@ set_of_awsets_anti_entropy_fwd(Config) ->
 
     _ = [
         gen_server:call(Peer1, {put, K, V}, ?TIMEOUT_XXL)
-     || {K, V} <- list_shuffle(L1)
+     || {K, V} <- rand:shuffle(L1)
     ],
 
     ?assertEqual(L1, gen_server:call(Peer1, list, ?TIMEOUT_XXL)),
@@ -499,7 +499,7 @@ set_of_awsets_anti_entropy_fwd(Config) ->
 
     _ = [
         gen_server:call(Peer2, {put, K, V}, ?TIMEOUT_XXL)
-     || {K, V} <- list_shuffle(L2)
+     || {K, V} <- rand:shuffle(L2)
     ],
 
     ?assertEqual(L1, gen_server:call(Peer1, list, ?TIMEOUT_XXL)),
@@ -545,30 +545,4 @@ set_of_awsets_anti_entropy_fwd(Config) ->
 
 %% @private
 suffled_seq(N, M) ->
-    list_shuffle(lists:seq(N, M)).
-
-%% @private
-randomize(1, List) ->
-    randomize(List);
-randomize(T, List) ->
-    lists:foldl(
-        fun(_E, Acc) -> randomize(Acc) end,
-        randomize(List),
-        lists:seq(1, (T - 1))
-    ).
-
-%% @private
-randomize(List) ->
-    D = lists:map(fun(A) -> {rand:uniform(), A} end, List),
-    {_, D1} = lists:unzip(lists:keysort(1, D)),
-    D1.
-
-%% -----------------------------------------------------------------------------
-%% @doc
-%% From https://erlangcentral.org/wiki/index.php/RandomShuffle
-%% @end
-%% -----------------------------------------------------------------------------
-list_shuffle([]) ->
-    [];
-list_shuffle(List) ->
-    randomize(round(math:log(length(List)) + 0.5), List).
+    rand:shuffle(lists:seq(N, M)).

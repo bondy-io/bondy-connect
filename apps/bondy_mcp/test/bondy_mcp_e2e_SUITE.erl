@@ -8,13 +8,13 @@
 End-to-end cases: the official MCP SDK client of each era and the
 official conformance suite (@modelcontextprotocol/conformance) driven
 against a real listener over real sockets, plus the two-endpoint
-deployment claim.
+deployment claim and the JSON rendering of a callee's `null`.
 
 The node-based cases run the SDKs pinned by this suite's data dir
 `package-lock.json` in a copy of that directory under `priv_dir`; they
 skip — not fail — when the node toolchain is missing or the npm registry
-is unreachable with a cold cache. `two_endpoint_deployment` is pure
-Erlang and always runs.
+is unreachable with a cold cache. `two_endpoint_deployment` and
+`null_kwarg_reaches_the_agent_as_null` are pure Erlang and always run.
 
 The conformance case asserts exit 0 against the committed
 `expected-failures.yaml` baseline, which pins the result set in
@@ -37,6 +37,7 @@ and a baselined scenario that starts passing fails it too (stale entry).
 -define(WATCHED, <<"com.example.mcp.e2e.watched">>).
 -define(WATCHED_TOPIC, <<"com.example.mcp.e2e.watched.changed">>).
 -define(STUB, <<"com.example.mcp.e2e.stub">>).
+-define(NULL_VALUE, <<"com.example.mcp.e2e.null_value">>).
 
 %% The conformance scenarios each call a tool of this NAME; all ride one
 %% stub procedure, so their failures measure the gateway's deviation
@@ -62,6 +63,7 @@ suite() ->
 all() ->
     [
         two_endpoint_deployment,
+        null_kwarg_reaches_the_agent_as_null,
         modern_sdk_client,
         handshake_sdk_client,
         conformance_active_suite
@@ -99,7 +101,8 @@ init_per_suite(Config) ->
                 {?STATIC, <<"Static text resource read">>},
                 {?TPL, <<"Template-bound resource read">>},
                 {?WATCHED, <<"Watched resource read">>},
-                {?STUB, <<"Conformance scenario stub">>}
+                {?STUB, <<"Conformance scenario stub">>},
+                {?NULL_VALUE, <<"Returns a null value">>}
             ]
         ]
     }),
@@ -127,6 +130,13 @@ init_per_suite(Config) ->
                 <<"kind">> => <<"tool">>,
                 <<"wamp_procedure">> => ?FAIL,
                 <<"description">> => <<"Returns isError: true for testing">>
+            },
+            #{
+                <<"realm">> => ?REALM,
+                <<"name">> => <<"null_value">>,
+                <<"kind">> => <<"tool">>,
+                <<"wamp_procedure">> => ?NULL_VALUE,
+                <<"description">> => <<"Returns a null value">>
             },
             #{
                 <<"realm">> => ?REALM,
@@ -204,6 +214,8 @@ end_per_suite(Config) ->
 
 init_per_testcase(two_endpoint_deployment, Config) ->
     Config;
+init_per_testcase(null_kwarg_reaches_the_agent_as_null, Config) ->
+    Config;
 init_per_testcase(_Case, Config) ->
     case ?config(node_setup, Config) of
         {ok, _Dir} -> Config;
@@ -278,6 +290,25 @@ two_endpoint_deployment(_Config) ->
         stop_listener_quietly(ct_mcp_e2e_internal),
         stop_listener_quietly(ct_mcp_e2e_partner)
     end.
+
+%% A WAMP JSON callee's `null` reaches the router as `undefined`
+%% (`bondy_wamp_json:decode/1`); the local callee returns that term directly.
+null_kwarg_reaches_the_agent_as_null(Config) ->
+    {200, #{<<"result">> := Result}} = post_port(
+        ?config(port, Config),
+        modern_req(1, <<"tools/call">>, #{
+            <<"name">> => <<"null_value">>, <<"arguments">> => #{}
+        })
+    ),
+    ?assertMatch(
+        #{
+            <<"isError">> := false,
+            <<"structuredContent">> := #{<<"note">> := null}
+        },
+        Result
+    ),
+    #{<<"content">> := [#{<<"text">> := Text}]} = Result,
+    ?assertEqual(#{<<"note">> => null}, json:decode(Text)).
 
 stop_listener_quietly(Name) ->
     try
@@ -388,6 +419,11 @@ spawn_callee_owner() ->
                             <<"bondy maps WAMP results to text content">>
                     }
                 }}
+            end
+        ),
+        {ok, _} = bondy_connect_client:register(
+            Conn, ?NULL_VALUE, fun(_, _, _) ->
+                {ok, #{kwargs => #{<<"note">> => undefined}}}
             end
         ),
         Caller ! {ready, self()},

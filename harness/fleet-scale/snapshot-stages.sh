@@ -42,7 +42,7 @@
 # connection process (egress.depth). If every one of those is flat and the
 # end-to-end tail persists, it is below Bondy: socket, network or client.
 #
-# `bondy eval`, not /metrics (the runtime image ships no curl). Emits one TSV
+# `bondy-connect eval`, not /metrics (the runtime image ships no curl). Emits one TSV
 # row per node per metric; an unreachable machine is reported, never silently
 # counted as zero.
 #
@@ -99,7 +99,7 @@ MACHINES=$(fly machines list --app "$APP" --json \
 [ -n "$MACHINES" ] || { echo "no started machines in $APP" >&2; exit 2; }
 
 for M in $MACHINES; do
-    # Prefix the machine's OWN nodename. `bondy eval` unavoidably rewrites the
+    # Prefix the machine's OWN nodename. `bondy-connect eval` unavoidably rewrites the
     # shared releases/<vsn>/vm.args (relx substitutes it at the top of the
     # start script, for every subcommand); without this the SSH session
     # supplies the Dockerfile default and the rewrite bakes bondy@127.0.0.1
@@ -108,7 +108,7 @@ for M in $MACHINES; do
     IP=$(fly machines list --app "$APP" --json \
         | jq -r --arg m "$M" '.[]|select(.id==$m)|.private_ip')
     RAW=$(fly ssh console --app "$APP" --machine "$M" \
-            --command "env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy eval $(printf '%s' "$READ" | tr -d '\n')" \
+            --command "env BONDY_ERL_NODENAME=bondy@$IP /bondy/bin/bondy-connect eval $(printf '%s' "$READ" | tr -d '\n')" \
             2>/dev/null | tr -d ' \r\n' | grep -oE '\{\{.*\}$' | tail -1)
     if [ -z "$RAW" ]; then
         printf '%s\t%s\tUNREACHABLE\n' "$PHASE" "$M"

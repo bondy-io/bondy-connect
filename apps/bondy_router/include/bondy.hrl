@@ -88,10 +88,6 @@
 %% FEATURES
 %% =============================================================================
 
--define(INVOKE_JUMP_CONSISTENT_HASH, <<"jump_consistent_hash">>).
--define(INVOKE_QUEUE_LEAST_LOADED, <<"queue_least_loaded">>).
--define(INVOKE_QUEUE_LEAST_LOADED_SAMPLE, <<"queue_least_loaded_sample">>).
-
 -define(WAMP_CLIENT_ROLES, #{
     caller => #{features => ?CALLER_FEATURES},
     callee => #{features => ?CALLEE_FEATURES},
@@ -167,7 +163,7 @@ end#{
     event_retention => true,
     subscription_revocation => false,
     session_meta_api => true,
-    subscription_meta_api => false,
+    subscription_meta_api => true,
     %% wamp.reflection.topic.* read the same bondy_interface store.
     reflection => true,
     %% Non-standard

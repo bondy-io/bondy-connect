@@ -139,10 +139,10 @@ meta_api_decodes_partial_payload(Config) ->
     ).
 
 %% The routing callback is registered with `callback_args => [RealmUri]` and
-%% takes `(RealmUri, Guid)`, so the rewritten CALL must carry exactly `[Guid]`
-%% whether the caller sent `[Guid]` or `[RealmUri, Guid]`; forwarding the
-%% caller's own arguments -- directly, or through a `partial` left on the
-%% CALL -- hands the callback three when the realm was named.
+%% takes `(RealmUri, Guid)`, so the rewritten CALL must carry exactly `[Guid]`;
+%% a `partial` left on the CALL would restore the caller's own arguments.
+%% `wamp.session.get` takes the session id alone, so naming the realm as well
+%% is refused.
 meta_api_forwards_only_the_guid(Config) ->
     RealmUri = ?config(realm_uri, Config),
     Guid = open_session(RealmUri),
@@ -162,7 +162,13 @@ meta_api_forwards_only_the_guid(Config) ->
                 bondy_wamp_meta_api:handle_call(Call, Ctxt)
             )
         end,
-        [{Enc, Args} || Enc <- [json, cbor], Args <- [[Guid], [RealmUri, Guid]]]
+        [{Enc, [Guid]} || Enc <- [json, cbor]]
+    ),
+    ?assertError(
+        #error{error_uri = ?WAMP_INVALID_ARGUMENT},
+        bondy_wamp_meta_api:handle_call(
+            off_the_wire(json, [RealmUri, Guid]), Ctxt
+        )
     ).
 
 %% A CALL in Payload Passthru Mode carries a payload Bondy must not interpret,
