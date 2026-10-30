@@ -480,7 +480,7 @@ token_flow(#{?GRANT_TYPE := <<"password">>} = Map, Req0, St0) ->
                 reason => EReason,
                 device_id => DeviceId,
                 realm_uri => RealmUri,
-                cient_ip => inet_utils:ip_address_to_binary(SourceIP)
+                client_ip => inet_utils:ip_address_to_binary(SourceIP)
             }),
             {stop, reply(oauth2_invalid_grant, Req0), St0}
     end;
