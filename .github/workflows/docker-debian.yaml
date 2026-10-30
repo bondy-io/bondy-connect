@@ -197,3 +197,16 @@ jobs:
           docker buildx imagetools create \
             --tag ghcr.io/bondy-io/${{ steps.meta.outputs.tags }} \
             docker.io/leapsight/${{ steps.meta.outputs.tags }}
+
+      # A final release (a version tag without a pre-release suffix) also
+      # becomes `latest`. A separate step because the steps above take
+      # `steps.meta.outputs.tags` as a single tag.
+      - name: Tag a final release as latest
+        if: startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-')
+        run: |
+          docker buildx imagetools create \
+            --tag docker.io/leapsight/bondy-connect:latest \
+            docker.io/leapsight/bondy-connect:${{ github.ref_name }}
+          docker buildx imagetools create \
+            --tag ghcr.io/bondy-io/bondy-connect:latest \
+            ghcr.io/bondy-io/bondy-connect:${{ github.ref_name }}

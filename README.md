@@ -3,7 +3,7 @@
 ![Version](https://img.shields.io/badge/version-1.0.0-blue?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=for-the-badge)<br>
 ![Docker Pulls](https://img.shields.io/docker/pulls/leapsight/bondy-connect?style=for-the-badge)
-![Docker Build (master)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy-connect/docker-debian.yaml?&branch=master&label=docker-master&style=for-the-badge)
+![Docker Build (main)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy-connect/docker-debian.yaml?&branch=main&label=docker-main&style=for-the-badge)
 ![Docker Build (develop)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy-connect/docker-debian.yaml?&branch=develop&label=docker-develop&style=for-the-badge)
 <br>![Architectures](https://img.shields.io/badge/architecture-linux%2Famd64%20%7C%20linux%2Farm64%20%7C%20macOS%2Fintel%20%7C%20macOS%2Fapple%20silicon-lightgrey?style=for-the-badge)
 
