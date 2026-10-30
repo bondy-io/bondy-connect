@@ -285,10 +285,10 @@ a shard: it says nothing about changes made on other nodes.
 
 Which sync activity certifies the security shards on a clustered node:
 
-- `refuse` certifies only after a sync round with a peer. A node that
-  reaches no peer, including a member that has just restarted and lists only
-  itself, refuses once `db.aae.fence.max_lag` passes, however much it writes
-  locally.
+- `refuse` certifies only after a sync round with a peer. A node starts
+  uncertified, so a member that has just restarted refuses until its first
+  round with a peer completes. A node that reaches no peer refuses for as
+  long as that lasts, however much it writes locally.
 - `proceed` also certifies on a tick with no reachable peer. A node cut off
   from the cluster keeps authenticating against a view that may miss a
   revocation made elsewhere.
@@ -297,6 +297,23 @@ Which sync activity certifies the security shards on a clustered node:
   is never a majority.
 
 `bondy_auth_oauth2_SUITE`: `aae_fence_isolation_policy`.
+
+### `db.aae.fence.alarm` (`bondy_router.auth_fence_alarm_ms`)
+
+Duration, default `5m`. `0` disables the alarm.
+
+How long the fence may stay closed before the node raises the
+`bondy_auth_fence_closed` alarm ([Alarms](../router/alarms.md)). The alarm
+clears when the fence admits again. It is not raised until the node has been
+up for this long, because the fence is closed from boot until the first sync
+round. `bondy_auth_password_SUITE`: `aae_fence_alarm_follows_the_fence`.
+
+A node that stays fenced because no peer is reachable — the first node back
+after a whole-cluster outage, or the only one left — authenticates again once
+a peer joins and a round completes. To authenticate before that, set
+`db.aae.fence.on_isolation` to `proceed` on that node, accepting that it may
+miss a revocation made on a node that is down, and set it back to `refuse`
+once a peer is back.
 
 ## See also
 

@@ -2,7 +2,10 @@
 ## 1.0.1
 
 ### Action required
-* `bondy.user.update` (`PUT /realms/:realm_uri/users/:id`) `bondy.oauth2.client.update` (`PUT /realms/:realm_uri/clients/:id`) and `bondy.oauth2.resource_owner.update` (`PUT /realms/:realm_uri/resource_owners/:id`) reject a `password` or `client_secret` with `wamp.error.invalid_argument` (HTTP 400). They used to return success, leave the credential unchanged and close the user's sessions. Set a password or client secret with `bondy.user.change_password` (`POST /realms/:realm_uri/users/:id/change_password`).
+* `bondy.user.update` (`PUT /realms/:realm_uri/users/:id`), `bondy.oauth2.client.update` (`PUT /realms/:realm_uri/clients/:id`) and `bondy.oauth2.resource_owner.update` (`PUT /realms/:realm_uri/resource_owners/:id`) reject a `password` or `client_secret` with `wamp.error.invalid_argument` (HTTP 400). They used to return success, leave the credential unchanged and close the user's sessions. Set a password or client secret with `bondy.user.change_password` (`POST /realms/:realm_uri/users/:id/change_password`).
+
+### New Features
+* The `bondy_auth_fence_closed` alarm (critical) is raised when the authentication freshness fence has refused every new authentication for longer than `db.aae.fence.alarm` (default `5m`, `0` disables), and cleared when it admits again. It does not affect readiness. See [Database options](doc/guides/configuration/database_options.md).
 
 ## 1.0.0
 

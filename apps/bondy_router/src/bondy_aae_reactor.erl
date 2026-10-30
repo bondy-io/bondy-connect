@@ -64,6 +64,17 @@ sessions for the user, mirroring the local credential-change chokepoint
 (`bondy_rbac_user`). A metadata-only `set` is a no-op. A realm `set` (create /
 update) likewise needs no session-close.
 
+## Authentication fence alarm
+
+Every 10 seconds the reactor checks the authentication freshness fence
+(`bondy_auth:security_fence/0`). It raises `bondy_auth_fence_closed` when no
+anti-entropy round has refreshed the security tables for longer than
+`db.aae.fence.alarm`, and clears it once the fence admits again. The check
+reads the fence's per-shard timestamps on every tick and keeps no state of its
+own, apart from its start time: the fence starts closed at every boot, so the
+alarm is not raised until the reactor has been up for the threshold.
+`db.aae.fence.alarm = 0` disables the alarm and clears it.
+
 ## Subscription lifecycle
 
 Each subscription is (re)established once the namespace catalogue has provisioned
@@ -81,6 +92,8 @@ the dispatcher is configured to effectively never restart.
 -include("bondy_uris.hrl").
 
 -define(RESUBSCRIBE_AFTER, 500).
+-define(AUTH_FENCE_CHECK_MS, 10_000).
+-define(AUTH_FENCE_ALARM_MS, 300_000).
 
 %% One reacted-on bondy_db table. `ns`/`ref` are filled once the namespace
 %% catalogue has provisioned the table and the subscription is established;
@@ -94,11 +107,13 @@ the dispatcher is configured to effectively never restart.
 }).
 
 -record(state, {
-    subs = [] :: [#sub{}]
+    subs = [] :: [#sub{}],
+    started_at :: integer()
 }).
 
 %% API
 -export([start_link/0]).
+-export([check_auth_fence/0]).
 -export([apply_reaction/4]).
 %% Exposed for the same reason as `apply_reaction/4`: it lets the bootstrap
 %% dispatch be unit-tested without a running cluster.
@@ -139,17 +154,34 @@ the dispatcher is configured to effectively never restart.
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
+-doc """
+Runs the authentication fence alarm check now, as the periodic tick does. The
+raise or clear reaches the alarm handler asynchronously.
+""".
+-spec check_auth_fence() -> ok.
+
+check_auth_fence() ->
+    gen_server:call(?MODULE, check_auth_fence).
+
 %% =============================================================================
 %% GEN_SERVER CALLBACKS
 %% =============================================================================
 
 init([]) ->
     _ = bondy_registry_rib:ensure_stubs_table(),
-    {ok, #state{subs = reacted_tables()}, {continue, subscribe}}.
+    ok = schedule_auth_fence_check(),
+    State = #state{
+        subs = reacted_tables(),
+        started_at = erlang:monotonic_time(millisecond)
+    },
+    {ok, State, {continue, subscribe}}.
 
 handle_continue(subscribe, State) ->
     {noreply, subscribe(State)}.
 
+handle_call(check_auth_fence, _From, State) ->
+    ok = check_auth_fence(State),
+    {reply, ok, State};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown}, State}.
 
@@ -158,6 +190,10 @@ handle_cast(_Msg, State) ->
 
 handle_info(retry_subscribe, State) ->
     {noreply, subscribe(State)};
+handle_info(check_auth_fence, State) ->
+    ok = check_auth_fence(State),
+    ok = schedule_auth_fence_check(),
+    {noreply, State};
 handle_info(
     {bondy_oplog_core_merge_event, NS, Key, _Hlc, Op, Old}, State
 ) ->
@@ -198,6 +234,58 @@ code_change(_OldVsn, State, _Extra) ->
 %% =============================================================================
 %% PRIVATE
 %% =============================================================================
+
+%% @private
+schedule_auth_fence_check() ->
+    _ = erlang:send_after(?AUTH_FENCE_CHECK_MS, self(), check_auth_fence),
+    ok.
+
+%% @private
+check_auth_fence(#state{started_at = StartedAt}) ->
+    case
+        application:get_env(
+            bondy_router, auth_fence_alarm_ms, ?AUTH_FENCE_ALARM_MS
+        )
+    of
+        0 ->
+            clear_auth_fence_alarm();
+        AlarmMs ->
+            Up = erlang:monotonic_time(millisecond) - StartedAt,
+            check_auth_fence(
+                bondy_auth:security_fence(), Up >= AlarmMs, AlarmMs
+            )
+    end.
+
+%% @private
+check_auth_fence(ok, _, _) ->
+    clear_auth_fence_alarm();
+check_auth_fence({error, temporarily_unavailable}, false, _) ->
+    ok;
+check_auth_fence({error, temporarily_unavailable}, true, AlarmMs) ->
+    case bondy_auth:fence_freshness(AlarmMs) of
+        {stale, Namespaces} -> raise_auth_fence_alarm(Namespaces, AlarmMs);
+        ok -> ok;
+        disabled -> clear_auth_fence_alarm()
+    end.
+
+%% @private
+raise_auth_fence_alarm(Namespaces, AlarmMs) ->
+    bondy_alarm_handler:set_alarm(
+        {
+            bondy_auth_fence_closed,
+            <<
+                "This node has refused every new authentication for longer "
+                "than db.aae.fence.alarm: no anti-entropy round has refreshed "
+                "its users and grants within that time. See "
+                "db.aae.fence.on_isolation."
+            >>
+        },
+        #{details => #{namespaces => Namespaces, threshold_ms => AlarmMs}}
+    ).
+
+%% @private
+clear_auth_fence_alarm() ->
+    alarm_handler:clear_alarm(bondy_auth_fence_closed).
 
 %% @private
 %% The static set of bondy_db tables this node reacts to on a remote merge, each

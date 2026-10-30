@@ -74,6 +74,7 @@ system and the user's password capabilities.
 -export([available_methods/2]).
 -export([challenge/3]).
 -export([decoy/5]).
+-export([fence_freshness/1]).
 -export([host/1]).
 -export([init/3]).
 -export([init/4]).
@@ -88,6 +89,7 @@ system and the user's password capabilities.
 -export([realm_uri/1]).
 -export([role/1]).
 -export([roles/1]).
+-export([security_fence/0]).
 -export([session_id/1]).
 -export([source_ip/1]).
 -export([sso_realm_uri/1]).
@@ -558,38 +560,54 @@ authenticate(Method, Signature, DataIn, Ctxt) ->
             {error, Reason}
     end.
 
-%% =============================================================================
-%% PRIVATE
-%% =============================================================================
+-doc """
+The authentication freshness fence. On a node whose view of the security
+tables (users and grants) is staler than `db.aae.fence.max_lag` — a lagging
+or partitioned node — every new authentication is refused, whatever the
+method: such a node must not authenticate against a view that may predate a
+credential or permission change made elsewhere.
 
-%% @private
-%% §9.8 AE auth fence. On a node whose view of the security tables (users /
-%% grants) is staler than `auth_max_lag` — a lagging or partitioned node —
-%% refuse ALL new authentication regardless of method: such a node must not
-%% authenticate against a security view that may predate a credential or
-%% permission change made elsewhere.
-%%
-%% A no-op unless the AAE phase is enabled (`db.aae`): with AAE off, local
-%% writes are synchronous and there is no cross-node staleness window. The
-%% per-shard freshness signal is produced AE-side (`bondy_oplog_sync_session`),
-%% honouring the `db.aae.fence.on_isolation` policy; this fence only reads it.
+Admits everything unless anti-entropy is enabled (`db.aae`): with it off,
+local writes are synchronous and there is no cross-node staleness window. The
+per-shard freshness signal is produced by anti-entropy
+(`bondy_oplog_sync_session`), under the `db.aae.fence.on_isolation` policy;
+the fence only reads it.
+""".
 -spec security_fence() -> ok | {error, temporarily_unavailable}.
 
 security_fence() ->
+    case fence_freshness(auth_max_lag()) of
+        disabled -> ok;
+        ok -> ok;
+        {stale, _NSs} -> {error, temporarily_unavailable}
+    end.
+
+-doc """
+Evaluates the authentication freshness fence against `MaxLag` milliseconds.
+
+Returns `disabled` when anti-entropy is off, `ok` when every primary shard of
+the user, user-grant and group-grant tables completed an anti-entropy round
+within `MaxLag`, and `{stale, Namespaces}` otherwise. `Namespaces` is empty
+when the catalogue has not provisioned those tables. Authentication is refused
+while this returns `{stale, _}` at `db.aae.fence.max_lag`.
+""".
+-spec fence_freshness(MaxLag :: non_neg_integer() | infinity) ->
+    disabled | ok | {stale, [atom()]}.
+
+fence_freshness(MaxLag) ->
     case aae_enabled() of
         false ->
-            ok;
+            disabled;
         true ->
             case fence_tables() of
-                [] ->
-                    {error, temporarily_unavailable};
-                Tables ->
-                    case bondy_db:ensure_fresh(Tables, auth_max_lag()) of
-                        ok -> ok;
-                        {stale, _NSs} -> {error, temporarily_unavailable}
-                    end
+                [] -> {stale, []};
+                Tables -> bondy_db:ensure_fresh(Tables, MaxLag)
             end
     end.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
 
 %% @private
 %% The security tables the fence checks for freshness. Fails closed (empty list

@@ -57,6 +57,7 @@ all() ->
 
         %% The AE fence refuses non-bearer methods too
         aae_fence_refuses_password_when_stale,
+        aae_fence_alarm_follows_the_fence,
 
         oidc_is_not_an_authmethod,
         a_source_for_a_method_without_wamp_auth_is_skipped
@@ -462,6 +463,42 @@ aae_fence_refuses_password_when_stale(Config) ->
 %% PASSWORD VERIFICATION
 %% =============================================================================
 
+aae_fence_alarm_follows_the_fence(_Config) ->
+    ok = application:set_env(bondy_oplog, aae_enabled, true),
+    ok = application:set_env(bondy_oplog, aae_fence_on_isolation, refuse),
+    ok = application:set_env(bondy_router, auth_fence_alarm_ms, 1),
+    try
+        ok = bondy_ct:aae_mock_unreachable_peer(),
+        try
+            ok = bondy_ct:aae_reset_all_stale(),
+            ok = bondy_aae_reactor:check_auth_fence(),
+            ?assertMatch(
+                #{details := #{namespaces := [_ | _], threshold_ms := 1}},
+                await_fence_alarm(raised)
+            ),
+
+            ok = application:set_env(bondy_router, auth_fence_alarm_ms, 0),
+            ok = bondy_aae_reactor:check_auth_fence(),
+            ?assertEqual(none, await_fence_alarm(cleared)),
+
+            ok = application:set_env(bondy_router, auth_fence_alarm_ms, 1),
+            ok = bondy_aae_reactor:check_auth_fence(),
+            ?assertMatch(#{}, await_fence_alarm(raised))
+        after
+            ok = bondy_ct:aae_unmock_unreachable_peer()
+        end,
+
+        ok = application:set_env(bondy_cluster, enabled, false),
+        ok = bondy_ct:aae_bump_isolated_all(),
+        ?assertEqual(ok, bondy_auth:security_fence()),
+        ok = bondy_aae_reactor:check_auth_fence(),
+        ?assertEqual(none, await_fence_alarm(cleared))
+    after
+        ok = application:set_env(bondy_cluster, enabled, true),
+        ok = application:unset_env(bondy_router, auth_fence_alarm_ms),
+        ok = application:set_env(bondy_oplog, aae_enabled, false)
+    end.
+
 correct_password_succeeds(Config) ->
     RealmUri = ?config(realm_uri, Config),
     SessionId = bondy_session_id:new(),
@@ -768,3 +805,35 @@ multiple_source_cidrs(Config) ->
     ?assertNot(
         lists:member(?PASSWORD_AUTH, bondy_auth:available_methods(C3))
     ).
+
+%% =============================================================================
+%% HELPERS
+%% =============================================================================
+
+%% The alarm is raised through an asynchronous `gen_event:notify/2`.
+await_fence_alarm(Expect) ->
+    await_fence_alarm(Expect, 50).
+
+await_fence_alarm(Expect, Retries) ->
+    Current = fence_alarm(),
+    case settled(Expect, Current) orelse Retries =:= 0 of
+        true ->
+            Current;
+        false ->
+            timer:sleep(20),
+            await_fence_alarm(Expect, Retries - 1)
+    end.
+
+settled(raised, Current) -> is_map(Current);
+settled(cleared, Current) -> Current =:= none.
+
+fence_alarm() ->
+    case
+        [
+            A
+         || #{id := bondy_auth_fence_closed} = A <- bondy_alarm_handler:list()
+        ]
+    of
+        [Alarm] -> Alarm;
+        [] -> none
+    end.

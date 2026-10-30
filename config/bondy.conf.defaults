@@ -38,6 +38,7 @@ cluster.tls.server.verify = verify_none
 cluster.tls.server.versions = 1.3
 db.aae = on
 db.aae.fanout = 3
+db.aae.fence.alarm = 5m
 db.aae.fence.max_lag = 60s
 db.aae.fence.on_isolation = refuse
 db.aae.interval = 500ms

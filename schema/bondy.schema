@@ -220,6 +220,19 @@
   {default, refuse}
 ]}.
 
+%% -----------------------------------------------------------------------------
+%% @doc How long the authentication AE fence may stay closed before the node
+%% raises the bondy_auth_fence_closed alarm. The alarm is cleared when the
+%% fence admits again, and is not raised until the node has been up for this
+%% long, since the fence is closed at every boot until the first AE round.
+%% `0` disables the alarm. Only relevant when `db.aae` is on.
+%% @end
+%% -----------------------------------------------------------------------------
+{mapping, "db.aae.fence.alarm", "bondy_router.auth_fence_alarm_ms", [
+  {datatype, {duration, ms}},
+  {default, "5m"}
+]}.
+
 
 %% -----------------------------------------------------------------------------
 %% @doc How long a per-shard WAL drain may actively process frames without
