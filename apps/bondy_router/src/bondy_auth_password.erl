@@ -7,11 +7,12 @@
 -moduledoc """
 This module implements the `bondy_auth` behaviour for password-based
 authentication, verifying a client-supplied string against the user's stored
-password using the `cra` or `scram` protocols.
+password: a `cra` or `scram` record, or a `legacy` record from before
+version 1.2 (`bondy_password:protocol/1`).
 """.
 -behaviour(bondy_auth).
 
--define(VALID_PROTOCOLS, [cra, scram]).
+-define(VALID_PROTOCOLS, [cra, scram, legacy]).
 
 -type state() :: undefined.
 

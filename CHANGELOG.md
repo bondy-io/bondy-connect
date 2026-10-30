@@ -7,6 +7,10 @@
 ### New Features
 * The `bondy_auth_fence_closed` alarm (critical) is raised when the authentication freshness fence has refused every new authentication for longer than `db.aae.fence.alarm` (default `5m`, `0` disables), and cleared when it admits again. It does not affect readiness. See [Database options](doc/guides/configuration/database_options.md).
 
+### Fixes
+* A user whose password was stored before the 1.2 password format (`1.0` or `1.1` records, as a legacy backup import carries them) was offered WAMP-CRA, and the challenge crashed the connection. Such a password now serves the `password` method and the OAuth2 password grant only; changing it stores the current format, which WAMP-CRA and WAMP-SCRAM accept.
+* A refused WAMP authentication is logged at `info` as "WAMP authentication failed", with the reason, the authid, the method being answered and the requested methods; the realm and source IP are in the log metadata. The client still receives the generic `wamp.error.authentication_failed`.
+
 ## 1.0.0
 
 ### Action required

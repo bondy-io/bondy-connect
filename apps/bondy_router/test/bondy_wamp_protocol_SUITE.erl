@@ -38,6 +38,7 @@ all() ->
         router_abort_close_logs_the_reason,
         tcp_handler_status_redacts_the_protocol_state,
         unknown_authid_gets_a_challenge_like_a_known_one,
+        an_authentication_failure_logs_its_reason,
         an_error_for_anything_but_an_invocation_is_a_protocol_violation,
         the_configured_json_float_format_reaches_the_encoder,
         a_batched_offer_falls_through_to_the_next,
@@ -692,6 +693,63 @@ scram_hello(RealmUri, Authid, Extra) ->
     {[Msg], <<>>} = bondy_wamp_encoding:decode({raw, binary, erl}, Reply),
     {Msg, St1}.
 
+%% -----------------------------------------------------------------------------
+%% A refused AUTHENTICATE is logged with its reason
+%% -----------------------------------------------------------------------------
+
+%% An AUTHENTICATE without the SCRAM nonce gets the generic ABORT, so the log
+%% line is the operator's only record of why. The report is matched whole, so
+%% it carries no part of the proof. Covers the AUTHENTICATE stage only.
+an_authentication_failure_logs_its_reason(_Config) ->
+    Uri = ~"com.example.test.wamp_protocol.auth_failure_log",
+    _ = bondy_realm:create(#{
+        uri => Uri,
+        description => ~"authentication failure log test realm",
+        authmethods => [~"wamp-scram"],
+        security_enabled => true,
+        users => [#{username => ~"alice", password => ~"aWe11KeptSecret"}],
+        sources => [
+            #{
+                usernames => [~"alice"],
+                authmethod => ~"wamp-scram",
+                cidr => ~"0.0.0.0/0"
+            }
+        ]
+    }),
+    #{level := Primary} = logger:get_primary_config(),
+    ok = logger:set_primary_config(level, all),
+    ok = logger:add_handler(?MODULE, ?MODULE, #{config => #{pid => self()}}),
+    try
+        {#challenge{}, St} = scram_hello(Uri, ~"alice", #{}),
+        Proof = base64:encode(crypto:strong_rand_bytes(32)),
+        Authenticate = bondy_wamp_message:authenticate(Proof, #{}),
+        ?assertMatch(
+            {stop, ?WAMP_AUTHENTICATION_FAILED, [_], _},
+            bondy_wamp_protocol:handle_inbound(
+                bondy_wamp_encoding:encode(Authenticate, erl), St
+            )
+        ),
+        receive
+            {authentication_failed, Report, #{realm := Realm}} ->
+                ?assertEqual(Uri, Realm),
+                ?assertEqual(
+                    #{
+                        description => "WAMP authentication failed",
+                        reason => invalid_nonce,
+                        authid => ~"alice",
+                        authmethod => ~"wamp-scram",
+                        authmethods => [~"wamp-scram"]
+                    },
+                    Report
+                )
+        after 1000 ->
+            ct:fail(no_authentication_failure_log)
+        end
+    after
+        ok = logger:remove_handler(?MODULE),
+        ok = logger:set_primary_config(level, Primary)
+    end.
+
 wrong_proof(St) ->
     Authenticate = bondy_wamp_message:authenticate(
         base64:encode(crypto:strong_rand_bytes(32)), #{}
@@ -913,13 +971,22 @@ ws_handshake(Offered) ->
         ok = gun:close(Conn)
     end.
 
-%% logger handler callback for the case above: forwards the handler's close
-%% line, and nothing else, to the test process.
+%% logger handler callback: forwards the handler's close line and the
+%% authentication failure line, and nothing else, to the test process.
 log(
     #{msg := {report, #{description := "Connection closed by router"} = R}},
     #{config := #{pid := Pid}}
 ) ->
     Pid ! {closed_by_router, maps:get(reason, R)},
+    ok;
+log(
+    #{
+        msg := {report, #{description := "WAMP authentication failed"} = R},
+        meta := Meta
+    },
+    #{config := #{pid := Pid}}
+) ->
+    Pid ! {authentication_failed, R, Meta},
     ok;
 log(_Event, _Config) ->
     ok.

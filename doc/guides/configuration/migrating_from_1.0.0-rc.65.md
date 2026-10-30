@@ -28,6 +28,13 @@ Gateway specs and OAuth refresh tokens come across. Realm records do not —
 recreate realms from configuration, and their per-realm data still imports,
 because it is banded by the realm URI.
 
+A user's password comes across in the format it was stored in. A password set
+before the 1.2 password format (`1.0` or `1.1` records) authenticates with the
+`password` method and the OAuth2 password grant, but is not offered WAMP-CRA
+or WAMP-SCRAM: a challenge needs data such a record does not hold. Changing
+the password (`bondy.user.change_password`) stores it in the current format.
+`bondy_auth_password_SUITE`: `legacy_password_offers_password_not_cra`.
+
 The full procedure — backing up on the old deployment, confirming it
 finished, copying the file, and importing it — is
 [Upgrading to 1.0.0](https://developer.bondy.io/guides/deployment/upgrading_to_1_0_0).

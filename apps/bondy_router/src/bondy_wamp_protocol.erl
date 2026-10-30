@@ -978,10 +978,8 @@ do_msg_throttle(M, #wamp_state{msg_limiter = Limiter}, Reply) ->
 
 %% @private
 
-stop(#abort{} = M, St) ->
-    stop(M, [], St);
 stop(Reason, St) ->
-    stop(abort_message(Reason), St).
+    stop(Reason, [], St).
 
 %% @private
 stop(#abort{reason_uri = Uri} = M, Acc, St0) ->
@@ -991,6 +989,25 @@ stop(#abort{reason_uri = Uri} = M, Acc, St0) ->
     %% We reply all previous messages plus an abort message and close
     St1 = St0#wamp_state{state_name = closed},
     {stop, Uri, lists:reverse([Bin | Acc]), St1};
+stop({authentication_failed, Reason} = Failure, Acc, St) ->
+    %% The client gets a generic ABORT, so this line is the only record of
+    %% why. `Reason` is logged as is: an auth callback must never put a
+    %% credential in it.
+    Ctxt = St#wamp_state.context,
+    Requested =
+        case bondy_context:request_details(Ctxt) of
+            #{authmethods := Methods} -> Methods;
+            #{} -> [];
+            undefined -> []
+        end,
+    ?LOG_INFO(#{
+        description => "WAMP authentication failed",
+        reason => Reason,
+        authid => bondy_context:authid(Ctxt),
+        authmethod => St#wamp_state.authmethod,
+        authmethods => Requested
+    }),
+    stop(abort_message(Failure), Acc, St);
 stop(Reason, Acc, St) ->
     stop(abort_message(Reason), Acc, St).
 
@@ -1118,22 +1135,9 @@ abort_message({authentication_failed, {no_such_groups, Groups}}) when
         Joined
     ]),
     abort(no_such_role, Msg, <<>>, #{groups => Groups});
-abort_message({authentication_failed, {no_such_user, Username}}) ->
-    ?LOG_INFO(#{
-        description =>
-            "Authentication failed; returning a generic reason to the client "
-            "to avoid user enumeration.",
-        reason => no_such_user,
-        authid => Username
-    }),
+abort_message({authentication_failed, {no_such_user, _}}) ->
     generic_authentication_failed();
 abort_message({authentication_failed, user_disabled}) ->
-    ?LOG_INFO(#{
-        description =>
-            "Authentication failed; returning a generic reason to the client "
-            "to avoid user enumeration.",
-        reason => user_disabled
-    }),
     generic_authentication_failed();
 abort_message({authentication_failed, invalid_scheme}) ->
     abort(authentication_failed, <<"Unsupported authentication scheme.">>);

@@ -13,6 +13,8 @@
 -define(U2, <<"user_2">>).
 -define(U3, <<"user_3">>).
 -define(U4, <<"user_no_password">>).
+-define(U_L10, <<"legacy_v10_user">>).
+-define(U_L11, <<"legacy_v11_user">>).
 -define(P1, <<"aWe11KeptSecret">>).
 -define(P2, <<"An0therWe11KeptSecret">>).
 
@@ -50,6 +52,7 @@ all() ->
         context_accessors,
 
         password_coexists_with_other_methods,
+        legacy_password_offers_password_not_cra,
 
         full_challenge_authenticate_flow,
 
@@ -741,6 +744,84 @@ password_coexists_with_other_methods(Config) ->
         {ok, _, _},
         bondy_auth:authenticate(?PASSWORD_AUTH, ?P2, undefined, Ctxt)
     ).
+
+legacy_password_offers_password_not_cra(Config) ->
+    RealmUri = ?config(multi_realm_uri, Config),
+    Password = ~"aLegacyS3cretValue",
+    Salt = crypto:strong_rand_bytes(16),
+    Hash = fun(HashFun, Len) ->
+        crypto:pbkdf2_hmac(HashFun, Password, Salt, 4096, Len)
+    end,
+    Legacy = [
+        {?U_L10, #{
+            version => ~"1.0",
+            auth_name => pbkdf2,
+            hash_func => sha,
+            iterations => 4096,
+            salt => Salt,
+            hash_pass => binary:encode_hex(Hash(sha, 20), lowercase)
+        }},
+        {?U_L11, #{
+            version => ~"1.1",
+            auth_name => pbkdf2,
+            hash_func => sha256,
+            iterations => 4096,
+            hash_len => 32,
+            salt => Salt,
+            hash_pass => base64:encode(Hash(sha256, 32))
+        }}
+    ],
+    lists:foreach(
+        fun({Username, LegacyPassword}) ->
+            User0 = bondy_rbac_user:new(#{
+                username => Username,
+                password => ~"placeholder-password",
+                groups => []
+            }),
+            User = maps:put(password, LegacyPassword, User0),
+            ok = bondy_rbac_user:import_legacy(RealmUri, Username, User),
+            _ = [
+                {ok, _} = bondy_rbac_source:add(RealmUri, #{
+                    usernames => [Username],
+                    authmethod => Method,
+                    cidr => ~"0.0.0.0/0"
+                })
+             || Method <- [?PASSWORD_AUTH, ?WAMP_CRA_AUTH]
+            ],
+
+            Methods = bondy_auth:available_methods(
+                legacy_ctxt(RealmUri, Username)
+            ),
+            ?assert(lists:member(?PASSWORD_AUTH, Methods)),
+            ?assertNot(lists:member(?WAMP_CRA_AUTH, Methods)),
+
+            ?assertMatch(
+                {ok, _, _},
+                bondy_auth:authenticate(
+                    ?PASSWORD_AUTH,
+                    Password,
+                    undefined,
+                    legacy_ctxt(RealmUri, Username)
+                )
+            ),
+            ?assertMatch(
+                {error, _},
+                bondy_auth:authenticate(
+                    ?PASSWORD_AUTH,
+                    ~"not-the-password",
+                    undefined,
+                    legacy_ctxt(RealmUri, Username)
+                )
+            )
+        end,
+        Legacy
+    ).
+
+legacy_ctxt(RealmUri, Username) ->
+    {ok, Ctxt} = bondy_auth:init(
+        bondy_session_id:new(), RealmUri, Username, [], {127, 0, 0, 1}
+    ),
+    Ctxt.
 
 %% =============================================================================
 %% FULL CHALLENGE-AUTHENTICATE FLOW
