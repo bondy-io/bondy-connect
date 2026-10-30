@@ -227,11 +227,7 @@ api_client_update(Config) ->
     ClientId = ?config(client_id, Prev),
 
     ?assertMatch(
-        {ok, #{
-            groups := [<<"api_clients">>],
-            username := _,
-            type := user
-        }},
+        {error, #{type := invalid_argument}},
         bondy_oauth2_client:update(
             RealmUri,
             ClientId,
@@ -241,11 +237,22 @@ api_client_update(Config) ->
             }
         )
     ),
-
-    %% Updating password has no effect, we need to use the change password API
     ?assertMatch(
         {error, bad_signature},
         do_authenticate(RealmUri, ClientId, <<"New-Password">>)
+    ),
+
+    ?assertMatch(
+        {ok, #{
+            groups := [<<"api_clients">>],
+            username := _,
+            type := user
+        }},
+        bondy_oauth2_client:update(
+            RealmUri,
+            ClientId,
+            #{<<"meta">> => #{<<"foo">> => <<"bar">>}}
+        )
     ),
 
     {save_config, Prev}.
@@ -312,13 +319,21 @@ resource_owner_update(Config) ->
     Username = ?config(username, Prev),
     Pass = <<"New-Password">>,
     {ok, #{groups := Gs}} = bondy_rbac_user:lookup(RealmUri, Username),
+    ?assertMatch(
+        {error, #{type := invalid_argument}},
+        bondy_oauth2_resource_owner:update(
+            RealmUri,
+            Username,
+            #{
+                <<"password">> => Pass,
+                <<"meta">> => #{<<"foo">> => <<"bar">>}
+            }
+        )
+    ),
     {ok, _} = bondy_oauth2_resource_owner:update(
         RealmUri,
         Username,
-        #{
-            <<"password">> => Pass,
-            <<"meta">> => #{<<"foo">> => <<"bar">>}
-        }
+        #{<<"meta">> => #{<<"foo">> => <<"bar">>}}
     ),
     {ok, #{groups := Gs}} = bondy_rbac_user:lookup(RealmUri, Username),
     {save_config, Prev}.

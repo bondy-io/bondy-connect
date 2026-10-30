@@ -244,6 +244,7 @@ end#{
     | already_exists.
 -type update_error() ::
     reserved_name
+    | bondy_connect_error:t()
     | {no_such_realm, uri()}
     | {no_such_user, username_int()}
     | {no_such_groups, [bondy_rbac_group:name()]}.
@@ -560,6 +561,9 @@ add(RealmUri, #{type := ?USER_TYPE, username := Username} = User, Opts) ->
 -doc """
 Updates an existing user.
 This change is globally replicated.
+
+`Data` cannot carry a `password`: the update returns an `invalid_argument`
+error and changes nothing. Use `change_password/3,4` to set a password.
 """.
 -spec update(RealmUri :: uri(), Arg :: username() | t(), Data :: map()) ->
     {ok, NewUser :: t()} | {error, update_error()}.
@@ -570,6 +574,10 @@ update(RealmUri, Arg, Data) ->
 -doc """
 Updates an existing user.
 This change is globally replicated.
+
+`Data` may carry a `password` only when `Opts` sets
+`update_credentials => true`; otherwise the update returns an
+`invalid_argument` error and changes nothing.
 """.
 -spec update(
     RealmUri :: uri(),
@@ -582,6 +590,7 @@ This change is globally replicated.
 update(RealmUri, #{type := ?USER_TYPE} = User, Data0, Opts) ->
     try
         Data = maps_utils:validate(Data0, ?UPDATE_VALIDATOR),
+        ok = check_credentials_update(Data, Opts),
         do_update(RealmUri, User, Data, Opts)
     catch
         error:{no_such_user, _} = Reason ->
@@ -597,6 +606,7 @@ update(RealmUri, Username0, Data0, Opts) when is_binary(Username0) ->
         Username == anonymous andalso throw(not_allowed),
         ok = not_reserved_name_check(Username),
 
+        ok = check_credentials_update(Data, Opts),
         User = fetch(RealmUri, Username),
         do_update(RealmUri, User, Data, Opts)
     catch
@@ -1742,6 +1752,21 @@ maybe_add_sso_user(true, RealmUri, SSOUri, SSOUser, Opts) ->
     {ok, _} = maybe_throw(store(SSOUri, SSOUser, Opts)),
     ok;
 maybe_add_sso_user(false, _, _, _, _) ->
+    ok.
+
+%% @private
+check_credentials_update(#{password := _}, #{update_credentials := true}) ->
+    ok;
+check_credentials_update(#{password := _}, _) ->
+    throw(
+        bondy_connect_error:new(invalid_argument, #{
+            message =>
+                ~"An update cannot change a password or client secret.",
+            description => ~"Use bondy.user.change_password.",
+            details => #{key => password}
+        })
+    );
+check_credentials_update(_, _) ->
     ok.
 
 %% @private

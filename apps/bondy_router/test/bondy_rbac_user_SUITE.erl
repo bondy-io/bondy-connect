@@ -29,6 +29,7 @@ all() ->
         resolve,
         add_sso_user_to_realm,
         update,
+        update_rejects_credentials,
         change_password,
         update_groups,
         add_group,
@@ -257,8 +258,8 @@ update(_) ->
         sso_realm_uri => ?SSO_REALM_URI
     },
 
-    ?assertEqual(
-        {ok, User0},
+    ?assertMatch(
+        {error, #{type := invalid_argument}},
         bondy_rbac_user:update(
             ?REALM2_URI, ?SSOU1, Data0, #{update_credentials => false}
         )
@@ -290,6 +291,46 @@ update(_) ->
     ),
 
     ok.
+
+update_rejects_credentials(_) ->
+    U = ~"upd_cred_user",
+    ok = add_member(?REALM1_URI, U, []),
+    ok = add_group(?REALM1_URI, ~"api_clients"),
+    ClientId = ~"upd_cred_client",
+    {ok, _} = bondy_oauth2_client:add(?REALM1_URI, #{
+        ~"client_id" => ClientId,
+        ~"client_secret" => ~"client-secret-0"
+    }),
+
+    Self = self(),
+    {ok, Handler} = bondy_event_manager:add_callback(
+        fun(Event) -> Self ! {event, Event} end
+    ),
+
+    ?assertMatch(
+        {error, #{type := invalid_argument}},
+        bondy_rbac_user:update(?REALM1_URI, U, #{password => ~"new-pw"})
+    ),
+    ?assertMatch(
+        {error, #{type := invalid_argument}},
+        bondy_oauth2_client:update(?REALM1_URI, ClientId, #{
+            ~"client_secret" => ~"client-secret-1"
+        })
+    ),
+
+    ?assert(verify(?REALM1_URI, U, U)),
+    ?assertNot(verify(?REALM1_URI, U, ~"new-pw")),
+    ?assert(verify(?REALM1_URI, ClientId, ~"client-secret-0")),
+    ?assertNot(verify(?REALM1_URI, ClientId, ~"client-secret-1")),
+    ?assertEqual(none, credentials_event(?REALM1_URI, U)),
+    ?assertEqual(none, credentials_event(?REALM1_URI, ClientId)),
+
+    %% Positive control: the observer does see a real credential change.
+    ok = bondy_rbac_user:change_password(?REALM1_URI, U, ~"new-pw"),
+    ?assert(verify(?REALM1_URI, U, ~"new-pw")),
+    ?assertEqual(seen, credentials_event(?REALM1_URI, U)),
+
+    ok = gen_event:delete_handler(bondy_event_manager, Handler, []).
 
 change_password(_) ->
     SSOUser0 = bondy_rbac_user:fetch(?SSO_REALM_URI, ?SSOU1),
@@ -516,7 +557,7 @@ update_reports_a_missing_sso_user(_) ->
     ?assertEqual(
         {error, {no_such_user, Username}},
         bondy_rbac_user:update(?REALM1_URI, Username, #{
-            password => ~"a-new-password"
+            meta => #{fruit => ~"kiwi"}
         })
     ).
 
@@ -802,6 +843,20 @@ add_group(RealmUri, Name) ->
         RealmUri, bondy_rbac_group:new(#{name => Name})
     ),
     ok.
+
+verify(RealmUri, Username, Password) ->
+    bondy_password:verify_string(
+        Password,
+        bondy_rbac_user:password(bondy_rbac_user:fetch(RealmUri, Username))
+    ).
+
+credentials_event(RealmUri, Username) ->
+    receive
+        {event, {[bondy, user, credentials, updated], RealmUri, Username}} ->
+            seen
+    after 500 ->
+        none
+    end.
 
 add_member(RealmUri, Username, Groups) ->
     User = bondy_rbac_user:new(#{

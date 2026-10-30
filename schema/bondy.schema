@@ -19,10 +19,10 @@
 %% replicated tables. On by default. This is the single master switch: the sync
 %% scheduler process always runs, but with AAE off
 %% `bondy_router_app:maybe_setup_oplog_replication/0` wires no Partisan peer source, so
-%% the scheduler has no peers and stays inert. A single-node deployment is
-%% unaffected either way — it has no peer to sync with, and the authentication
-%% freshness fence treats a lone node as vacuously fresh (see
-%% `db.aae.fence.on_isolation`).
+%% the scheduler has no peers and stays inert. A lone node
+%% (`cluster.enabled = off`) is unaffected either way — it has no peer to sync
+%% with, and the authentication freshness fence treats it as vacuously fresh
+%% (see `db.aae.fence.on_isolation`).
 %% @end
 %% -----------------------------------------------------------------------------
 {mapping, "db.aae", "bondy_oplog.aae_enabled", [
@@ -184,14 +184,17 @@
 ]}.
 
 %% -----------------------------------------------------------------------------
-%% @doc What the authentication AE fence does on a node in a multi-node cluster
-%% that currently cannot confirm freshness with any peer — partitioned into a
-%% minority, or cold-started before its first AE round completes. Such a node
-%% still lists its peers in its Partisan membership, so it knows it may be
-%% lagging a security change made elsewhere. A genuine single-node deployment
-%% (membership is just this node) is NOT governed by this policy: with no peer
-%% to lag, its view is vacuously fresh and it always authenticates — so flipping
-%% `db.aae` on does not lock out a lone node.
+%% @doc What the authentication AE fence does on a clustered node
+%% (`cluster.enabled = on`) that currently cannot confirm freshness with any
+%% peer — partitioned into a minority, or cold-started before its first AE round
+%% completes. The policy governs such a node even when its membership lists only
+%% itself: a just-restarted member lists only itself, so a one-node membership
+%% is no evidence that no peer exists. A clustered node that never gains a peer
+%% therefore refuses authentication under `refuse`.
+%%
+%% A lone node (`cluster.enabled = off`) is NOT governed by this policy: with
+%% no peer to lag, its view is vacuously fresh and it always authenticates — so
+%% flipping `db.aae` on does not lock out a lone node.
 %%
 %% Only relevant when `db.aae` is on.
 %%
