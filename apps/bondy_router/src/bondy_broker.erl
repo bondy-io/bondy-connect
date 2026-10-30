@@ -1,0 +1,1081 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_broker).
+-moduledoc """
+This module implements the capabilities of a Broker. It is used by
+`bondy_router`.
+
+Regarding *Publish & Subscribe*, the ordering guarantees are as
+follows:
+
+If *Subscriber A* is subscribed to both *Topic 1* and *Topic 2*, and
+*Publisher B* first publishes an *Event 1* to *Topic 1* and then an
+*Event 2* to *Topic 2*, then *Subscriber A* will first receive *Event
+1* and then *Event 2*. This also holds if *Topic 1* and *Topic 2* are
+identical.
+
+In other words, WAMP guarantees ordering of events between any given
+*pair* of *Publisher* & *Subscriber*. The implementation preserves this
+by handling each publisher's publications synchronously in its own
+connection process (which serialises them in submission order) and,
+for subscribers on other nodes, by pinning the publisher's relayed
+publications to one relay channel connection on egress and to one flow
+pool worker on the receiving node (see `bondy_relay:routing_opts/2`),
+so a publisher's events reach every subscriber in publication order —
+across topics — while distinct publishers run concurrently.
+
+Further, if *Subscriber A* subscribes to *Topic 1*, the "SUBSCRIBED"
+message will be sent by the *Broker* to *Subscriber A* before any
+"EVENT" message for *Topic 1*.
+
+There is no guarantee regarding the order of return for multiple
+subsequent subscribe requests.  A subscribe request might require the
+*Broker* to do a time-consuming lookup in some database, whereas
+another subscribe request second might be permissible immediately.
+
+```
+,---------.          ,------.             ,----------.
+|Publisher|          |Broker|             |Subscriber|
+`----+----'          `--+---'             `----+-----'
+     |                  |                      |
+     |                  |                      |
+     |                  |       SUBSCRIBE      |
+     |                  | <---------------------
+     |                  |                      |
+     |                  |  SUBSCRIBED or ERROR |
+     |                  | --------------------->
+     |                  |                      |
+     |                  |                      |
+     |                  |                      |
+     |                  |                      |
+     |                  |      UNSUBSCRIBE     |
+     |                  | <---------------------
+     |                  |                      |
+     |                  | UNSUBSCRIBED or ERROR|
+     |                  | --------------------->
+,----+----.          ,--+---.             ,----+-----.
+|Publisher|          |Broker|             |Subscriber|
+`---------'          `------'             `----------'
+```
+""".
+
+-include_lib("kernel/include/logger.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("bondy.hrl").
+-include("bondy_uris.hrl").
+
+-define(MATCH_LIMIT, 100).
+-define(EOT, '$end_of_table').
+
+-define(GET_REALM_URI(Map),
+    case maps:find(realm_uri, Map) of
+        {ok, Val} -> Val;
+        error -> error(no_realm)
+    end
+).
+
+-type list_cont() ::
+    {
+        [bondy_registry_entry:t()],
+        bondy_registry:continuation()
+        | bondy_registry:eot()
+    }
+    | bondy_registry:eot().
+
+-type match_cont() ::
+    {
+        {[bondy_registry_entry:t()], [node()]},
+        bondy_registry_store:continuation()
+        | bondy_registry_store:eot()
+    }
+    | bondy_registry_store:eot().
+
+%% API
+-export([features/0]).
+-export([flush/2]).
+-export([forward/2]).
+-export([forward/3]).
+-export([is_feature_implemented/1]).
+-export([match_subscriptions/2]).
+-export([match_subscriptions/3]).
+-export([publish/5]).
+-export([publish/6]).
+-export([subscribe/3]).
+-export([subscribe/4]).
+-export([subscriptions/1]).
+-export([subscriptions/2]).
+-export([subscriptions/3]).
+-export([unsubscribe/1]).
+-export([unsubscribe/2]).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-spec features() -> map().
+
+features() ->
+    maps:from_list(bondy_config:get([wamp, broker, features])).
+
+-doc """
+Returns `true` if this build implements WAMP feature `F` for the broker.
+
+This is a CAPABILITY, not a session flag. It answers "can Bondy do this at all",
+which is what `bondy_router:roles/0` announces in WELCOME and what
+`bondy_config:setup_wamp/0` seats from `?BROKER_FEATURES`. What a given peer may
+actually use is the intersection of its `HELLO` request with these values, and
+that lives on the session — see `bondy_context:is_feature_enabled/3`.
+""".
+-spec is_feature_implemented(binary() | atom()) -> boolean().
+
+is_feature_implemented(F) when is_binary(F) ->
+    try binary_to_existing_atom(F) of
+        Feature ->
+            is_feature_implemented(Feature)
+    catch
+        error:badarg ->
+            false
+    end;
+is_feature_implemented(F) when is_atom(F) ->
+    bondy_config:get([wamp, broker, features, F], false).
+
+-doc """
+Removes all subscriptions that are associated for reference `Ref` in
+realm `RealmUri`.
+""".
+-spec flush(RealmUri :: uri(), Ref :: bondy_ref:t()) -> ok.
+
+flush(RealmUri, Ref) ->
+    try
+        SessionId = bondy_ref:session_id(Ref),
+        bondy_registry:remove_all(
+            subscription, RealmUri, SessionId, fun on_unsubscribe/1
+        )
+    catch
+        error:{badmatch, {error, _}} = Reason ->
+            ?LOG_DEBUG(#{
+                description => "Error while flushing subscriptions",
+                reason => Reason,
+                realm_uri => RealmUri,
+                ref => Ref
+            }),
+            ok
+    end.
+
+-spec publish(
+    Opts :: map(),
+    {Realm :: uri(), TopicUri :: uri()} | uri(),
+    Args :: [],
+    ArgsKw :: map(),
+    bondy_context:t()
+) -> {ok, id()} | {error, any()}.
+
+publish(Opts, TopicUri, Args, ArgsKw, Ctxt) ->
+    ReqId = bondy_context:gen_message_id(Ctxt, session),
+    publish(ReqId, Opts, TopicUri, Args, ArgsKw, Ctxt).
+
+-spec publish(
+    id(),
+    Opts :: map(),
+    {Realm :: uri(), TopicUri :: uri()} | uri(),
+    Args :: list(),
+    ArgsKw :: map(),
+    bondy_context:t()
+) -> {ok, id()} | {error, any()}.
+
+publish(ReqId, Opts, TopicUri, Args, KWArgs, Ctxt) when
+    is_map(Ctxt)
+->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+
+    try
+        ok = bondy_rbac:authorize(<<"wamp.publish">>, TopicUri, Ctxt),
+        M = bondy_wamp_message:publish(ReqId, Opts, TopicUri, Args, KWArgs),
+        do_publish(M, Ctxt)
+    catch
+        _:{not_authorized, _Reason} = Reason ->
+            {error, Reason};
+        _:{no_such_realm, RealmUri} = Reason ->
+            {error, Reason};
+        error:{invalid_uri, _} = Reason ->
+            publish_failed(Reason, TopicUri, Ctxt);
+        error:{invalid_id, _} = Reason ->
+            publish_failed(Reason, TopicUri, Ctxt);
+        error:{validation_failed, _} = Reason ->
+            publish_failed(Reason, TopicUri, Ctxt);
+        error:retained_messages_not_provisioned = Reason ->
+            publish_failed(Reason, TopicUri, Ctxt)
+    end.
+
+%% @private
+publish_failed(Reason, TopicUri, Ctxt) ->
+    SessionId = bondy_context:session_id(Ctxt),
+    ExtId = bondy_router_utils:external_session_id(SessionId),
+    ?LOG_WARNING(#{
+        description => "Error while publishing",
+        reason => Reason,
+        protocol_session_id => ExtId,
+        session_id => SessionId,
+        topic => TopicUri
+    }),
+    {error, Reason}.
+
+-spec subscribe(RealmUri :: uri(), Opts :: map(), Topic :: uri()) ->
+    {ok, id()} | {ok, {id(), pid()}} | {error, already_exists | any()}.
+
+subscribe(RealmUri, Opts, Topic) ->
+    subscribe(RealmUri, Opts, Topic, self()).
+
+-doc """
+For internal use.
+
+If the last argument is a function, spawns a supervised instance of a
+`bondy_subscriber` by calling `bondy_subscribers_sup:start_subscriber/4`.
+The new process, calls `subscribe/4` passing its pid as last argument.
+
+If the last argument is a pid, it registers the pid as a subscriber
+(a.k.a a local subscription).
+""".
+-spec subscribe(
+    RealmUri :: uri(),
+    Opts :: map(),
+    Topic :: uri(),
+    SubscriberOrFun :: pid() | function()
+) ->
+    {ok, id()} | {ok, {id(), pid()}} | {error, already_exists | any()}.
+
+subscribe(RealmUri, Opts, Topic, Fun) when is_function(Fun, 2) ->
+    %% We preallocate an id so that we can keep the same even when the process
+    %% is restarted by the supervisor.
+    Id = bondy_connect_lib:lazy_or_else(
+        maps:get(subscription_id, Opts, undefined),
+        fun bondy_message_id:global/0
+    ),
+    %% subscriber will call subscribe(RealmUri, Opts, Topic, Pid)
+    Result = bondy_subscribers_sup:start_subscriber(
+        Id, RealmUri, Opts, Topic, Fun
+    ),
+    resulto:map(Result, fun(Pid) -> {Id, Pid} end);
+subscribe(RealmUri, Opts, Topic, Pid) when is_pid(Pid) ->
+    subscribe(RealmUri, Opts, Topic, bondy_ref:new(internal, Pid));
+subscribe(RealmUri, Opts, Topic, Ref) ->
+    bondy_ref:is_type(Ref) orelse error({badarg, Ref}),
+
+    case bondy_registry:add(subscription, RealmUri, Topic, Opts, Ref) of
+        {ok, Entry} ->
+            ok = on_subscribe(Entry),
+            {ok, bondy_registry_entry:id(Entry)};
+        {error, {already_exists, _Entry}} ->
+            {error, already_exists};
+        {error, _} = Error ->
+            Error
+    end.
+
+-doc """
+For internal Bondy use.
+
+Terminates the process identified by `Pid` by
+`bondy_subscribers_sup:terminate_subscriber/1`.
+""".
+-spec unsubscribe(pid() | integer()) -> ok | {error, not_found}.
+
+unsubscribe(SubscriberId) when is_integer(SubscriberId) ->
+    unsubscribe(bondy_subscriber:pid(SubscriberId));
+unsubscribe(Subscriber) when is_pid(Subscriber) ->
+    bondy_subscribers_sup:terminate_subscriber(Subscriber).
+
+-spec unsubscribe(id(), bondy_context:t() | uri()) ->
+    ok | {error, not_found | any()}.
+
+unsubscribe(SubsId, RealmUri) when is_integer(SubsId), is_binary(RealmUri) ->
+    unsubscribe(SubsId, bondy_context:local_context(RealmUri));
+unsubscribe(SubsId, Ctxt) when is_integer(SubsId) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+
+    case bondy_registry:lookup(subscription, RealmUri, SubsId) of
+        {ok, Entry} ->
+            Topic = bondy_registry_entry:uri(Entry),
+            ok = bondy_rbac:authorize(<<"wamp.unsubscribe">>, Topic, Ctxt),
+
+            case bondy_registry:remove(Entry) of
+                ok ->
+                    on_unsubscribe(Entry);
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+-doc """
+Handles a wamp message. This function is called by the `bondy_router`
+module.
+
+The message might be handled synchronously (it is performed by the calling
+process i.e. the transport handler) or asynchronously (by sending the
+message to the broker worker pool).
+""".
+-spec forward(M :: wamp_message(), Ctxt :: bondy_context:t()) -> ok.
+
+forward(M, Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+
+    try
+        do_forward(M, Ctxt)
+    catch
+        _:{not_authorized, Reason} when is_record(M, publish) ->
+            Opts = M#publish.options,
+            case maps:get(acknowledge, Opts, false) of
+                true ->
+                    Reply = not_authorized_error(M, Reason),
+                    bondy_router_peer:send(
+                        RealmUri, bondy_context:ref(Ctxt), Reply
+                    );
+                false ->
+                    ok
+            end;
+        _:{not_authorized, Reason} ->
+            Reply = not_authorized_error(M, Reason),
+            bondy_router_peer:send(RealmUri, bondy_context:ref(Ctxt), Reply);
+        throw:not_found ->
+            Reply = not_found_error(M, Ctxt),
+            bondy_router_peer:send(RealmUri, bondy_context:ref(Ctxt), Reply);
+        Class:Reason:Stacktrace ->
+            %% The log entry and the reply are projections of one error
+            %% value, so the trace_id the caller is given is the one the log
+            %% can be searched by.
+            Error = bondy_connect_error:internal(Class, Reason, Stacktrace),
+            ?LOG_ERROR((bondy_connect_error:to_log_map(Error))#{
+                description =>
+                    ~"Error while evaluating inbound message. Returning ERROR",
+                data => M
+            }),
+
+            Reply = bondy_wamp_error:to_wamp(Error, M),
+            bondy_router_peer:send(RealmUri, bondy_context:ref(Ctxt), Reply)
+    end.
+
+-doc """
+Handles a message relayed by a peer node (executed on the flow pool
+worker owning the message's flow key — see `bondy_relay`).
+""".
+-spec forward(
+    M :: wamp_publish(),
+    To :: optional(bondy_ref:t()),
+    Opts :: map()
+) ->
+    ok | no_return().
+
+forward(#publish{} = M, undefined, FwdOpts) ->
+    #{
+        from := Publisher,
+        relayed_by := Relay,
+        publication_id := PubId,
+        event_details := Details
+    } = FwdOpts,
+
+    %% Fails with no_realm exception if not present
+    RealmUri = ?GET_REALM_URI(FwdOpts),
+    SessionId = bondy_ref:session_id(Publisher),
+    TopicUri = M#publish.topic_uri,
+
+    MatchOpts0 = make_match_opts(SessionId, M#publish.options),
+
+    MatchOpts =
+        case bondy_ref:is_bridge_relay(Relay) of
+            true ->
+                %% A publish relayed from another cluster or node e.g. bridge relay.
+                %% We need to send to all subscribers in the cluster.
+                MatchOpts0;
+            false ->
+                %% A publish relayed by a cluster peer.
+                %% We need to send to this node local subscribers only.
+                MatchOpts0#{nodestring => bondy_config:nodestring()}
+        end,
+
+    MatchResult = match_subscriptions(TopicUri, RealmUri, MatchOpts),
+
+    %% @TODO we should accept a 2nd argument with the subscription options to
+    %% remove unwanted info in Details
+    MakeEvent = fun(SubsId) ->
+        bondy_wamp_message:event_from(M, SubsId, PubId, Details)
+    end,
+
+    Fwd = fun
+        (Node) when is_atom(Node) ->
+            %% We do nothing as this is already a forwarded message and must
+            %% have been already sent to Node by the Publisher
+            ok;
+        (Ref) ->
+            ok = forward_using_bridge_relay(M, FwdOpts, Ref)
+    end,
+
+    %% No need to retain events here as this has been done already
+    %% by the original publication time in the original node (see forward/2).
+
+    %% We publish to all matching local subscribers and we get back the list of
+    %% local bridge relays and the cluster peer nodes where we found remote
+    %% subscribers
+    AuthLists = auth_lists(M#publish.options),
+    ok = do_publish(RealmUri, MatchResult, MakeEvent, Fwd, remote, AuthLists),
+
+    {ok, PubId}.
+
+-doc """
+Returns the list of subscriptions for the active session.
+
+When called with a `bondy:context()` it is equivalent to calling
+`subscriptions/2` with the RealmUri and SessionId extracted from the Context.
+""".
+-spec subscriptions(bondy_registry:continuation() | bondy_registry:eot()) ->
+    list_cont().
+
+subscriptions(Cont) ->
+    bondy_registry:entries(Cont).
+
+%% @private
+-doc """
+Returns the complete list of subscriptions matching the RealmUri
+and SessionId.
+
+Use `subscriptions/3` and `subscriptions/1` to limit the number
+of subscriptions returned.
+""".
+-spec subscriptions(RealmUri :: uri(), SessionId :: id()) ->
+    [bondy_registry_entry:t()].
+
+subscriptions(RealmUri, SessionId) ->
+    bondy_registry:entries(subscription, RealmUri, SessionId).
+
+-doc """
+Returns the complete list of subscriptions matching the RealmUri
+and SessionId.
+
+Use `subscriptions/3` to limit the number of subscriptions returned.
+""".
+-spec subscriptions(
+    RealmUri :: uri(), SessionId :: id(), Limit :: non_neg_integer()
+) ->
+    list_cont().
+
+subscriptions(RealmUri, SessionId, Limit) ->
+    bondy_registry:entries(subscription, RealmUri, SessionId, Limit).
+
+-doc """
+Returns the tuple `{LocalSubscriptions, Nodes}` where `Nodes` are the
+nodes where there are additional subscriptions.
+""".
+-spec match_subscriptions(uri(), RealmUri :: uri()) ->
+    {LocalSubscriptions :: [bondy_registry_entry:t()], Nodes :: [node()]}.
+
+match_subscriptions(TopicUri, RealmUri) ->
+    Opts = #{limit => ?MATCH_LIMIT},
+    match_subscriptions(TopicUri, RealmUri, Opts).
+
+-spec match_subscriptions(uri(), RealmUri :: uri(), map()) ->
+    {[bondy_registry_entry:t()], [node()]} | match_cont().
+
+match_subscriptions(TopicUri, RealmUri, Opts) ->
+    bondy_registry:find_matches(subscription, RealmUri, TopicUri, Opts).
+
+-spec match_subscriptions(
+    bondy_registry_store:continuation() | bondy_registry_store:eot()
+) -> match_cont().
+
+match_subscriptions(?EOT) ->
+    ?EOT;
+match_subscriptions(Cont) ->
+    bondy_registry:find_matches(Cont).
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+do_forward(#subscribe{} = M, Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    Topic = M#subscribe.topic_uri,
+
+    ok = bondy_rbac:authorize(<<"wamp.subscribe">>, Topic, Ctxt),
+
+    Ref = bondy_context:ref(Ctxt),
+    Opts = M#subscribe.options,
+    ReqId = M#subscribe.request_id,
+
+    case bondy_registry:add(subscription, RealmUri, Topic, Opts, Ref) of
+        {ok, Entry} ->
+            Id = bondy_registry_entry:id(Entry),
+            bondy_router_peer:send(
+                RealmUri, Ref, bondy_wamp_message:subscribed(ReqId, Id)
+            ),
+            on_subscribe(Entry);
+        {error, {already_exists, Entry}} ->
+            Id = bondy_registry_entry:id(Entry),
+            bondy_router_peer:send(
+                RealmUri, Ref, bondy_wamp_message:subscribed(ReqId, Id)
+            );
+        {error, timeout} ->
+            Error = bondy_wamp_error:to_wamp(
+                bondy_connect_error:new(timeout, #{
+                    message =>
+                        ~"Request timed out waiting for subscription response."
+                }),
+                M
+            ),
+            bondy_router_peer:send(RealmUri, Ref, Error)
+    end;
+do_forward(#unsubscribe{} = M, Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    SubsId = M#unsubscribe.subscription_id,
+
+    case unsubscribe(SubsId, Ctxt) of
+        ok ->
+            ReqId = M#unsubscribe.request_id,
+            Reply = bondy_wamp_message:unsubscribed(ReqId),
+            bondy_router_peer:send(RealmUri, bondy_context:ref(Ctxt), Reply);
+        {error, not_found} ->
+            throw(not_found)
+    end;
+do_forward(#publish{} = M, Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    ReqId = M#publish.request_id,
+    Topic = M#publish.topic_uri,
+    Opts = M#publish.options,
+
+    ok = bondy_rbac:authorize(<<"wamp.publish">>, Topic, Ctxt),
+
+    %% (RFC) Asynchronously notifies all subscribers of the published event.
+    %% Note that the _Publisher_ of an event will never receive the
+    %% published event even if the _Publisher_ is also a _Subscriber_ of the
+    %% topic published to.
+    {ok, PubId} = do_publish(M, Ctxt),
+
+    %% (RFC) By default, publications are unacknowledged, and the _Broker_
+    %% will not respond, whether the publication was successful indeed or
+    %% not.
+    %% This behavior can be changed with the option
+    %% "PUBLISH.Options.acknowledge|bool"
+    case maps:get(acknowledge, Opts, false) of
+        true ->
+            Reply = bondy_wamp_message:published(ReqId, PubId),
+            bondy_router_peer:send(RealmUri, bondy_context:ref(Ctxt), Reply);
+        false ->
+            ok
+    end.
+
+%% @private
+not_found_error(M, _Ctxt) ->
+    Msg = iolist_to_binary(
+        [
+            ~"There are no subscriptions matching the id ",
+            $',
+            M#unsubscribe.subscription_id,
+            $'
+        ]
+    ),
+
+    bondy_wamp_error:to_wamp(
+        bondy_connect_error:new(no_such_subscription, #{
+            message => Msg,
+            description => ~"The unsubscribe request failed.",
+            details => #{subscription_id => M#unsubscribe.subscription_id}
+        }),
+        ?UNSUBSCRIBE,
+        M#unsubscribe.request_id,
+        #{}
+    ).
+
+%% @private
+not_authorized_error(M, Reason) ->
+    bondy_wamp_error:to_wamp(
+        bondy_connect_error:new(not_authorized, #{message => Reason}), M
+    ).
+
+%% @private
+-spec do_publish(M :: bondy_wamp_message:publish(), bondy_context:t()) ->
+    {ok, id()}.
+
+do_publish(#publish{} = M, Ctxt) ->
+    %% REVIEW We need to parallelise this based on batches.
+
+    %% (RFC) When a single event matches more than one of a _Subscriber's_
+    %% subscriptions, the event will be delivered for each subscription.
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    SessionId = bondy_context:session_id(Ctxt),
+    Publisher = bondy_context:ref(Ctxt),
+
+    TopicUri = M#publish.topic_uri,
+    Opts = M#publish.options,
+
+    MatchOpts = make_match_opts(SessionId, Opts),
+    T0 = erlang:monotonic_time(microsecond),
+    Subscriptions = match_subscriptions_for_publish(
+        TopicUri, RealmUri, MatchOpts
+    ),
+    MatchUs = erlang:monotonic_time(microsecond) - T0,
+
+    PubId = bondy_message_id:global(),
+
+    %% Prepare details, we will use them for the local event creation and also
+    %% to forward to the remote nodes (See FwdOpts below)
+    Details = make_event_details(TopicUri, Opts, Ctxt),
+
+    %% @TODO we should accept a 2nd argument with the subscription options to
+    %% remove unwanted info in Details
+    MakeEvent = fun(SubsId) ->
+        bondy_wamp_message:event_from(M, SubsId, PubId, Details)
+    end,
+
+    %% If retained options is provided the message will be retained, this is
+    %% regardless of whether there are any current subscribers to the topic or
+    %% not.
+    ok = maybe_retain(
+        Opts,
+        RealmUri,
+        TopicUri,
+        maps:merge(MatchOpts, auth_lists(Opts)),
+        MakeEvent
+    ),
+
+    %% We publish to all matching local subscribers and/or forward to
+    %% local bridge relays and remote subscribers in the cluster peer nodes.
+    FwdOpts = #{
+        realm_uri => RealmUri,
+        from => Publisher,
+        publication_id => PubId,
+        event_details => Details
+    },
+
+    Fwd = fun
+        (Node) when is_atom(Node) ->
+            ok = forward_using_relay(M, FwdOpts, Node);
+        (Relay) ->
+            ok = forward_using_bridge_relay(M, FwdOpts, Relay)
+    end,
+
+    T1 = erlang:monotonic_time(microsecond),
+    ok = do_publish(
+        RealmUri, Subscriptions, MakeEvent, Fwd, local, auth_lists(Opts)
+    ),
+    FanoutUs = erlang:monotonic_time(microsecond) - T1,
+
+    %% Stage split for the delivery-latency tail. This runs inline in the
+    %% publisher's connection process, so it is on the hot path: two clock
+    %% reads and one telemetry emit, the same cost the flow pool already pays
+    %% per task.
+    ok = bondy_telemetry:broker_publish(MatchUs, FanoutUs),
+
+    {ok, PubId}.
+
+%% @private
+do_publish(_, ?EOT, _, _, _, _) ->
+    ok;
+do_publish(
+    RealmUri, {_, _} = MatchResult, MakeEvent, Fwd, Origin, AuthLists
+) when
+    is_function(MakeEvent, 1), is_function(Fwd, 1)
+->
+    %% REVIEW Consider creating a broadcast tree out of the registry's
+    %% match results so that instead of sending possibly millions of
+    %% messages to millions of peers (processes) we delegate that to peers
+    %% — Erlang may penalise a process that fans out messages to many
+    %% destinations. Could be implemented at the registry layer.
+    Fun = fun
+        (Node, ok) when is_atom(Node) ->
+            %% A remote subscriber located in a peer cluster node.
+            Fwd(Node);
+        (Entry, ok) ->
+            Subscriber = bondy_registry_entry:ref(Entry),
+            EntryId = bondy_registry_entry:id(Entry),
+            IsCallback = undefined =/= bondy_ref:callback(Subscriber),
+            Publish =
+                case bondy_registry_entry:find_option(group_id, Entry) of
+                    {ok, _} when Origin == remote ->
+                        %% Support for Broker Bridge functionality
+                        %% We MUST not publish or forward if Subscriber is
+                        %% in a group and the message has been forwarded,
+                        %% as the instance of this subscriber local to the
+                        %% Publisher must have already received this event.
+                        false;
+                    _ ->
+                        true
+                end,
+
+            case {Publish, IsCallback} of
+                {true, true} ->
+                    case is_recipient(AuthLists, Subscriber) of
+                        true ->
+                            %% @TODO we should pass a 2nd argument with the
+                            %% subscription options to remove unwanted info in
+                            %% Details
+                            Event = MakeEvent(EntryId),
+                            CBArgs = bondy_registry_entry:callback_args(Entry),
+                            ok = apply_dynamic_callback(
+                                Event, Subscriber, CBArgs
+                            );
+                        false ->
+                            ok
+                    end;
+                {true, false} ->
+                    case bondy_ref:is_bridge_relay(Subscriber) of
+                        true ->
+                            %% We treat a bridge relay subscriber as a
+                            %% remote subscriber as we want it to receive
+                            %% the PUBLICATION as opposed to the EVENT, as
+                            %% the bridge relay will
+                            %% need for forward the publication to a remote
+                            %% cluster.
+                            Fwd(Subscriber);
+                        false ->
+                            case is_recipient(AuthLists, Subscriber) of
+                                true ->
+                                    %% @TODO we should pass a 2nd argument with
+                                    %% the subscription options to remove
+                                    %% unwanted info in Details
+                                    Event = MakeEvent(EntryId),
+                                    ok = bondy_router_peer:send(
+                                        RealmUri, Subscriber, Event
+                                    );
+                                false ->
+                                    ok
+                            end
+                    end;
+                {false, _} ->
+                    ok
+            end
+    end,
+
+    %% We send the event to the local subscribers and we get back a list of
+    %% (local) Bridge Relays and Cluster Peer nodestrings where we found at
+    %% least one subscriber
+    fold_matches(MatchResult, Fun, ok).
+
+%% @private
+%% The match set for a locally-originated publication. Remote reachability
+%% comes from the subscription stubs — one relayed PUBLISH per node with a
+%% matching subscription, the receiving node matching and delivering locally
+%% — and the entry match is restricted to local subscribers, since full
+%% entries are never replicated. Stub nodes ride on the first page only,
+%% mirroring the local-entry contract where continuations page local entries
+%% and the node list is complete on the first result.
+match_subscriptions_for_publish(TopicUri, RealmUri, MatchOpts) ->
+    LocalOpts = MatchOpts#{nodestring => bondy_config:nodestring()},
+    Result = match_subscriptions(TopicUri, RealmUri, LocalOpts),
+    Nodes = bondy_registry_rib:subscription_nodes(
+        RealmUri, TopicUri, MatchOpts
+    ),
+    merge_stub_nodes(Result, Nodes).
+
+%% @private
+%% Merge the stub-derived node set into a local match result, preserving its
+%% shape. Any remote nodes the local match happened to report are unioned in
+%% — over-forwarding is safe, the receiving node delivers only to its own
+%% live matching subscribers.
+merge_stub_nodes(?EOT, []) ->
+    ?EOT;
+merge_stub_nodes(?EOT, Nodes) ->
+    {[], Nodes};
+merge_stub_nodes({L, R}, Nodes) when is_list(L), is_list(R) ->
+    {L, lists:usort(R ++ Nodes)};
+merge_stub_nodes({{L, R}, Cont}, Nodes) when is_list(L), is_list(R) ->
+    {{L, lists:usort(R ++ Nodes)}, Cont}.
+
+%% @private
+make_match_opts(SessionId, Opts) ->
+    %% WAMP Subscriber Black- and Whitelisting: an event reaches a subscriber
+    %% only if its session id is in `eligible` (when present) and not in
+    %% `exclude` (when present).
+    %% The authid and authrole lists are applied at delivery
+    %% (`auth_lists/1`).
+    Exclusions0 = maps:get(exclude, Opts, []),
+
+    %% Publisher exclusion:
+    %% By default, a Publisher of an event will not itself receive an event
+    %% published, even when subscribed to the Topic the Publisher is publishing
+    %% to. This behavior can be overridden using this feature.
+    Exclusions =
+        case maps:get(exclude_me, Opts, true) of
+            true ->
+                lists:append(
+                    [
+                        bondy_session_id:to_external(S)
+                     || S <- [SessionId], S =/= undefined
+                    ],
+                    Exclusions0
+                );
+            false ->
+                Exclusions0
+        end,
+
+    MatchOpts0 = #{exclude => Exclusions},
+
+    %% Subscriber Eligibility by session id.
+    %% No `match' key, so every policy is considered: pattern-based subscription
+    %% is not optional (see `bondy_config:setup_wamp/0').
+    case maps:find(eligible, Opts) of
+        error ->
+            MatchOpts0;
+        {ok, L} when is_list(L) ->
+            Eligible = sets:subtract(
+                sets:from_list(L), sets:from_list(Exclusions)
+            ),
+            MatchOpts0#{eligible => sets:to_list(Eligible)}
+    end.
+
+%% @private
+%% The authid and authrole lists of Subscriber Black- and Whitelisting. They
+%% need the subscriber's session, which only the node holding it has, so each
+%% node applies them to its own subscribers at delivery; a publication
+%% forwarded to a peer or a bridge relay carries the options with it.
+auth_lists(Opts) ->
+    maps:with(
+        [eligible_authid, eligible_authrole, exclude_authid, exclude_authrole],
+        Opts
+    ).
+
+%% @private
+%% A subscriber without a session (an internal callback) has no authid or
+%% authrole, so an eligible list never admits it. A session that has ended
+%% receives nothing.
+is_recipient(AuthLists, _) when map_size(AuthLists) == 0 ->
+    true;
+is_recipient(AuthLists, Subscriber) ->
+    case bondy_ref:session_id(Subscriber) of
+        undefined ->
+            not (maps:is_key(eligible_authid, AuthLists) orelse
+                maps:is_key(eligible_authrole, AuthLists));
+        SessionId ->
+            case bondy_session:lookup(SessionId) of
+                {ok, Session} ->
+                    %% A session with several roles is eligible when any of
+                    %% them is listed, and excluded when any of them is.
+                    Authids = [bondy_session:authid(Session)],
+                    Roles = bondy_session:authroles(Session),
+                    listed(eligible_authid, Authids, AuthLists, true) andalso
+                        listed(eligible_authrole, Roles, AuthLists, true) andalso
+                        not listed(exclude_authid, Authids, AuthLists, false) andalso
+                        not listed(exclude_authrole, Roles, AuthLists, false);
+                {error, not_found} ->
+                    false
+            end
+    end.
+
+%% @private
+%% Whether any of `Values` is in the list under `Key`, or `Absent` when the
+%% publisher sent no such list.
+listed(Key, Values, AuthLists, Absent) ->
+    case maps:find(Key, AuthLists) of
+        {ok, List} -> lists:any(fun(V) -> lists:member(V, List) end, Values);
+        error -> Absent
+    end.
+
+%% @private
+make_event_details(TopicUri, Opts, Ctxt) ->
+    %% Forward PPT and trace-context attributes to EVENT.Details.
+    %% Trace context is a verbatim pass-through (see ?WAMP_TRACE_ATTRS).
+    Details0 = maps:with(?WAMP_PPT_ATTRS ++ ?WAMP_TRACE_ATTRS, Opts),
+
+    Details = Details0#{
+        %% This is mandatory only for pattern-based subscriptions
+        %% but we prefer to always add it
+        topic => TopicUri
+    },
+
+    %% TODO disclose info only if feature is announced by Publishers, Brokers
+    %% and Subscribers
+    case maps:get(disclose_me, Opts, true) of
+        true ->
+            bondy_context:publisher_details(Ctxt, Details);
+        false ->
+            Details
+    end.
+
+%% @private
+-doc """
+This is an optimization for sending an EVENT to N remote subscribers
+that located at cluster peer nodes. Instead of generating the N different
+EVENT messages we send a single PUBLISH per node (the equivalent of the
+original PUBLISH message).
+""".
+forward_using_relay(_, _, []) ->
+    ok;
+forward_using_relay(M, FwdOpts, NodeOrNodes) when
+    is_atom(NodeOrNodes); is_list(NodeOrNodes)
+->
+    %% We forward the publication to all Nodes.
+    %% @TODO stop replicating individual remote subscribers and instead
+    %% use a per node reference counter
+
+    RelayMsg = {forward, undefined, M, FwdOpts},
+
+    %% The publisher ref keys the flow: a PUBLISH is node-addressed (no
+    %% destination ref), and per-publisher order is exactly what the WAMP
+    %% event ordering guarantee needs at each receiving node (see
+    %% bondy_relay:routing_opts/2).
+    RelayOpts = bondy_relay:routing_opts(maps:get(from, FwdOpts), undefined),
+
+    %% Its fine if we get a not_yet_connected error as we are enabling
+    %% retransmission.
+    %% TODO Validate if we need ack enabled
+    _ = bondy_relay:forward(NodeOrNodes, RelayMsg, RelayOpts),
+    ok.
+
+%% @private
+-doc """
+This is an optimization for sending an EVENT to N local bridge relays
+that will need to re-publish the event at their remote clusters. We send
+them the equivalent of the original PUBLISH message.
+""".
+forward_using_bridge_relay(M, FwdOpts, RefOrRefs) ->
+    RelayMsg = {forward, undefined, M, FwdOpts},
+    ok = bondy_bridge_relay:forward(RefOrRefs, RelayMsg).
+
+%% @private
+fold_matches(?EOT, _Fun, Acc) ->
+    Acc;
+fold_matches({{L, R}, Cont}, Fun, Acc0) when is_list(L), is_list(R) ->
+    %% Match with a limit set
+    %% We fold the nodes then the (local) entriss
+    Acc = fold_matches(L, Fun, fold_matches(R, Fun, Acc0)),
+    fold_matches(match_subscriptions(Cont), Fun, Acc);
+fold_matches({L, R}, Fun, Acc) when is_list(L), is_list(R) ->
+    %% Match without a limit set
+    %% We fold the nodes then the (local) entries
+    fold_matches(L, Fun, fold_matches(R, Fun, Acc));
+fold_matches([H | T], Fun, Acc) ->
+    fold_matches(T, Fun, Fun(H, Acc));
+fold_matches([], _Fun, Acc) ->
+    Acc.
+
+%% =============================================================================
+%% PRIVATE: META EVENTS
+%% =============================================================================
+
+%% @private
+%% The aggregate metric is counted unconditionally (telemetry); the WAMP
+%% meta-event publication is demand-gated (see bondy_meta_events).
+-spec on_subscribe(bondy_registry_entry:t()) -> ok.
+
+on_subscribe(Entry) ->
+    ok = maybe_send_retained(Entry),
+    ok = bondy_telemetry:registry_event(subscription, added, Entry),
+    ok = bondy_event_manager:notify({
+        [bondy, broker, subscription, added], Entry
+    }),
+    bondy_meta_events:maybe_publish(added, Entry).
+
+%% @private
+-spec on_unsubscribe(bondy_registry_entry:t()) -> ok.
+
+on_unsubscribe(Entry) ->
+    ok = bondy_telemetry:registry_event(subscription, removed, Entry),
+    ok = bondy_event_manager:notify(
+        {[bondy, broker, subscription, removed], Entry}
+    ),
+    bondy_meta_events:maybe_publish(removed, Entry).
+
+%% =============================================================================
+%% PRIVATE: EVENT RETENTION
+%% =============================================================================
+
+%% @private
+maybe_retain(#{retain := true} = Opts, Realm, Topic, MatchOpts, MakeEvent) ->
+    %% We treat it as a template passing 0
+    %% as the real SubsId will be provided by the user in
+    %% bondy_retained_message:to_event/2 when retrieving it
+    %% @TODO we should pass a 2nd argument with the subscription
+    %% options to remove unwanted info in Details
+    Event = MakeEvent(0),
+    TTL = maps:get('_retained_ttl', Opts, undefined),
+    bondy_retained_message_manager:put(Realm, Topic, Event, MatchOpts, TTL);
+maybe_retain(_, _, _, _, _) ->
+    ok.
+
+%% @private
+maybe_send_retained(Entry) ->
+    case maps:get(get_retained, bondy_registry_entry:options(Entry), false) of
+        true ->
+            send_retained(Entry);
+        false ->
+            ok
+    end.
+
+%% @private
+send_retained(Entry) ->
+    RealmUri = bondy_registry_entry:realm_uri(Entry),
+    SessionId = bondy_registry_entry:session_id(Entry),
+    Ref = bondy_registry_entry:ref(Entry),
+    SubsId = bondy_registry_entry:id(Entry),
+    Topic = bondy_registry_entry:uri(Entry),
+    Policy = bondy_registry_entry:match_policy(Entry),
+
+    Matches = bondy_retained_message_manager:match(
+        RealmUri, Topic, SessionId, Policy
+    ),
+
+    bondy_router_utils:foreach(
+        fun
+            ({continue, Cont}) ->
+                bondy_retained_message_manager:match(Cont);
+            (M) ->
+                AuthLists = auth_lists(bondy_retained_message:match_opts(M)),
+                case is_recipient(AuthLists, Ref) of
+                    true ->
+                        Event = bondy_retained_message:to_event(M, SubsId),
+                        try
+                            bondy_router_peer:send(RealmUri, Ref, Event)
+                        catch
+                            %% A gone subscriber: `!` to an `undefined` pid
+                            %% raises `badarg`, and a gone HTTP transport
+                            %% fails its enqueue.
+                            error:badarg ->
+                                ok;
+                            error:{badmatch, {error, transport_not_found}} ->
+                                ok
+                        end;
+                    false ->
+                        ok
+                end
+        end,
+        Matches
+    ).
+
+%% @private
+-spec apply_dynamic_callback(wamp_event(), bondy_ref:t(), [any()]) ->
+    wamp_result() | wamp_error().
+
+apply_dynamic_callback(#event{} = Msg0, Subscriber, CBArgs) ->
+    Msg = bondy_wamp_message:decode_partial(Msg0),
+    {M, F} = bondy_ref:callback(Subscriber),
+
+    A = lists:append([
+        args_to_list(CBArgs),
+        args_to_list(Msg#event.args),
+        args_to_list(Msg#event.kwargs),
+        args_to_list(Msg#event.details)
+    ]),
+
+    try
+        erlang:apply(M, F, A)
+    catch
+        Class:Reason:Stacktrace ->
+            ?LOG_ERROR(#{
+                description => "Error while publishing event to subscriber",
+                subscriber => Subscriber,
+                class => Class,
+                reason => Reason,
+                stacktrace => Stacktrace
+            }),
+            ok
+    end.
+
+%% @private
+args_to_list(undefined) ->
+    [];
+args_to_list(L) when is_list(L) ->
+    L;
+args_to_list(M) when is_map(M) ->
+    [M].

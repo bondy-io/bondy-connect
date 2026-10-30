@@ -1,0 +1,316 @@
+# Storage Runtime View: The Shard
+
+One shard instance at runtime: the write path from `bondy_db:apply/4` to a
+durable, readable, replicable event, and the read path back. Cross-node
+behaviour is [replication](db_view_replication.md).
+
+## Primary presentation
+
+The write path is a chain, not a fan-out. On a `main` shard four processes run
+it — the caller, the shard's WAL writer, its applier and its instance — and
+each stage begins only when the one before it has committed. The
+per-instance supervisor (`bondy_oplog_instance_sup`, `one_for_all`) starts the
+instance, the WAL writer, the applier and a segment scrubber, so a crash in
+any of them restarts the whole shard.
+
+```mermaid
+flowchart TD
+    W["caller: bondy_db:apply/4"] --> MINT["caller: mint event key<br/>HLC tick · seq from an<br/>atomically reserved range"]
+    MINT --> OV["caller: stage overlay row"]
+    OV --> WA{"WAL writer: append"}
+    WA -->|rejected| RB["unstage overlay ·<br/>return or burn the seq range"]
+    WA -->|durable| ASY["apply_async/4 returns here"]
+    WA -->|durable| DR["applier: drain batch ·<br/>re-verify signatures"]
+    DR --> FOLD["applier: fold via CRDT<br/>module (cell_apply)"]
+    FOLD --> PROJ[("projection<br/>ETS or leveled")]
+    PROJ --> POST["applier: invalidate read cache ·<br/>dispatch secondary-index ops ·<br/>advance applied frontier"]
+    POST --> CAST["cast install_local_batch"]
+    CAST --> INSTALL["instance: install into MST"]
+    INSTALL --> PUB["instance: publish root ·<br/>evict the overlay rows"]
+    PUB --> ACK["apply/4 returns here"]
+    RD["bondy_db:read/3"] --> CA{"read cache"}
+    CA -->|hit| V["value"]
+    CA -->|miss| PROJ
+    PROJ --> V
+```
+
+The fold's input is the WAL batch and the cell's prior state. The fold reads
+that prior state from the projection (or a write-through cache of it), never
+from the MST. The MST install runs after the fold, in a different process.
+What overlaps is *batches*, not stages: while the instance installs batch N,
+the applier is already reading, verifying and folding batch N+1.
+
+A `registry` shard runs the same stages with two processes fewer. Its WAL is
+an in-memory table that the caller appends to directly, and the instance
+process drains it, folds, installs, publishes and evicts in one step
+(`fused_apply_batch`). The rest of this page describes the `main` pipeline.
+
+## The write path, step by step
+
+1. **Mint.** On the fast path the caller creates the event key in its own
+   process: one hybrid-logical-clock tick and a sequence number from an
+   atomically reserved contiguous range. The caller signs the event too. An
+   instance whose validator is not stateless mints through the instance
+   process instead, with the same key shape. A `tier_2` table pays one extra
+   round trip first: the caller reads the cell's current causal context from
+   the applier (or from the instance, on a `registry` shard) and stamps it
+   into the event's metadata, so the fold can resolve concurrency later.
+2. **Stage, then append.** The caller stages the overlay row *before* the WAL
+   append, so the row exists the instant the log entry does. The applier
+   reads the log the moment it commits; staging afterwards would let the
+   install handler's eviction run before the row was there, leaving an
+   orphan row. If the WAL rejects the append, the caller unstages the row
+   and returns the reserved sequence range to the counter when it is still
+   the topmost reservation. A range that a concurrent reservation overtook
+   cannot be returned. The instance counts it
+   (`bondy_oplog_seqs_burned_total`) and backfills it with signed no-op
+   `seq_fill` events (`bondy_oplog_seqs_filled_total`). Those events occupy
+   the sequence numbers, replicate and advance frontiers like any event, and
+   fold to nothing, so the gap does not become one that sync cannot fill.
+3. **Acknowledge.** The facade exposes two acknowledgement points.
+   `apply_async/4` returns at durable append, before the fold: the caller
+   pays for durability, not for interpretation. `apply/4` returns later: it
+   blocks until *its own* event is installed — folded, written to the
+   projection and published in the MST (`bondy_oplog:append_applied/4`). It
+   does not wait for other appenders' events. That barrier is what makes a
+   subsequent `read/3` observe the write, because the facade registers its
+   tables with the read-path overlay merge *disabled*.
+   `db.wal.fsync_mode` governs what "durable" costs. `per_write`, the
+   default, fsyncs every append, so each write is durable before it returns,
+   at the price of binding the writer to the device's fsync rate. `batched`
+   defers the fsync to a size or time boundary (`db.wal.batched_fsync_bytes`,
+   `db.wal.batched_fsync_interval`) and exposes durability through an
+   explicit wait rather than through the append returning, in exchange for a
+   bounded durability window. All three options are global: they affect every
+   durable instance on the node. A `registry` shard's in-memory WAL never
+   fsyncs and ignores them.
+4. **Drain and fold.** The applier consumes the log in order, re-verifies
+   each event's stored signature, and folds the survivors through the
+   table's CRDT module into the projection. The cell's prior state comes from
+   an in-batch shadow, the applier's frame cache, or a projection read — in
+   that order of precedence. Every event source reaches the same fold
+   module, so a locally minted event and the same event arriving from a peer
+   are interpreted by the same code.
+5. **Commit the projection.** Once the projection write returns, and only
+   then, the applier invalidates the read cache for the touched cells and
+   dispatches the secondary-index operations. When every table group of the
+   batch has been written, it advances the applied frontier over the batch's
+   `{origin, seq}` claims. Ordering the frontier after the projection write
+   keeps it from leading the projection it describes.
+6. **Install.** The applier casts the verified batch to the instance. The
+   instance merges up to `install_coalesce_max` queued casts into one
+   `put_batch` against the MST, publishes the new root — making the events
+   visible to [replication](db_view_replication.md) — and then deletes the
+   matching overlay rows and answers each waiting `apply/4`. Publishing
+   before evicting means a reader that misses the overlay row finds the
+   entry in the MST.
+
+Peer-authored events reach the same fold from the opposite direction. The
+instance installs them into the MST first, and the applier catches the
+projection up by diffing the tree against the last replayed root and folding
+the pairs the diff yields. On that path, and only on that path, the fold
+reads the MST. [Replication](db_view_replication.md) covers it.
+
+## The read path
+
+`bondy_db:read/3` consults the per-shard value cache first and falls back to
+the projection, decoding the stored cell and populating the cache. It does
+not touch the MST and does not re-fold history. Folds and relational queries
+run over the projection and its secondary indexes.
+
+The substrate can also merge an overlay of not-yet-drained events into a
+read, interpreting them over the projection state. The facade does not use
+it: it registers its tables with `overlay => disabled` and gets
+read-your-writes from `apply/4`'s barrier instead. Reads on the writing node
+therefore observe writes as soon as `apply/4` returns; reads elsewhere
+observe them after replication.
+
+**The secondary index is not part of the primary commit.** `cell_apply`
+derives each index operation from the cell's old and new value. On a durable
+table it stores the batch's operations as an intent in the same primary
+write, so a node or writer that stops before writing them replays them from
+the primary. It dispatches them only after the primary write returns, and
+*asynchronously*, to a shared index writer (`bondy_oplog_secondary_writer`).
+Each index has a bounded in-flight budget. A batch that would exceed it is
+dropped, the index shard is marked for rebuild, and its freshness is reset so
+indexed reads refuse to serve until the rebuild completes. The index is a
+deterministic function of the primary, which makes discarding and rebuilding
+it a legitimate response to saturation. A query therefore reads an index
+that trails the values, not one committed with them.
+
+## Ordering and concurrency contract
+
+Within one instance, the applier folds a batch's events in log order, and
+concurrent writers interleave freely at mint time. Across instances there is
+no ordering at all: a batch is atomic only within one shard, which is why the
+facade co-shards entities that have to commit together (the aggregate-root
+declaration, see [topology](db_topology.md)).
+
+The two paths treat per-origin contiguity differently. Locally minted events
+are contiguous — one origin, one reserved range per batch, a burned range
+backfilled by `seq_fill` — so the local drain folds unconditionally and only
+*measures* contiguity, reporting any gap it sees as telemetry
+(`bondy_oplog_prefix_holes_total`). The prefix-closure *enforcement* — hold an
+origin's events beyond a gap instead of folding them — lives on the
+replication fold, where a page sync can present a hole; see
+[replication](db_view_replication.md). The applied frontier records the
+contiguous prefix of what was folded per origin, plus the sequences folded
+above a gap.
+
+## Variability guide
+
+Configuration does not change the structure above; it changes what each
+element costs and how much of it may run at once. Each plate marks the
+options on the geometry they govern, with the values `bondy.conf` uses when
+you set nothing.
+
+### Durability of the append
+
+`db.wal.fsync_mode` (`per_write`) decides whether `append/2` returns before or
+after the device has the frame, which is the difference between the head
+position and the durable position. `per_write` collapses the two. `batched`
+opens a window bounded by whichever of `db.wal.batched_fsync_bytes` (1 MB) or
+`db.wal.batched_fsync_interval` (50 ms) fires first, and callers that need a
+specific position on disk wait for it through `await_durable/3`.
+`db.wal.max_segment_bytes` (64 MB) sets where the head segment rotates. It is
+a soft target: the writer rotates between appends, before a frame that would
+cross it, so no batch spans a segment boundary.
+
+![WAL segment geometry: the header, frames, the rotation threshold, and the
+window between head and durable position under each fsync mode](img/db-wal.svg)
+
+### Sealing the pack
+
+`db.pack_seal_mode` decides whether the seal runs on the apply path.
+`async`, the default, keeps it off that path: a monitored worker rewrites the
+pack while the instance keeps installing. `sync` puts one long datasync in
+front of the pipeline. `db.pack_auto_seal_bytes` sets how much accumulates
+first. Its default, `2MB`, is deliberately low so a seal rewrites the pack in
+short passes.
+
+![MST pack sealing: incoming.pack filling to the seal threshold, and the
+apply-latency trace under each seal mode](img/db-pack.svg)
+
+### Detecting a stalled drain
+
+`db.drain.stall_alarm` (1 minute) is how long the applier may process frames
+without committing past the highest position it has ever committed before it
+raises `{bondy_oplog_drain_stalled, InstanceId}`. Progress is measured against
+that high-water mark, so re-reading ground already committed does not count.
+`0` disables the detector.
+
+![Applier drain: consumer position as a ratchet, with the alarm window
+measured across a span that makes no forward progress](img/db-drain.svg)
+
+### Detecting a standing frontier gap
+
+A shard can be draining correctly and still be missing history: a per-origin
+sequence run it never received, with later operations from the same origin
+already applied above it. The applied frontier records exactly that — it
+reports a prefix bound and keeps the operations above the gap in a pending
+set — so the condition is a fact the shard holds rather than one that has to
+be inferred. `bondy_oplog_instance_frontier_holes` reports how many gaps a
+shard is carrying and `bondy_oplog_instance_frontier_pending_seqs` how much
+is stranded above them.
+
+`db.frontier.hole_alarm` (5 minutes) is how long a shard may carry one before
+raising `{bondy_oplog_frontier_hole, InstanceId}`, whose details name the
+origins and the sequence each gap starts at. The threshold is on the **age**
+of the condition, not its occurrence: short-lived gaps are routine — a local
+commit landing out of sequence order, a burned sequence awaiting its
+backfill, an operation a peer round away. A gap that stays is not: the shard
+holds its reported frontier below it, so peers keep re-offering that origin
+and the log cannot truncate past it. `0` disables the detector. The sync
+scheduler measures it on its own 10-second timer, independently of `db.aae`,
+because a node with anti-entropy off is more likely to carry a standing gap,
+not less.
+
+### Sizing the projection
+
+Durable shards open every leveled Bookie in **`head_only` mode**
+(`{head_only, with_lookup}`), and that one decision reshapes what the
+twenty-two `db.leveled.*` options govern. In this mode the whole cell — state
+and value — is stored as a ledger HEAD entry, written in batches through
+`book_mput/2`. The same object specs also go to the journal, where they serve
+only to rebuild the ledger after an unclean stop. Nothing on the read path
+goes near them: `book_get` becomes equivalent to `book_headonly`, so the
+fold's read of the previous state is a ledger lookup with no journal seek.
+
+The ledger path is therefore the whole of the live write path. It is bounded
+by `db.leveled.cache_size` (2000) and its `db.leveled.cache_multiple` (2)
+ceiling, past which every PUT returns a pause — backpressure on the writer
+rather than unbounded memory — and then flushed through the penciller into
+the LSM levels. The journal still rolls files on `db.leveled.max_journal_size`
+or `db.leveled.max_journal_objects`. `db.leveled.sync_strategy` is `none` on
+purpose: the event is already durable in the WAL before the fold reaches
+leveled, and the instance fsyncs the projection itself before it truncates or
+checkpoints anything a write was claimed to cover.
+
+![Leveled in head_only mode: the whole value into the ledger through cache,
+penciller and LSM levels; the journal taking object specs only, never
+read](img/db-leveled.svg)
+
+**Journal compaction does not run; a trim reclaims instead.** Leveled accepts
+`compact_journal` only when `head_only` is `false`. Its head_only counterpart
+is `trim`, which drops journal files older than the one holding the
+penciller's persisted sequence number — the history a clean restart would no
+longer replay. Leveled schedules neither on its own, so
+`bondy_db_journal_trimmer` drives the trim every `db.journal_trim_interval`
+(1 hour). Without it the journal grows with cumulative writes while the
+ledger holds only the live set. Reclaimed disk returns a few seconds after
+each pass, because leveled defers the unlink until no snapshot can still be
+reading the file.
+
+Opening a store leaves waste of its own: the inker renames journal files
+absent from its manifest, and the penciller renames SSTs it did not use to
+rebuild the ledger, both to `.bak`. Leveled leaves these for an operator to
+collect. Bondy deletes them itself each time it starts a Bookie
+(`bondy_db_leveled_sup`), which is the moment they appear.
+
+Because journal compaction never runs,
+`db.leveled.singlefile_compaction_percentage`,
+`db.leveled.maxrunlength_compaction_percentage`,
+`db.leveled.max_run_length`, `db.leveled.journal_compaction_score_one_in`
+and `db.leveled.waste_retention_period` have no effect.
+`db.leveled.max_merge_below` is unaffected — it bounds a *ledger* merge, not
+a journal one — as are the compression, snapshot and statistics options.
+`db.leveled.compression_point` keeps only its `on_receipt` meaning;
+`on_compact` would defer compression to a pass that never happens.
+
+![Leveled compaction, compression and snapshots: the journal scoring block
+that head_only mode leaves inert, alongside the ledger-merge, compression
+and snapshot options that still apply](img/db-leveled-compaction.svg)
+
+### Bounding an index rebuild
+
+`db.primary_scan_limit` (1,000,000) caps the primary-cell rescan that answers
+an indexed query while its index is stale. A scan that fills the cap returns a
+potentially incomplete result and logs a warning; the caller is not told. The
+right value follows from realm size and nothing else.
+
+![The bounded primary scan: one realm inside the cap and one that fills
+it](img/db-scan-limit.svg)
+
+## Rationale
+
+Splitting the acknowledgement in two is the central trade. Returning at the
+log makes write latency the price of durability, not of interpretation, and
+lets the fold batch. Returning after the install costs the caller the time
+until the applier reaches its event, but keeps read-your-writes true without
+a read-side merge. The facade defaults to the barrier and offers
+`apply_async/4` for deltas whose consumers are eventually consistent by
+design.
+
+Staging the overlay before the append is what makes both work: the row exists
+the instant the WAL entry does, so the eviction cannot race ahead of it, and
+the barrier has an exact row to wait on. The cost is a rollback obligation on
+the failure path, paid only when the WAL refuses.
+
+Running the fold ahead of the MST install, rather than beside it, is a
+correctness choice and not a performance one: the install handler releases
+the barrier, so a caller released by it has to find the projection already
+written. The pipeline recovers the lost overlap across batches.
+
+One fold module serves every event source, so an event is meant to be
+interpreted the same way whatever its source. See [rationale](db_rationale.md)
+for which of these properties are machine-checked.

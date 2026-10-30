@@ -1,0 +1,1563 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+-module(bondy_oplog_cell_apply).
+-moduledoc """
+The per-shard projection-write engine, factored out of
+`bondy_oplog_applier` so both the applier gen_server and the (ephemeral)
+fused writer can drive cell projection writes through identical code.
+
+Side-effect-only over a `cell_apply_ctx()` + instance id: it reads the
+old cell value (in-batch shadow → A3 frame-cache → projection `get/3`),
+applies the cell kernel, writes the new frames in one `put_batch`,
+invalidates the read cache, advances the per-shard high-water HLC, and
+dispatches secondary-index ops. It never touches the MST or any
+gen_server state. Pure relocation of the applier's prior internals —
+behaviour is byte-identical.
+""".
+
+-include_lib("kernel/include/logger.hrl").
+
+-define(DEFAULT_MAX_INFLIGHT, 100000).
+
+-type shard_key() :: {atom(), atom(), non_neg_integer()}.
+-type cell_apply_ctx() :: #{
+    shard_key := shard_key(),
+    adapter := module(),
+    handle := term(),
+    fold_module := atom() | undefined,
+    %% Namespace under which the replay path publishes remote-merge events
+    %% (`bondy_oplog_core:publish_merge/5`) so node-local reactors can react to
+    %% peer-originated changes. `undefined` (the default) disables emission —
+    %% set only for tables opened with `publish => true`. Only the replay
+    %% (`apply_cell_pairs/4`) path emits; local writes use the applier's
+    %% `publish_batch`.
+    publish_ns => atom() | undefined,
+    %% Cache adapter pair captured at init time so the applier can
+    %% keep the per-shard read cache coherent after every projection
+    %% write. Without this, `bondy_db:apply/4` followed by `read/3` on
+    %% a different process returns stale state — the cache is
+    %% populate-on-miss and never invalidated by writers otherwise.
+    cache_adapter => module() | undefined,
+    cache_handle => term(),
+    %% Per-shard high-water HLC mark. Advanced via
+    %% `bondy_oplog_high_water:advance/2` after every successful
+    %% projection write; see `advance_high_water/2`. `undefined` when the
+    %% shard's registry entry has no ref.
+    high_water_ref => bondy_oplog_high_water:ref() | undefined,
+    %% The primary shard's index version counter
+    %% (`bondy_oplog_core_registry:entry_version_ref/1`). Each cell event that
+    %% yields index ops takes its next value, and every op of the event carries
+    %% it as its order in the index cell.
+    version_ref => atomics:atomics_ref() | undefined,
+    %% Whether a batch that yields index ops also writes them as an intent in
+    %% its own `put_batch` (`bondy_oplog_core_registry:index_intent_cell/4`):
+    %% only on a durable projection, whose index outlives a crash.
+    index_intents => boolean(),
+    %% Secondary indexes declared on this primary table. Static descriptors
+    %% resolved once at init from the applier opts; `[]` (the default) makes the
+    %% index dispatch a strict no-op. For each cell the applier materialises it
+    %% term-diffs the cell's old vs new value per descriptor and dispatches
+    %% `index_entry` ops to the `bondy_oplog_secondary_writer` owning each
+    %% touched secondary shard, resolved live via `bondy_oplog_core_registry` so
+    %% the writer need not exist when the applier starts.
+    secondary_indexes => [index_descriptor()]
+}.
+-type index_descriptor() :: #{
+    index_name := atom(),
+    spec := bondy_oplog_index_spec:spec(),
+    sec_shard_count := pos_integer(),
+    %% Per-shard in-flight back-pressure cap; read by `dispatch_index_ops/3`.
+    %% Defaults to `?DEFAULT_MAX_INFLIGHT` when absent.
+    max_inflight => non_neg_integer()
+}.
+-doc """
+The cell-apply context multiplexer: a `bondy_oplog_mux:t()` whose key is the
+event's `Bucket` (entity type) and whose value is that table's
+`cell_apply_ctx()`. `{single, Ctx}` is the one-table-per-instance case, where
+every bucket resolves to the same context; `{dir, Map}` is the per-shard
+multiplexer keyed by bucket. The applier (durable and non-fused ephemeral) and
+the fused instance each hold a `ctx_source()` and dispatch through
+`apply_cell_batch_mux/3` / `apply_cell_pairs_mux/4`.
+""".
+-type ctx_source() :: bondy_oplog_mux:t().
+
+-doc """
+A context's namespace, its primary shard and that shard's index version
+counter, and its secondary index descriptors, as returned by `sec_idx/1`.
+""".
+-type sec_idx() :: {
+    Namespace :: atom(),
+    {
+        Shard :: non_neg_integer(),
+        VersionRef :: atomics:atomics_ref() | undefined
+    },
+    [index_descriptor()]
+}.
+
+-export_type([cell_apply_ctx/0]).
+-export_type([index_descriptor/0]).
+-export_type([ctx_source/0]).
+-export_type([sec_idx/0]).
+
+-export([apply_cell_batch/3]).
+-export([apply_cell_batch_mux/3]).
+-export([apply_cell_pairs/4]).
+-export([apply_cell_pairs_mux/4]).
+-export([apply_cell_pairs_mux/5]).
+-export([build_source/2]).
+-export([oldstate_cache_new/2]).
+-export([oldstate_cache_delete/3]).
+-export([oldstate_cache_put_entries/2]).
+-export([oldstate_cache_clear/1]).
+-export([sec_idx/1]).
+-export([next_index_version/1]).
+-export([index_ops_for_cell/8]).
+-export([merge_idx_ops/2]).
+-export([dispatch_index_ops/3]).
+-export([replay_intents/3]).
+-export([install_index/5]).
+-export([begin_install/1]).
+-export([settle_install/3]).
+-export([invalidate_cache/4]).
+-export([advance_high_water/2]).
+
+-ifdef(TEST).
+%% Exported for the bounded-eviction / hit-miss unit test.
+-export([oldstate_cache_get/3]).
+%% Exported for `bondy_oplog_prefix_hole_telemetry_test`: the detector needs a
+%% registry entry to read, `seq_gaps/2` is pure and is tested exhaustively.
+-export([detect_prefix_holes/2]).
+-export([seq_gaps/2]).
+-endif.
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+%% @private
+%% Apply a batch of `cell_apply` events to the projection: read each cell's
+%% frame (projection or in-batch shadow), fold the event through the kernel,
+%% write the new frame via `put_batch/2`. Returns the per-origin seqs this call
+%% materialised, `#{Origin => [Seq]}`, for `apply_cell_batch_mux/3` to merge
+%% into the frontier once per batch. An event whose kernel apply raises is
+%% skipped (`compute_one_cell/13`) and still counts as materialised; a failed
+%% `put_batch/2` counts as nothing, the cells re-applying on the next replay.
+apply_cell_batch(undefined, _Id, _Events) ->
+    #{};
+apply_cell_batch(_Ctx, _Id, []) ->
+    #{};
+apply_cell_batch(Ctx, Id, Events) ->
+    #{adapter := Adapter, handle := Handle, kernel := Kernel} = Ctx,
+    CrdtOpts = maps:get(crdt_opts, Ctx, #{}),
+    CacheAdapter = maps:get(cache_adapter, Ctx, undefined),
+    CacheHandle = maps:get(cache_handle, Ctx, undefined),
+    HighWaterRef = maps:get(high_water_ref, Ctx, undefined),
+    OldStateCache = maps:get(oldstate_cache, Ctx, undefined),
+    SecIdx = sec_idx(Ctx),
+
+    %% Collect all per-event writes into a single `Adapter:put_batch/2` call.
+    %% When two events in the batch target the same `{Bucket, Key}` the second
+    %% must observe the first's write, so a `LocalWrites :: #{{Bucket, Key} =>
+    %% Frame}` shadow is threaded through the fold and the per-event read
+    %% checks it before falling back to `Adapter:get/3`. The one `put_batch`
+    %% then takes the deduped list, last write winning per key. `IdxAcc`
+    %% collects the secondary-index ops each cell yields; those are dispatched
+    %% AFTER the primary `put_batch` returns ok.
+    {LocalWrites, MaxHlc, IdxAcc} = lists:foldl(
+        fun(Event, {WAcc, HlcAcc, IAcc}) ->
+            case bondy_oplog_event:op(Event) of
+                {cell_apply, Bucket, Key, FoldEvent} ->
+                    Meta = bondy_oplog_event:key(Event),
+                    Context = bondy_oplog_event:meta(Event),
+                    case
+                        compute_one_cell(
+                            Id,
+                            Adapter,
+                            Handle,
+                            Kernel,
+                            CrdtOpts,
+                            WAcc,
+                            Bucket,
+                            Key,
+                            FoldEvent,
+                            Meta,
+                            Context,
+                            SecIdx,
+                            OldStateCache
+                        )
+                    of
+                        {ok, NewFrame, NewHlc, IdxOps, _OldValueBytes} ->
+                            WAcc1 = WAcc#{{Bucket, Key} => NewFrame},
+                            {
+                                WAcc1,
+                                max_hlc(HlcAcc, NewHlc),
+                                merge_idx_ops(IAcc, IdxOps)
+                            }
+                    end;
+                _ ->
+                    {WAcc, HlcAcc, IAcc}
+            end
+        end,
+        {#{}, undefined, #{}},
+        Events
+    ),
+
+    case map_size(LocalWrites) of
+        0 ->
+            %% No cell produced a frame: the batch held no cell events, or
+            %% every kernel apply raised.
+            origin_seqs(Events, fun event_cell_key/1);
+        _ ->
+            PutT0 = erlang:monotonic_time(microsecond),
+            Entries = [{B, K, F} || {{B, K}, F} <- maps:to_list(LocalWrites)],
+            PutResult = Adapter:put_batch(
+                Handle, Entries ++ intent_cells(Ctx, SecIdx, IdxAcc)
+            ),
+            telemetry:execute(
+                [bondy_oplog, applier, batch_cell_put],
+                #{
+                    duration_us => erlang:monotonic_time(microsecond) - PutT0,
+                    count => length(Entries)
+                },
+                #{instance_id => Id}
+            ),
+            case PutResult of
+                ok ->
+                    %% Cache invalidate per unique key (dedup via
+                    %% the LocalWrites map's key set, not the Inval
+                    %% list which may have duplicates).
+                    maps:foreach(
+                        fun({B, K}, _F) ->
+                            invalidate_cache(CacheAdapter, CacheHandle, B, K)
+                        end,
+                        LocalWrites
+                    ),
+                    %% Write-through the now-durable frames into the
+                    %% applier's OldValue cache (no-op when disabled).
+                    oldstate_cache_put_entries(OldStateCache, Entries),
+                    case MaxHlc of
+                        undefined -> ok;
+                        _ -> advance_high_water(HighWaterRef, MaxHlc)
+                    end,
+                    %% Only after the primary write is durable do we let
+                    %% the index see these terms. The live drain path
+                    %% enforces the back-pressure cap (Bypass = false).
+                    ok = dispatch_index_ops(SecIdx, IdxAcc, false),
+                    %% Report what is now durable. The caller makes the
+                    %% frontier claim, after every group of the batch has
+                    %% reported — so the frontier never leads the projection.
+                    origin_seqs(Events, fun event_cell_key/1);
+                {error, Reason} ->
+                    %% Primary write failed: do NOT dispatch index ops —
+                    %% the cells (and their index entries) are re-applied
+                    %% on the next replay of these events.
+                    ?LOG_WARNING(#{
+                        description =>
+                            "bondy_oplog_applier projection batch write "
+                            "failed; the cells will be re-applied on the "
+                            "next replay of these events",
+                        instance_id => Id,
+                        count => map_size(LocalWrites),
+                        reason => Reason
+                    }),
+                    #{}
+            end
+    end.
+
+%% @private
+%% Per-event compute (read + apply + encode). Returns the new frame + HLC to the
+%% batch caller, which collects and writes them all at once. Reads first consult
+%% `LocalWrites` so in-batch updates to the same `{Bucket, Key}` see each other
+%% (the substrate has not been written yet), then fall back to `Adapter:get/3`.
+%% A raise anywhere here stops the applier, which resumes from
+%% `consumer.offset` and re-applies the event, rather than skip an event the
+%% caller has already been told is applied (`bondy_oplog_commit_barrier_test`).
+compute_one_cell(
+    Id,
+    Adapter,
+    Handle,
+    Kernel,
+    CrdtOpts,
+    LocalWrites,
+    Bucket,
+    Key,
+    FoldEvent,
+    Meta,
+    Context,
+    SecIdx,
+    OldStateCache
+) ->
+    ReadT0 = erlang:monotonic_time(microsecond),
+    %% OldValue read precedence: in-batch shadow (`LocalWrites`), then the
+    %% frame cache, then projection `get/3`. The cache is a write-through
+    %% mirror of the durable frame, so a hit only removes the read I/O.
+    {OldState, OldValueOpt} =
+        case maps:get({Bucket, Key}, LocalWrites, undefined) of
+            undefined ->
+                read_old_value(
+                    OldStateCache,
+                    Adapter,
+                    Handle,
+                    Kernel,
+                    CrdtOpts,
+                    Id,
+                    Bucket,
+                    Key
+                );
+            LocalFrame ->
+                decode_old_frame(Kernel, LocalFrame)
+        end,
+    telemetry:execute(
+        [bondy_oplog, applier, cell_read],
+        #{duration_us => erlang:monotonic_time(microsecond) - ReadT0},
+        #{instance_id => Id}
+    ),
+    ApplyT0 = erlang:monotonic_time(microsecond),
+    {NewState, Hlc, NewStateBytes, NewValueBytes, ValueEqualsState} =
+        bondy_oplog_cell_kernel:apply(
+            Kernel, OldState, OldValueOpt, FoldEvent, Meta, Context
+        ),
+    NewFrame = bondy_oplog_cell_frame:encode(
+        Hlc,
+        NewStateBytes,
+        NewValueBytes,
+        ValueEqualsState
+    ),
+    telemetry:execute(
+        [bondy_oplog, applier, cell_apply_event],
+        #{duration_us => erlang:monotonic_time(microsecond) - ApplyT0},
+        #{instance_id => Id}
+    ),
+    IdxOps = index_ops_for_cell(
+        SecIdx,
+        Id,
+        Kernel,
+        Bucket,
+        Key,
+        OldState,
+        NewState,
+        next_index_version(SecIdx)
+    ),
+    {ok, NewFrame, Hlc, IdxOps, OldValueOpt}.
+
+%% @private
+%% Resolve OldValue from the frame-cache (hit) or the projection
+%% (miss). Emits a `[bondy_oplog, applier, oldstate_cache]` hit/miss
+%% event only when the cache is enabled (zero overhead when off).
+read_old_value(
+    OldStateCache, Adapter, Handle, Kernel, CrdtOpts, Id, Bucket, Key
+) ->
+    case oldstate_cache_get(OldStateCache, Bucket, Key) of
+        {hit, Frame} ->
+            emit_cache_result(OldStateCache, Id, hit),
+            decode_old_frame(Kernel, Frame);
+        miss ->
+            emit_cache_result(OldStateCache, Id, miss),
+            case Adapter:get(Handle, Bucket, Key) of
+                not_found ->
+                    {
+                        bondy_oplog_cell_kernel:init(Kernel, CrdtOpts),
+                        undefined
+                    };
+                {ok, OldFrame} ->
+                    decode_old_frame(Kernel, OldFrame)
+            end
+    end.
+
+%% @private
+%% Decode a stored cell frame into `{OldState, OldValueOpt}` — the exact shape
+%% `compute_one_cell/13` consumes. Shared by the in-batch shadow, the
+%% cache-hit, and the projection-read paths so all three are byte-for-byte
+%% equivalent.
+decode_old_frame(Kernel, Frame) ->
+    {_PrevHlc, StateBytes, ValueBytes} =
+        bondy_oplog_cell_frame:decode_full(Frame),
+    {
+        bondy_oplog_cell_kernel:decode_state(Kernel, StateBytes),
+        ValueBytes
+    }.
+
+%% @private
+%% OldValue frame-cache constructor. `{Tab, Max}` when enabled,
+%% `undefined` when disabled (every cache op below is then a no-op and
+%% behaviour is unchanged). The table is `private` — only
+%% the owning applier process reads or writes it.
+oldstate_cache_new(false, _Max) ->
+    undefined;
+oldstate_cache_new(true, Max) ->
+    {ets:new(applier_oldstate_cache, [set, private]), Max}.
+
+%% @private
+oldstate_cache_get(undefined, _Bucket, _Key) ->
+    miss;
+oldstate_cache_get({Tab, _Max}, Bucket, Key) ->
+    case ets:lookup(Tab, {Bucket, Key}) of
+        [{_, Frame}] -> {hit, Frame};
+        [] -> miss
+    end.
+
+%% @private
+%% Write-through the just-written `{Bucket, Key, Frame}` entries. Called
+%% only after the projection `put_batch` returns ok, so the cache mirrors
+%% exactly what is durable. Bounded: if the table is at the cap, it is
+%% cleared before inserting (coarse evict — the cache is rebuildable, so a
+%% clear only costs re-warm misses on the next cycle).
+oldstate_cache_put_entries(undefined, _Entries) ->
+    ok;
+oldstate_cache_put_entries({Tab, Max}, Entries) ->
+    case ets:info(Tab, size) >= Max of
+        true -> ets:delete_all_objects(Tab);
+        false -> ok
+    end,
+    lists:foreach(
+        fun({Bucket, Key, Frame}) ->
+            ets:insert(Tab, {{Bucket, Key}, Frame})
+        end,
+        Entries
+    ),
+    ok.
+
+%% Drop ONE cached frame — the cell was physically removed from the
+%% projection (the stable-cell sweep), so a hit would feed the next apply a
+%% stale OldState. Runs in the owning applier process (the table is
+%% `private`). No-op when disabled.
+oldstate_cache_delete(undefined, _Bucket, _Key) ->
+    ok;
+oldstate_cache_delete({Tab, _Max}, Bucket, Key) ->
+    true = ets:delete(Tab, {Bucket, Key}),
+    ok.
+
+%% @private
+%% Drop every cached frame. Used when the projection is written outside
+%% the write-through paths (catalogue install) so the cache cannot serve
+%% a pre-install frame on the next read. No-op when disabled.
+oldstate_cache_clear(undefined) ->
+    ok;
+oldstate_cache_clear({Tab, _Max}) ->
+    true = ets:delete_all_objects(Tab),
+    ok.
+
+%% @private
+emit_cache_result(undefined, _Id, _Result) ->
+    ok;
+emit_cache_result(_Cache, Id, Result) ->
+    telemetry:execute(
+        [bondy_oplog, applier, oldstate_cache],
+        #{count => 1},
+        #{instance_id => Id, result => Result}
+    ).
+
+%% @private
+%% Tracks the maximum HLC seen across a batch so the per-shard
+%% high-water mark can be advanced once at the end instead of once
+%% per cell event.
+max_hlc(undefined, Hlc) -> Hlc;
+max_hlc(A, B) when A >= B -> A;
+max_hlc(_, B) -> B.
+
+%% @private
+%% `[]` (no indexes) makes every downstream index step a strict no-op.
+sec_idx(Ctx) ->
+    {NS, _Index, Shard} = maps:get(shard_key, Ctx),
+    {
+        NS,
+        {Shard, maps:get(version_ref, Ctx, undefined)},
+        maps:get(secondary_indexes, Ctx, [])
+    }.
+
+-doc """
+Take the next index version of the primary shard `SecIdx` names. `0`, with no
+draw, when the shard has no secondary indexes.
+""".
+-spec next_index_version(sec_idx()) -> non_neg_integer().
+
+next_index_version({_NS, _Counter, []}) ->
+    0;
+next_index_version({_NS, {_Shard, Ref}, _SecIndexes}) ->
+    bondy_oplog_core_registry:index_version_next(Ref).
+
+-doc """
+Term-diff one cell's old and new state into `{IndexName, SecShard, IndexOp}`
+ops across every secondary index `SecIdx` declares, each op carrying
+`Version` as its order. `OldState = none` stands for a cell with no indexed
+past, so the ops are a `put` for every current term: the rebuild's re-fold
+into a cleared index. `NewState = none` stands for a deleted cell, so the ops
+are a `remove` for every old term. A `put` goes out for every current term (an idempotent
+re-put also refreshes the denormalised columns when sibling fields changed)
+and a `remove` for every term the value no longer yields.
+
+A raise (e.g. a term type the codec rejects) is logged and yields no ops: it
+degrades only the index, which a rebuild restores, never the primary write.
+""".
+-spec index_ops_for_cell(
+    sec_idx(),
+    term(),
+    bondy_oplog_cell_kernel:t(),
+    binary(),
+    term(),
+    term() | none,
+    term() | none,
+    non_neg_integer()
+) -> [{atom(), non_neg_integer(), bondy_oplog_secondary_writer:op()}].
+
+index_ops_for_cell(
+    {_NS, _Counter, []}, _Id, _Kernel, _Bucket, _Key, _Old, _New, _Version
+) ->
+    [];
+index_ops_for_cell(
+    {_NS, _Counter, SecIndexes},
+    _Id,
+    Kernel,
+    Bucket,
+    Key,
+    OldState,
+    NewState,
+    Version
+) ->
+    OldValue = cell_value(Kernel, OldState),
+    NewValue = cell_value(Kernel, NewState),
+    lists:flatmap(
+        fun(Desc) ->
+            index_ops_for_one(
+                Desc, Bucket, Key, OldValue, NewValue, Version
+            )
+        end,
+        SecIndexes
+    ).
+
+%% @private
+cell_value(_Kernel, none) ->
+    undefined;
+cell_value(Kernel, State) ->
+    bondy_oplog_cell_kernel:to_value(Kernel, State).
+
+%% @private
+index_ops_for_one(
+    #{index_name := IName, spec := Spec, sec_shard_count := SCount} = Desc,
+    Bucket,
+    Key,
+    OldValue,
+    NewValue,
+    Version
+) ->
+    RealmFolded = maps:get(realm_folded, Desc, false),
+    OldTerms = lists:usort(bondy_oplog_index_spec:terms(Spec, OldValue)),
+    NewTerms = lists:usort(bondy_oplog_index_spec:terms(Spec, NewValue)),
+    SecBucket = bondy_oplog_index_key:bucket(Bucket, IName),
+    Cols = bondy_oplog_index_spec:project(Spec, NewValue),
+    Removed = OldTerms -- NewTerms,
+    [
+        index_op(
+            IName, SecBucket, SCount, T, Key, {put, Cols, Version}, RealmFolded
+        )
+     || T <- NewTerms
+    ] ++
+        [
+            index_op(
+                IName, SecBucket, SCount, T, Key, {remove, Version}, RealmFolded
+            )
+         || T <- Removed
+        ].
+
+%% @private
+index_op(IName, SecBucket, SCount, Term, PrimaryKey, EventDelta, RealmFolded) ->
+    SecShard = bondy_oplog_index_key:shard(SecBucket, Term, SCount),
+    SecKey = index_seckey(Term, PrimaryKey, RealmFolded),
+    Op =
+        case EventDelta of
+            {put, Cols, Version} -> {put, SecBucket, SecKey, Cols, Version};
+            {remove, Version} -> {remove, SecBucket, SecKey, Version}
+        end,
+    {IName, SecShard, Op}.
+
+%% @private
+%% Compose the secondary key. A scalar term keeps the term-first layout
+%% `«enc(Term), 0, PrimaryKey»`; a realm the topology folds stays inside
+%% `PrimaryKey` and `bondy_db` scopes it on the read side. A composite (list)
+%% term on a realm-folding topology is recomposed realm-first,
+%% `«Realm, 0, enc(Tuple), 0, BareKey»`, so a prefix/range scan over the tuple
+%% stays inside one realm. The realm is split out of the folded `PrimaryKey`
+%% `«Realm, 0, BareKey»`: realm URIs are NUL-free, so the first `0x00` delimits.
+index_seckey(Term, PrimaryKey, true) when is_list(Term) ->
+    [Realm, BareKey] = binary:split(PrimaryKey, <<0>>),
+    <<Realm/binary, 0, (bondy_oplog_index_key:encode_term(Term))/binary, 0,
+        BareKey/binary>>;
+index_seckey(Term, PrimaryKey, _RealmFolded) ->
+    bondy_oplog_index_key:encode(Term, PrimaryKey).
+
+%% @private
+merge_idx_ops(Acc, []) ->
+    Acc;
+merge_idx_ops(Acc, [{IName, SecShard, Op} | Rest]) ->
+    K = {IName, SecShard},
+    merge_idx_ops(Acc#{K => [Op | maps:get(K, Acc, [])]}, Rest).
+
+%% @private
+%% Dispatch the grouped index ops to the secondary writer owning each touched
+%% shard, resolved live from the registry. A missing writer pid or row is
+%% dropped silently; the index is rebuildable from the primary. Each
+%% `(IName, SecShard)` carries an in-flight op counter: on the live drain path
+%% (`Bypass = false`) a batch that would exceed the index's `max_inflight` cap
+%% is dropped, the shard marked `needs_rebuild` and stale, and a rebuild
+%% requested; the rebuild's own re-fold dispatches with `Bypass = true`.
+dispatch_index_ops({_NS, _Counter, []}, _IdxAcc, _Bypass) ->
+    ok;
+dispatch_index_ops({_NS, _Counter, _SecIndexes}, IdxAcc, _Bypass) when
+    map_size(IdxAcc) =:= 0
+->
+    ok;
+dispatch_index_ops({NS, {Shard, Ref}, SecIndexes}, IdxAcc, Bypass) ->
+    Caps = maps:from_list([
+        {
+            maps:get(index_name, D),
+            maps:get(max_inflight, D, ?DEFAULT_MAX_INFLIGHT)
+        }
+     || D <- SecIndexes
+    ]),
+    maps:foreach(
+        fun({IName, SecShard}, RevOps) ->
+            Cap = maps:get(IName, Caps, ?DEFAULT_MAX_INFLIGHT),
+            dispatch_one_index(
+                NS, IName, SecShard, Shard, lists:reverse(RevOps), Cap, Bypass
+            )
+        end,
+        IdxAcc
+    ),
+    bondy_oplog_core_registry:index_version_dispatched(
+        Ref, top_version(IdxAcc)
+    ).
+
+-doc """
+Dispatch the index ops of a primary shard's leftover intents
+(`bondy_oplog_core_registry:index_intents_leftover/4`) to the writers of its
+index shards, bypassing the back-pressure cap, then record their highest
+version as dispatched. `Entry` is the shard's registry row. It is meant to
+run after the row is registered and before the shard's applier starts, so it
+is the only process dispatching for the shard.
+""".
+-spec replay_intents(
+    bondy_oplog_core_registry:shard_entry(),
+    [index_descriptor()],
+    [{pos_integer(), map()}]
+) -> ok.
+
+replay_intents(_Entry, _SecIndexes, []) ->
+    ok;
+replay_intents(Entry, SecIndexes, Intents) ->
+    {NS, _Index, Shard} = bondy_oplog_core_registry:entry_key(Entry),
+    Ref = bondy_oplog_core_registry:entry_version_ref(Entry),
+    IdxAcc = lists:foldl(
+        fun({_Version, Ops}, Acc0) ->
+            maps:fold(
+                fun(Stream, RevOps, Acc) ->
+                    Acc#{Stream => RevOps ++ maps:get(Stream, Acc, [])}
+                end,
+                Acc0,
+                Ops
+            )
+        end,
+        #{},
+        Intents
+    ),
+    dispatch_index_ops({NS, {Shard, Ref}, SecIndexes}, IdxAcc, true).
+
+-doc """
+The index side of an install's write of cell `{Bucket, Key}`: the intent cells
+to write in the same batch as the cell, and the index ops, diffed against the
+cell's current frame. `New` is the frame the install writes, or `none` when
+it deletes the cell. Each call takes one version of the shard's counter.
+`{[], []}`, with no read, when the table has no secondary indexes.
+""".
+-spec install_index(
+    term(), cell_apply_ctx(), binary(), term(), binary() | none
+) ->
+    {
+        [{binary(), term(), binary()}],
+        [{atom(), non_neg_integer(), bondy_oplog_secondary_writer:op()}]
+    }.
+
+install_index(Id, Ctx, Bucket, Key, New) ->
+    case sec_idx(Ctx) of
+        {_NS, _Counter, []} ->
+            {[], []};
+        SecIdx ->
+            #{adapter := Adapter, handle := Handle, kernel := Kernel} = Ctx,
+            Old =
+                case Adapter:get(Handle, Bucket, Key) of
+                    {ok, Frame} -> Frame;
+                    not_found -> none
+                end,
+            Ops = index_ops_for_cell(
+                SecIdx,
+                Id,
+                Kernel,
+                Bucket,
+                Key,
+                frame_state(Kernel, Old),
+                frame_state(Kernel, New),
+                next_index_version(SecIdx)
+            ),
+            {intent_cells(Ctx, SecIdx, merge_idx_ops(#{}, Ops)), Ops}
+    end.
+
+-doc """
+Opens an install's group of cells. On a table with secondary indexes it syncs
+the primary first, so an install never overwrites an unsynced write: a crash
+could keep the install and lose that write, whose redo then diffs against the
+installed cell and drops its index ops
+(`proofs/quint/configs/IndexIntents/Intents_Subset.qnt`; without the sync,
+`proofs/quint/configs/IndexIntents/Intents_Subset_NoInstallSync.qnt` violates
+`indexMatchesPrimary`).
+""".
+-spec begin_install(cell_apply_ctx()) -> ok | {error, term()}.
+
+begin_install(Ctx) ->
+    case sec_idx(Ctx) of
+        {_NS, _Counter, []} -> ok;
+        _SecIdx -> sync_primary(Ctx)
+    end.
+
+-doc """
+Ends an install's group of cells, whose index ops `IdxAcc` holds
+(`merge_idx_ops/2` over `install_index/5`'s ops). When the group wrote all its
+cells (`Status = ok`) and has ops, it syncs the primary, then dispatches
+`IdxAcc`, bypassing the back-pressure cap. The sync comes first because an
+install's cells are not in the WAL, so nothing re-applies one a crash lost
+(`proofs/quint/configs/IndexIntents/InstallBatch.qnt`; without the sync,
+`proofs/quint/configs/IndexIntents/InstallBatch_NoSync.qnt` violates
+`indexMatchesPrimary`). A failed group or sync marks every shard of the
+table's indexes for rebuild instead, and returns the error.
+""".
+-spec settle_install(cell_apply_ctx(), map(), ok | {error, term()}) ->
+    ok | {error, term()}.
+
+settle_install(_Ctx, IdxAcc, ok) when map_size(IdxAcc) =:= 0 ->
+    ok;
+settle_install(Ctx, IdxAcc, ok) ->
+    SecIdx = sec_idx(Ctx),
+    case sync_primary(Ctx) of
+        ok ->
+            dispatch_index_ops(SecIdx, IdxAcc, true);
+        {error, _} = Error ->
+            ok = mark_indexes(SecIdx),
+            Error
+    end;
+settle_install(Ctx, _IdxAcc, {error, _} = Error) ->
+    ok = mark_indexes(sec_idx(Ctx)),
+    Error.
+
+%% @private
+sync_primary(#{adapter := Adapter, handle := Handle}) ->
+    case bondy_oplog_projection_adapter:sync(Adapter, Handle) of
+        ok -> ok;
+        {error, Reason} -> {error, {projection_sync_failed, Reason}}
+    end.
+
+%% @private
+frame_state(_Kernel, none) ->
+    none;
+frame_state(Kernel, Frame) ->
+    {State, _ValueBytes} = decode_old_frame(Kernel, Frame),
+    State.
+
+%% @private
+mark_indexes({NS, _Counter, SecIndexes}) ->
+    lists:foreach(
+        fun(#{index_name := IName, sec_shard_count := SCount}) ->
+            lists:foreach(
+                fun(SecShard) ->
+                    case
+                        bondy_oplog_core_registry:lookup(NS, IName, SecShard)
+                    of
+                        {ok, Entry} -> bondy_oplog_index_rebuild:mark(Entry);
+                        not_found -> ok
+                    end
+                end,
+                lists:seq(0, SCount - 1)
+            )
+        end,
+        SecIndexes
+    ).
+
+%% @private
+intent_cells(
+    #{index_intents := true}, {NS, {Shard, _Ref}, _SecIndexes}, IdxAcc
+) when
+    map_size(IdxAcc) > 0
+->
+    [
+        bondy_oplog_core_registry:index_intent_cell(
+            NS, Shard, top_version(IdxAcc), IdxAcc
+        )
+    ];
+intent_cells(_Ctx, _SecIdx, _IdxAcc) ->
+    [].
+
+%% @private
+top_version(IdxAcc) ->
+    maps:fold(
+        fun(_Stream, Ops, Max) ->
+            lists:foldl(
+                fun(Op, M) ->
+                    max(bondy_oplog_secondary_writer:op_version(Op), M)
+                end,
+                Max,
+                Ops
+            )
+        end,
+        0,
+        IdxAcc
+    ).
+
+%% @private
+dispatch_one_index(NS, IName, SecShard, Source, Ops, Cap, Bypass) ->
+    case bondy_oplog_core_registry:lookup(NS, IName, SecShard) of
+        {ok, Entry} ->
+            case bondy_oplog_core_registry:entry_writer_pid(Entry) of
+                Pid when is_pid(Pid) ->
+                    NumOps = length(Ops),
+                    Accept =
+                        Bypass orelse
+                            bondy_oplog_core_registry:index_inflight(Entry) +
+                                NumOps =< Cap,
+                    case Accept of
+                        true ->
+                            _ = bondy_oplog_core_registry:index_inflight_add(
+                                Entry, NumOps
+                            ),
+                            %% Tag the batch with its `(NS, IndexName)` stream:
+                            %% the writer is shared across every index shard on
+                            %% its `writer_key` and demuxes the ops back to each
+                            %% stream's projection.
+                            bondy_oplog_secondary_writer:enqueue(
+                                Pid, {NS, IName}, Source, Ops
+                            );
+                        false ->
+                            secondary_saturation_drop(
+                                NS, IName, SecShard, Entry, NumOps
+                            )
+                    end;
+                undefined ->
+                    ok
+            end;
+        not_found ->
+            ok
+    end.
+
+%% @private
+%% Saturation: the secondary writer's in-flight backlog would exceed the
+%% cap. Drop the batch (the index is a deterministic function of the
+%% primary, so it is rebuildable), mark the shard for rebuild, reset its
+%% freshness so `index_get`/`index_range` refuse until the rebuild
+%% completes, and request the rebuild.
+secondary_saturation_drop(NS, IName, SecShard, Entry, NumOps) ->
+    bondy_oplog_core_registry:reset_stale_ae(Entry),
+    telemetry:execute(
+        [bondy_oplog, secondary_writer, saturated],
+        #{dropped_ops => NumOps},
+        #{namespace => NS, index_name => IName, shard => SecShard}
+    ),
+    bondy_oplog_index_rebuild:mark(Entry).
+
+%% @private
+%% Walks the `{Key, Value}` pairs from the MST (or its diff) and dispatches
+%% every `cell_apply` op through the batched compute path; non-cell ops are
+%% the per-instance fold's, already seen via the WAL drain. Same
+%% collect-then-batch shape as `apply_cell_batch/3`, with a per-key shadow for
+%% in-batch read-your-own-writes, and index dispatch under the back-pressure
+%% cap. Returns `{CellsApplied, Materialised}`; `apply_cell_pairs_mux/5` makes
+%% the frontier claim once per batch. A raising apply counts as materialised.
+apply_cell_pairs(Ctx, Id, Pairs, LocalOrigin) ->
+    #{adapter := Adapter, handle := Handle, kernel := Kernel} = Ctx,
+    CrdtOpts = maps:get(crdt_opts, Ctx, #{}),
+    CacheAdapter = maps:get(cache_adapter, Ctx, undefined),
+    CacheHandle = maps:get(cache_handle, Ctx, undefined),
+    HighWaterRef = maps:get(high_water_ref, Ctx, undefined),
+    OldStateCache = maps:get(oldstate_cache, Ctx, undefined),
+    SecIdx = sec_idx(Ctx),
+    %% When set (table opened with `publish => true`), every PEER-authored cell
+    %% this replay writes is published as a remote-merge event so node-local
+    %% reactors can react to peer-originated changes. `undefined` ⇒ no emission,
+    %% zero cost. The replay diff can also sweep up locally-authored cells (a
+    %% shared per-shard instance replays one MST whenever ANY of its tables
+    %% merges a peer root); those were already published locally via
+    %% `publish_batch`, so they are filtered here by `LocalOrigin` — only a cell
+    %% whose event-key origin differs from this node's own origin is a true merge.
+    PublishNs = maps:get(publish_ns, Ctx, undefined),
+    {LocalWrites, MaxHlc, N, IdxAcc, PubAcc} = lists:foldl(
+        fun
+            (
+                {MstKey, {
+                    {cell_apply, Bucket, CellKey, FoldEvent},
+                    EventMeta,
+                    _Prev,
+                    _Sig
+                }},
+                {WAcc, HlcAcc, NAcc, IAcc, PAcc}
+            ) ->
+                case
+                    compute_one_cell(
+                        Id,
+                        Adapter,
+                        Handle,
+                        Kernel,
+                        CrdtOpts,
+                        WAcc,
+                        Bucket,
+                        CellKey,
+                        FoldEvent,
+                        MstKey,
+                        EventMeta,
+                        SecIdx,
+                        OldStateCache
+                    )
+                of
+                    {ok, NewFrame, NewHlc, IdxOps, OldValueBytes} ->
+                        WAcc1 = WAcc#{{Bucket, CellKey} => NewFrame},
+                        %% Only a peer-authored cell is a true merge; a
+                        %% locally-authored cell swept into the diff was
+                        %% already published locally.
+                        CellPublishNs = merge_publish_ns(
+                            PublishNs, MstKey, LocalOrigin
+                        ),
+                        PAcc1 = maybe_collect_merge(
+                            CellPublishNs,
+                            PAcc,
+                            Bucket,
+                            CellKey,
+                            FoldEvent,
+                            NewHlc,
+                            decode_publish_old(
+                                Kernel, CellPublishNs, OldValueBytes
+                            )
+                        ),
+                        {
+                            WAcc1,
+                            max_hlc(HlcAcc, NewHlc),
+                            NAcc + 1,
+                            merge_idx_ops(IAcc, IdxOps),
+                            PAcc1
+                        }
+                end;
+            (_, Acc) ->
+                Acc
+        end,
+        {#{}, undefined, 0, #{}, #{}},
+        Pairs
+    ),
+    Materialised =
+        case map_size(LocalWrites) of
+            0 ->
+                batch_seqs(Pairs);
+            _ ->
+                Entries = [
+                    {B, K, F}
+                 || {{B, K}, F} <- maps:to_list(LocalWrites)
+                ],
+                case
+                    Adapter:put_batch(
+                        Handle,
+                        Entries ++ intent_cells(Ctx, SecIdx, IdxAcc)
+                    )
+                of
+                    ok ->
+                        maps:foreach(
+                            fun({B, K}, _F) ->
+                                invalidate_cache(
+                                    CacheAdapter, CacheHandle, B, K
+                                )
+                            end,
+                            LocalWrites
+                        ),
+                        %% Write-through the peer/replay frames too,
+                        %% so a subsequent local read sees the durable
+                        %% value (no-op when disabled).
+                        oldstate_cache_put_entries(OldStateCache, Entries),
+                        case MaxHlc of
+                            undefined -> ok;
+                            _ -> advance_high_water(HighWaterRef, MaxHlc)
+                        end,
+                        ok = dispatch_index_ops(SecIdx, IdxAcc, false),
+                        %% Notify reactors AFTER the durable write + index
+                        %% dispatch, so a reactor that reads back sees the
+                        %% merged value. Best-effort, never blocks the replay.
+                        ok = publish_merges(PublishNs, PubAcc),
+                        %% Report what is now durable; the caller makes the
+                        %% frontier claim, so the frontier never leads the
+                        %% projection.
+                        batch_seqs(Pairs);
+                    {error, Reason} ->
+                        ?LOG_WARNING(#{
+                            description =>
+                                "bondy_oplog_applier replay batch write "
+                                "failed; the cells will be re-applied on "
+                                "the next sync tick",
+                            instance_id => Id,
+                            count => map_size(LocalWrites),
+                            reason => Reason
+                        }),
+                        #{}
+                end
+        end,
+    {N, Materialised}.
+
+%% @private
+batch_seqs(Pairs) ->
+    origin_seqs(Pairs, fun pair_cell_key/1).
+
+%% @private
+%% Per-origin seq lists (unsorted) over a batch's seq-bearing events — the
+%% shared core of `batch_seqs/1`, `apply_cell_batch_mux/3`,
+%% `detect_prefix_holes/2` and `partition_contiguous/4`. `KeyF` extracts the
+%% event key from one batch element, or `undefined` for elements carrying no
+%% per-origin seq claim. `cell_apply` events count, and so do `seq_fill`
+%% backfills: a fill's whole purpose is to be PRESENT — to advance the frontier
+%% and complete contiguous runs — while every fold skips it.
+origin_seqs(Items, KeyF) ->
+    lists:foldl(
+        fun(Item, Acc) ->
+            case KeyF(Item) of
+                undefined ->
+                    Acc;
+                Key ->
+                    Origin = bondy_oplog_event:key_origin(Key),
+                    Seq = bondy_oplog_event:key_seq(Key),
+                    maps:update_with(
+                        Origin, fun(Seqs) -> [Seq | Seqs] end, [Seq], Acc
+                    )
+            end
+        end,
+        #{},
+        Items
+    ).
+
+%% @private
+pair_cell_key({MstKey, {{cell_apply, _B, _K, _F}, _Meta, _Prev, _Sig}}) ->
+    MstKey;
+pair_cell_key({MstKey, {seq_fill, _Meta, _Prev, _Sig}}) ->
+    MstKey;
+pair_cell_key(_) ->
+    undefined.
+
+%% @private
+event_cell_key(Event) ->
+    case bondy_oplog_event:op(Event) of
+        {cell_apply, _B, _K, _F} -> bondy_oplog_event:key(Event);
+        seq_fill -> bondy_oplog_event:key(Event);
+        _ -> undefined
+    end.
+
+%% @private
+%% Telemetry only; never changes behaviour. Reports the seqs a fold found
+%% ABSENT below its own batch. Presence is the prefix PLUS
+%% `bondy_oplog_registry:pending/1`, read together so the pair cannot tear.
+%%
+%% A firing is not always data loss: a local append committing to the WAL out
+%% of seq order, or a seq burned and awaiting its `seq_fill`, presents the same
+%% way.
+detect_prefix_holes(_Id, OriginSeqs) when map_size(OriginSeqs) =:= 0 ->
+    ok;
+detect_prefix_holes(Id, OriginSeqs) ->
+    {VV, Pending} = bondy_oplog_registry:frontier_and_pending(Id),
+    maps:foreach(
+        fun(Origin, Seqs) ->
+            Cur = maps:get(Origin, VV, 0),
+            Held = maps:get(Origin, Pending, bondy_connect_interval_set:new()),
+            Present = bondy_connect_interval_set:union(
+                Held,
+                bondy_connect_interval_set:from_list([S || S <- Seqs, S > Cur])
+            ),
+            case seq_gaps(Cur, Present) of
+                [] ->
+                    ok;
+                Gaps ->
+                    Missing = lists:sum([To - From + 1 || {From, To} <- Gaps]),
+                    telemetry:execute(
+                        [bondy_oplog, applier, prefix_hole],
+                        #{count => 1, missing => Missing},
+                        #{
+                            instance_id => Id,
+                            origin => Origin,
+                            applied_seq => Cur,
+                            held => bondy_connect_interval_set:flat_size(Held),
+                            gaps => Gaps
+                        }
+                    ),
+                    ?LOG_WARNING(#{
+                        description =>
+                            "Per-origin contiguity gap at the cell-apply "
+                            "fold: this batch materialises an origin's "
+                            "later seq while earlier seq(s) are neither "
+                            "applied here nor in the batch. The applied "
+                            "frontier holds its prefix below the gap and "
+                            "keeps the later seqs pending, so nothing is "
+                            "over-claimed - but the gap holds this "
+                            "origin's prefix, and every event above it in "
+                            "the tree, until it closes. If the missing "
+                            "history is truncated at every live peer, only "
+                            "a catalogue re-bootstrap can close it.",
+                        instance_id => Id,
+                        origin => Origin,
+                        applied_seq => Cur,
+                        held => bondy_connect_interval_set:flat_size(Held),
+                        gaps => Gaps,
+                        missing => Missing
+                    })
+            end
+        end,
+        OriginSeqs
+    ).
+
+%% @private
+%% The absent runs below each maximal run of `Set`, relative to `Prev`
+%% (exclusive): each `{From, To}` is a maximal run of absent seqs. `Set` is a
+%% `bondy_connect_interval_set`, whose runs are ascending, disjoint and non-adjacent
+%% (it coalesces), so one left-to-right pass suffices; a run already covered
+%% by `Prev` contributes nothing.
+seq_gaps(_Prev, []) ->
+    [];
+seq_gaps(Prev, [Run | Rest]) ->
+    {Lo, Hi} = run_bounds(Run),
+    case Lo > Prev + 1 of
+        true -> [{Prev + 1, Lo - 1} | seq_gaps(Hi, Rest)];
+        false -> seq_gaps(erlang:max(Hi, Prev), Rest)
+    end.
+
+%% @private
+run_bounds({Lo, Hi}) -> {Lo, Hi};
+run_bounds(N) when is_integer(N) -> {N, N}.
+
+%% @private
+%% Per-bucket multiplexing front-end for `apply_cell_batch/3`: a shard instance
+%% shared by several tables receives events for more than one `Bucket`, so the
+%% batch is grouped by bucket and each group applied under the ctx its
+%% `ctx_source()` resolves (`{single, Ctx}` or `{dir, #{Bucket => Ctx}}`); a
+%% bucket with no ctx is logged and skipped. The frontier claim is made here,
+%% once per batch, from what materialised, `seq_fill` backfills included; the
+%% merge is a join, so one over-claiming site would defeat every other one.
+apply_cell_batch_mux(Source, Id, Events) ->
+    ok = detect_prefix_holes(Id, origin_seqs(Events, fun event_cell_key/1)),
+    Materialised = lists:foldl(
+        fun({Bucket, Group}, MAcc) ->
+            case bondy_oplog_mux:resolve(Source, Bucket) of
+                undefined ->
+                    log_missing_ctx(Id, Bucket, length(Group)),
+                    MAcc;
+                Ctx ->
+                    union_seqs(MAcc, apply_cell_batch(Ctx, Id, Group))
+            end
+        end,
+        origin_seqs(fills(Events), fun event_cell_key/1),
+        bondy_oplog_mux:group_by(Events, fun event_bucket/1)
+    ),
+    bondy_oplog_registry:merge_applied(Id, Materialised).
+
+%% @private
+%% The `seq_fill` members of a batch — the signed no-op occupants of a seq
+%% range burned by a failed WAL append (`release_seq_range` in
+%% `bondy_oplog_instance`). They seed the materialised set because their whole
+%% purpose is to be present: there is nothing to fold and nothing to lose.
+fills(Events) ->
+    lists:filter(
+        fun(E) -> bondy_oplog_event:op(E) =:= seq_fill end,
+        Events
+    ).
+
+%% @private
+%% Per-origin seq accumulator union. Lists, not sets: they are batch-scoped and
+%% short, and `bondy_oplog_registry:merge_applied/2` folds them into an
+%% interval set anyway.
+union_seqs(A, B) ->
+    maps:merge_with(fun(_Origin, Xs, Ys) -> Xs ++ Ys end, A, B).
+
+%% @private
+%% As `apply_cell_batch_mux/3`, for the replay/merge path; returns the total
+%% number of cells applied across all bucket groups.
+apply_cell_pairs_mux(Source, Id, Pairs, LocalOrigin) ->
+    {Count, _Held} =
+        apply_cell_pairs_mux(Source, Id, Pairs, LocalOrigin, #{hold => false}),
+    Count.
+
+%% @private
+%% As `apply_cell_pairs_mux/4`, delivering causally: with `hold => true`, a
+%% remote origin's events beyond its first contiguity gap, and every event whose
+%% context observed one, are held (`partition_contiguous/4`): excluded from the
+%% fold and from the frontier claim. Returns `{CellsApplied, HeldCount}`. A
+%% caller passing `hold => true` MUST NOT advance its replay cursor past this
+%% diff when `HeldCount > 0`; a one-shot fold with no re-presentation path
+%% (`rederive_projection`) MUST use `/4`. Local-origin events are never held.
+apply_cell_pairs_mux(Source, Id, Pairs, LocalOrigin, Opts) ->
+    {Presented, Held} =
+        case maps:get(hold, Opts, false) of
+            true ->
+                partition_contiguous(
+                    Id, drop_retired(Id, Pairs), LocalOrigin, Source
+                );
+            false ->
+                {drop_retired(Id, Pairs), 0}
+        end,
+    Foldable = drop_claimed(Id, Presented),
+    %% Detect on what will actually FOLD, after any hold: `prefix_hole`
+    %% means a contiguity gap MATERIALISED into the projection, while a
+    %% gap that was presented but held is `events_held`. With holding
+    %% off `Foldable =:= Pairs`, so this is the unenforced measurement.
+    ok = detect_prefix_holes(Id, batch_seqs(Foldable)),
+    %% One frontier update for the batch, from what MATERIALISED — the same
+    %% rule as the local path; see `bondy_oplog_registry:merge_applied/2`.
+    %% Events HELD by `partition_contiguous/4` are not in `Foldable` and so
+    %% simply do not appear: they were deliberately withheld and the caller's
+    %% un-advanced cursor re-presents them, at which point they materialise
+    %% and are recorded like any other.
+    {Count, Materialised} = lists:foldl(
+        fun({Bucket, Group}, {CAcc, MAcc}) ->
+            case bondy_oplog_mux:resolve(Source, Bucket) of
+                undefined ->
+                    log_missing_ctx(Id, Bucket, length(Group)),
+                    {CAcc, MAcc};
+                Ctx ->
+                    {N, Done} = apply_cell_pairs(Ctx, Id, Group, LocalOrigin),
+                    {CAcc + N, union_seqs(MAcc, Done)}
+            end
+        end,
+        {0, batch_seqs(fill_pairs(Foldable))},
+        bondy_oplog_mux:group_by(Foldable, fun pair_bucket/1)
+    ),
+    ok = bondy_oplog_registry:merge_applied(Id, Materialised),
+    {Count, Held}.
+
+%% @private
+%% The `seq_fill` members of a replay batch — see `fills/1`.
+fill_pairs(Pairs) ->
+    lists:filter(
+        fun
+            ({_MstKey, {seq_fill, _Meta, _Prev, _Sig}}) -> true;
+            (_) -> false
+        end,
+        Pairs
+    ).
+
+%% @private
+%% Drops the pairs the applied frontier already claims, prefix or pending, so
+%% an event folds into a cell at most once. A re-fold is not idempotent once
+%% the cell has been reclaimed: stabilization discards an empty cell and its
+%% context, so a re-presented add whose remove was already folded would come
+%% back (`installed_enable_stays_disabled` in
+%% `bondy_oplog_bootstrap_rederive_test`; `proofs/quint/specs/JoinInstall.qnt`).
+%% It relies on every claim naming an event the projection holds
+%% (`claimSound`).
+drop_claimed(Id, Pairs) ->
+    {VV, Pending} = bondy_oplog_registry:frontier_and_pending(Id),
+    [Pair || Pair <- Pairs, not is_claimed(pair_cell_key(Pair), VV, Pending)].
+
+%% @private
+is_claimed(undefined, _VV, _Pending) ->
+    false;
+is_claimed(Key, VV, Pending) ->
+    bondy_oplog_event:covered(Key, VV) orelse
+        bondy_connect_interval_set:is_element(
+            bondy_oplog_event:key_seq(Key),
+            maps:get(
+                bondy_oplog_event:key_origin(Key),
+                Pending,
+                bondy_connect_interval_set:new()
+            )
+        ).
+
+%% @private
+%% Drops pairs authored by a RETIRED origin before anything folds them.
+%% `bondy_oplog_instance` refuses a banned origin at `install_remote`, but a
+%% whole-root page merge brings a peer's subtree in structurally and never
+%% consults that gate, so without this filter a retired origin's events would
+%% reach the projection and contradict the frontier reap its retirement
+%% licensed. Only retired origins are dropped, never merely banned ones: a
+%% ban can be lifted, and dropping its events here would lose them for good.
+drop_retired(Id, Pairs) ->
+    case bondy_oplog_origin_bans:has_retired() of
+        false ->
+            Pairs;
+        true ->
+            %% The set is read ONCE for the batch. Asking per pair would put
+            %% a match-spec compilation per event on the applier's fold, paid
+            %% from the moment an operator retires anything.
+            Retired = bondy_oplog_origin_bans:retired_set(),
+            {Kept, Dropped} = lists:partition(
+                fun(Pair) ->
+                    case pair_cell_key(Pair) of
+                        undefined ->
+                            true;
+                        Key ->
+                            not is_map_key(
+                                bondy_oplog_event:key_origin(Key), Retired
+                            )
+                    end
+                end,
+                Pairs
+            ),
+            Dropped =/= [] andalso
+                telemetry:execute(
+                    [bondy_oplog, applier, retired_pairs_dropped],
+                    #{count => length(Dropped)},
+                    #{instance_id => Id}
+                ),
+            Kept
+    end.
+
+%% @private
+%% Splits a replay batch into the pairs the fold may materialise and the count
+%% it must hold, so the fold delivers causally: an event folds only when all
+%% its stamped context observed is applied or folds before it in this batch
+%% (`proofs/isabelle/Aw_Kernel.thy`, `causal_hold_delivers_causally`). Per
+%% remote origin the top is the end of the contiguous run above the applied
+%% PREFIX, drawn from routable seqs only, lowered by contexts naming seqs beyond
+%% another origin's top (`causal_tops/4`). Local-origin pairs are never held.
+partition_contiguous(Id, Pairs0, LocalOrigin, Source) ->
+    Pairs = lists:keysort(1, Pairs0),
+    VV = bondy_oplog_registry:frontier(Id),
+    OriginSeqs = maps:remove(
+        LocalOrigin, origin_seqs(Pairs, fun pair_cell_key/1)
+    ),
+    Unroutable = maps:remove(
+        LocalOrigin, origin_seqs(unroutable(Pairs, Source), fun pair_cell_key/1)
+    ),
+    RunTops = maps:map(
+        fun(Origin, Seqs) ->
+            Cur = maps:get(Origin, VV, 0),
+            Blocked = maps:get(Origin, Unroutable, []),
+            Run = contiguous_run(
+                Cur,
+                lists:usort([
+                    S
+                 || S <- Seqs, S > Cur, not lists:member(S, Blocked)
+                ])
+            ),
+            lists:last([Cur | Run])
+        end,
+        OriginSeqs
+    ),
+    Tops = causal_tops(
+        unapplied_contexts(Pairs, VV, LocalOrigin),
+        RunTops,
+        VV,
+        bondy_oplog_origin_bans:retired_set()
+    ),
+    case lists:partition(fun(Pair) -> not above_top(Pair, Tops) end, Pairs) of
+        {Foldable, []} ->
+            {Foldable, 0};
+        {Foldable, Held} ->
+            HeldSeqs = origin_seqs(Held, fun pair_cell_key/1),
+            telemetry:execute(
+                [bondy_oplog, applier, events_held],
+                #{count => length(Held)},
+                #{instance_id => Id, held => HeldSeqs}
+            ),
+            ?LOG_INFO(#{
+                description =>
+                    "Causal hold: this replay batch carries remote-origin "
+                    "events beyond a per-origin contiguity gap, or events "
+                    "whose context observed one; they are excluded from the "
+                    "fold and the applied-frontier merge, and the caller "
+                    "keeps its replay cursor so they re-present until the "
+                    "gap fills or a rebootstrap repairs it.",
+                instance_id => Id,
+                held => HeldSeqs
+            }),
+            {Foldable, length(Held)}
+    end.
+
+%% @private
+above_top(Pair, Tops) ->
+    case pair_cell_key(Pair) of
+        undefined ->
+            false;
+        Key ->
+            bondy_oplog_event:key_seq(Key) >
+                maps:get(bondy_oplog_event:key_origin(Key), Tops, infinity)
+    end.
+
+%% @private
+%% `{Origin, Seq, Context}` for each remote pair above the applied frontier
+%% whose event carries a stamped context (a version vector; `undefined` for a
+%% context-free CRDT).
+unapplied_contexts(Pairs, VV, LocalOrigin) ->
+    [
+        {Origin, Seq, Ctx}
+     || {_MstKey, {{cell_apply, _B, _K, _F}, Ctx, _Prev, _Sig}} = Pair <- Pairs,
+        is_list(Ctx),
+        Key <- [pair_cell_key(Pair)],
+        Origin <- [bondy_oplog_event:key_origin(Key)],
+        Origin =/= LocalOrigin,
+        Seq <- [bondy_oplog_event:key_seq(Key)],
+        Seq > maps:get(Origin, VV, 0)
+    ].
+
+%% @private
+%% Lowers each origin's top to below the first of its events, in key order,
+%% whose context names a seq above another origin's top. An origin outside
+%% `Tops` is bounded by the applied frontier. One pass suffices: whatever an
+%% event observed sorts before it (the HLC respects happens-before, H3 of
+%% `proofs/isabelle/Oplog_Model.thy`), so every top it is checked against is
+%% already final.
+causal_tops(Candidates, Tops0, VV, Retired) ->
+    lists:foldl(
+        fun({Origin, Seq, Ctx}, Tops) ->
+            Top = fun(P) -> maps:get(P, Tops, maps:get(P, VV, 0)) end,
+            Observed = fun({P, N}) ->
+                not is_map_key(P, Retired) andalso N > Top(P)
+            end,
+            case Seq =< Top(Origin) andalso lists:any(Observed, Ctx) of
+                true -> Tops#{Origin => Seq - 1};
+                false -> Tops
+            end
+        end,
+        Tops0,
+        Candidates
+    ).
+
+%% @private
+%% The pairs whose bucket does not resolve to a cell-apply context, so the
+%% fold would discard them. A pair carrying no bucket — a `seq_fill` — is
+%% never blocked: occupying its seq is its whole job.
+unroutable(Pairs, Source) ->
+    lists:filter(
+        fun(Pair) ->
+            case pair_bucket(Pair) of
+                skip ->
+                    false;
+                {ok, Bucket} ->
+                    bondy_oplog_mux:resolve(Source, Bucket) =:= undefined
+            end
+        end,
+        Pairs
+    ).
+
+%% @private
+contiguous_run(Prev, [S | Rest]) when S =:= Prev + 1 ->
+    [S | contiguous_run(S, Rest)];
+contiguous_run(_Prev, _Seqs) ->
+    [].
+
+-doc """
+Build the initial `ctx_source()` for the cell-apply mux. A `cell_apply_bucket`
+in `Opts` (a `bondy_db`-provisioned table that may later share its shard
+instance) starts the source in `{dir, _}` mode keyed by that bucket, so
+`source_put/3` can add sibling tables. Without it — the single-table and
+raw-instance callers — the source stays `{single, Ctx}` (every bucket routes to
+the one ctx).
+""".
+-spec build_source(CellCtx :: cell_apply_ctx(), Opts :: map()) -> ctx_source().
+
+build_source(CellCtx, Opts) ->
+    case maps:get(cell_apply_bucket, Opts, undefined) of
+        Bucket when is_binary(Bucket) ->
+            bondy_oplog_mux:dir([{Bucket, CellCtx}]);
+        _ ->
+            bondy_oplog_mux:single(CellCtx)
+    end.
+
+%% @private
+event_bucket(Event) ->
+    case bondy_oplog_event:op(Event) of
+        {cell_apply, Bucket, _Key, _FoldEvent} -> {ok, Bucket};
+        _ -> skip
+    end.
+
+%% @private
+pair_bucket(
+    {_MstKey, {{cell_apply, Bucket, _CellKey, _FoldEvent}, _Meta, _Prev, _Sig}}
+) ->
+    {ok, Bucket};
+pair_bucket(_) ->
+    skip.
+
+%% @private
+log_missing_ctx(Id, Bucket, Count) ->
+    ?LOG_WARNING(#{
+        description =>
+            "bondy_oplog_cell_apply: no cell-apply context for bucket; "
+            "cells skipped and not counted as applied. They come back only "
+            "on a path that re-presents them: the held replay keeps its "
+            "cursor and does, a one-shot full fold does not.",
+        instance_id => Id,
+        bucket => Bucket,
+        count => Count
+    }).
+
+%% @private
+%% The publish namespace to use for ONE replayed cell: the table's `PublishNs`
+%% only when the cell was peer-authored (its event-key origin differs from this
+%% node's `LocalOrigin`), else `undefined` (suppress emission). A locally
+%% authored cell — which a shared per-shard instance can sweep into a replay diff
+%% triggered by a sibling table's peer merge — was already published locally via
+%% the applier's `publish_batch`, so re-publishing it as a "merge" would be a
+%% duplicate reactor event. `LocalOrigin = undefined` publishes all.
+merge_publish_ns(undefined, _MstKey, _LocalOrigin) ->
+    undefined;
+merge_publish_ns(PublishNs, MstKey, LocalOrigin) ->
+    case bondy_oplog_event:key_origin(MstKey) of
+        LocalOrigin -> undefined;
+        _ -> PublishNs
+    end.
+
+%% @private
+%% Accumulate a cell's `(FoldEvent, Hlc)` for remote-merge publication, keyed by
+%% `{Bucket, CellKey}` so a key written twice in one batch publishes once (the
+%% last write). A no-op when the table did not opt in (`publish_ns = undefined`).
+maybe_collect_merge(
+    undefined, PubAcc, _Bucket, _CellKey, _FoldEvent, _Hlc, _Old
+) ->
+    PubAcc;
+maybe_collect_merge(_NS, PubAcc, Bucket, CellKey, FoldEvent, Hlc, Old) ->
+    PubAcc#{{Bucket, CellKey} => {FoldEvent, Hlc, Old}}.
+
+%% @private
+%% The pre-merge cell VALUE for the published merge event, decoded from the old
+%% frame's value bytes. Only paid for cells actually being published
+%% (`NS =/= undefined`); `undefined` when the cell did not exist (and for a
+%% `value_equals_state` fold, whose frames carry no value column — no published
+%% table uses one).
+decode_publish_old(_Kernel, undefined, _ValueBytes) ->
+    undefined;
+decode_publish_old(_Kernel, _NS, undefined) ->
+    undefined;
+decode_publish_old(Kernel, _NS, ValueBytes) ->
+    bondy_oplog_cell_kernel:decode_value_bytes(Kernel, ValueBytes).
+
+%% @private
+%% Publish one remote-merge event per collected cell. The published `(Key, Op)`
+%% mirrors `bondy_db:publish_event/1` (Key = CellKey, Op = FoldEvent), so a
+%% reactor sees the same shape for local and remote changes; the merge event
+%% additionally carries the pre-merge value (`Old`) so reactors can diff.
+publish_merges(undefined, _PubAcc) ->
+    ok;
+publish_merges(NS, PubAcc) ->
+    maps:foreach(
+        fun({_Bucket, CellKey}, {FoldEvent, Hlc, Old}) ->
+            bondy_oplog_core:publish_merge(NS, CellKey, Hlc, FoldEvent, Old)
+        end,
+        PubAcc
+    ).
+
+%% @private
+%% Invalidate the per-shard read cache entry for `{Bucket, Key}` after a
+%% projection write so the next reader repopulates it. Both `(a)` the
+%% applier cannot insert the correct cached value (the cache wants the
+%% post-overlay-merge value but the applier has only the *decoded* fold
+%% state) and `(b)` the next reader's `slow_read_traced/3` will repopulate
+%% the cache anyway.
+invalidate_cache(undefined, _Handle, _Bucket, _Key) ->
+    ok;
+invalidate_cache(_Adapter, undefined, _Bucket, _Key) ->
+    ok;
+invalidate_cache(Adapter, Handle, Bucket, Key) ->
+    Adapter:delete(Handle, Bucket, Key).
+
+%% @private
+%% Advance the per-shard high-water HLC mark
+%% (`bondy_oplog_high_water:advance/2`) after a successful projection
+%% write. A registry entry without a ref advances nothing.
+advance_high_water(undefined, _Hlc) ->
+    ok;
+advance_high_water(Ref, Hlc) ->
+    bondy_oplog_high_water:advance(Ref, Hlc).

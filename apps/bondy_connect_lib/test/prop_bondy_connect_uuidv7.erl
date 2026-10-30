@@ -1,0 +1,252 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(prop_bondy_connect_uuidv7).
+-moduledoc """
+Property-based tests for `bondy_connect_uuidv7`: UUIDv7 generation and parsing.
+
+UUIDv7 is a time-ordered UUID that embeds a Unix timestamp in milliseconds.
+These properties check the implementation against RFC 9562.
+""".
+
+-include_lib("proper/include/proper.hrl").
+
+%% Properties
+-export([
+    prop_new_always_valid/0,
+    prop_new_has_correct_version/0,
+    prop_new_has_correct_variant/0,
+    prop_from_timestamp_roundtrip/0,
+    prop_from_timestamp_is_valid/0,
+    prop_format_produces_valid_output/0,
+    prop_is_valid_rejects_invalid/0,
+    prop_parse_hex_roundtrip/0,
+    prop_parse_rejects_non_hex/0,
+    prop_monotonic_ordering/0,
+    prop_uniqueness/0
+]).
+
+%% =============================================================================
+%% Generators
+%% =============================================================================
+
+timestamp() ->
+    %% Up to year 9999
+    ?LET(T, range(0, 253402300799999), T).
+
+%% Generate a small timestamp for testing ordering
+small_timestamp() ->
+    %% Roughly 2001 to 2033
+    range(1000000000000, 2000000000000).
+
+ordered_timestamps() ->
+    ?LET(
+        Base,
+        small_timestamp(),
+        ?LET(
+            Offsets,
+            list(range(1, 1000)),
+            lists:foldl(
+                fun(Offset, Acc) ->
+                    Last =
+                        case Acc of
+                            [] -> Base;
+                            [H | _] -> H
+                        end,
+                    [Last + Offset | Acc]
+                end,
+                [Base],
+                Offsets
+            )
+        )
+    ).
+
+invalid_uuid() ->
+    oneof([
+        %% Wrong version (not 7)
+        ?LET(
+            {Ts, A, B},
+            {
+                range(0, 281474976710655),
+                range(0, 4095),
+                range(0, 4611686018427387903)
+            },
+            <<Ts:48, 6:4, A:12, 2:2, B:62>>
+        ),
+        %% Wrong variant (not 2)
+        ?LET(
+            {Ts, A, B},
+            {
+                range(0, 281474976710655),
+                range(0, 4095),
+                range(0, 4611686018427387903)
+            },
+            <<Ts:48, 7:4, A:12, 0:2, B:62>>
+        ),
+        %% Wrong size
+        ?LET(
+            Bytes,
+            range(1, 15),
+            crypto:strong_rand_bytes(Bytes)
+        ),
+        %% Too large
+        ?LET(
+            _,
+            term(),
+            crypto:strong_rand_bytes(20)
+        )
+    ]).
+
+%% =============================================================================
+%% Properties: Generation
+%% =============================================================================
+
+prop_new_always_valid() ->
+    ?FORALL(
+        _,
+        term(),
+        bondy_connect_uuidv7:is_valid(bondy_connect_uuidv7:new())
+    ).
+
+prop_new_has_correct_version() ->
+    ?FORALL(
+        _,
+        term(),
+        begin
+            <<_:48, Version:4, _:76>> = bondy_connect_uuidv7:new(),
+            Version =:= 7
+        end
+    ).
+
+%% Property: new/0 produces UUIDs with variant 2 (RFC 4122)
+prop_new_has_correct_variant() ->
+    ?FORALL(
+        _,
+        term(),
+        begin
+            <<_:48, _:4, _:12, Variant:2, _:62>> = bondy_connect_uuidv7:new(),
+            Variant =:= 2
+        end
+    ).
+
+%% =============================================================================
+%% Properties: Timestamp Operations
+%% =============================================================================
+
+prop_from_timestamp_roundtrip() ->
+    ?FORALL(
+        Ts,
+        timestamp(),
+        begin
+            UUID = bondy_connect_uuidv7:from_timestamp(Ts),
+            %% Timestamp is truncated to 48 bits
+            Expected = Ts band 16#FFFFFFFFFFFF,
+            bondy_connect_uuidv7:timestamp(UUID) =:= Expected
+        end
+    ).
+
+prop_from_timestamp_is_valid() ->
+    ?FORALL(
+        Ts,
+        timestamp(),
+        begin
+            UUID = bondy_connect_uuidv7:from_timestamp(Ts),
+            bondy_connect_uuidv7:is_valid(UUID)
+        end
+    ).
+
+%% =============================================================================
+%% Properties: Formatting
+%% =============================================================================
+
+prop_format_produces_valid_output() ->
+    ?FORALL(
+        Ts,
+        timestamp(),
+        begin
+            UUID = bondy_connect_uuidv7:from_timestamp(Ts),
+            Formatted = bondy_connect_uuidv7:format(UUID),
+            %% Default format is urlsafe base64
+            is_binary(Formatted) orelse is_list(Formatted)
+        end
+    ).
+
+%% =============================================================================
+%% Properties: Validation
+%% =============================================================================
+
+prop_is_valid_rejects_invalid() ->
+    ?FORALL(
+        Invalid,
+        invalid_uuid(),
+        not bondy_connect_uuidv7:is_valid(Invalid)
+    ).
+
+prop_parse_hex_roundtrip() ->
+    ?FORALL(
+        Ts,
+        timestamp(),
+        begin
+            UUID = bondy_connect_uuidv7:from_timestamp(Ts),
+            Hex = bondy_connect_uuidv7:format(UUID, #{mode => hex}),
+            UUID =:= bondy_connect_uuidv7:parse(Hex)
+        end
+    ).
+
+%% `binary:decode_hex/1` raises `badarg` on a non-hex character.
+prop_parse_rejects_non_hex() ->
+    ?FORALL(
+        {Pos, Char},
+        {range(0, 31), oneof([$g, $z, $\s, $+, $/])},
+        begin
+            Hex = binary:copy(<<"0">>, 32),
+            <<Pre:Pos/binary, _, Post/binary>> = Hex,
+            Bad = <<Pre/binary, Char, Post/binary>>,
+            try bondy_connect_uuidv7:parse(Bad) of
+                _ -> false
+            catch
+                error:badarg -> true
+            end
+        end
+    ).
+
+%% =============================================================================
+%% Properties: Ordering and Uniqueness
+%% =============================================================================
+
+%% Property: UUIDs built from increasing timestamps embed non-decreasing
+%% timestamps.
+prop_monotonic_ordering() ->
+    ?FORALL(
+        Timestamps,
+        ordered_timestamps(),
+        begin
+            UUIDs = [
+                bondy_connect_uuidv7:from_timestamp(Ts)
+             || Ts <- lists:reverse(Timestamps)
+            ],
+            check_monotonic_timestamps(UUIDs)
+        end
+    ).
+
+check_monotonic_timestamps([]) ->
+    true;
+check_monotonic_timestamps([_]) ->
+    true;
+check_monotonic_timestamps([A, B | Rest]) ->
+    TsA = bondy_connect_uuidv7:timestamp(A),
+    TsB = bondy_connect_uuidv7:timestamp(B),
+    TsA =< TsB andalso check_monotonic_timestamps([B | Rest]).
+
+prop_uniqueness() ->
+    ?FORALL(
+        N,
+        range(2, 100),
+        begin
+            UUIDs = [bondy_connect_uuidv7:new() || _ <- lists:seq(1, N)],
+            UniqueUUIDs = lists:usort(UUIDs),
+            length(UUIDs) =:= length(UniqueUUIDs)
+        end
+    ).

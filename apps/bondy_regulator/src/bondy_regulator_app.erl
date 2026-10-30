@@ -3,12 +3,10 @@
 %% SPDX-License-Identifier: Apache-2.0
 %% =============================================================================
 
-%%%-------------------------------------------------------------------
-%% @doc bondy_regulator public API
-%% @end
-%%%-------------------------------------------------------------------
-
 -module(bondy_regulator_app).
+-moduledoc """
+The `bondy_regulator` application callback.
+""".
 
 -behaviour(application).
 
@@ -19,5 +17,3 @@ start(_StartType, _StartArgs) ->
 
 stop(_State) ->
     ok.
-
-%% internal functions

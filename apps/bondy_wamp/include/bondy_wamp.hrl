@@ -7,17 +7,35 @@
 %% COMMON
 %% =============================================================================
 
+%% A `calendar:datetime()`. JSON, CBOR and MessagePack send one as the same
+%% RFC 3339 string (`bondy_wamp_encoding_SUITE:in_vm_terms_encode_alike_test/1`).
+-define(IS_DATETIME(Y, M, D, H, Mi, S),
+    (is_integer(Y) andalso Y >= 0 andalso
+        is_integer(M) andalso M >= 0 andalso
+        is_integer(D) andalso D >= 0 andalso
+        is_integer(H) andalso H >= 0 andalso
+        is_integer(Mi) andalso Mi >= 0 andalso
+        is_number(S) andalso S >= 0)
+).
+
+%% A key OTP `json` can encode (`json.erl`, `key/2`). JSON, CBOR and
+%% MessagePack send a list headed by a pair with such a key as an object. A
+%% list headed by a datetime goes out as an array of strings
+%% (`bondy_wamp_encoding_SUITE:datetime_list_encodes_as_strings_test/1`).
+-define(IS_KEY_VALUE_KEY(K),
+    (is_binary(K) orelse is_atom(K) orelse is_integer(K) orelse is_float(K))
+).
 
 -define(WAMP2_JSON, <<"wamp.2.json">>).
 -define(WAMP2_MSGPACK, <<"wamp.2.msgpack">>).
 -define(WAMP2_BERT, <<"wamp.2.bert">>).
 -define(WAMP2_ERL, <<"wamp.2.erl">>).
 -define(WAMP2_CBOR, <<"wamp.2.cbor">>).
--define(WAMP2_CBOR_BATCHED,<<"wamp.2.cbor.batched">>).
--define(WAMP2_MSGPACK_BATCHED,<<"wamp.2.msgpack.batched">>).
--define(WAMP2_JSON_BATCHED,<<"wamp.2.json.batched">>).
--define(WAMP2_BERT_BATCHED,<<"wamp.2.bert.batched">>).
--define(WAMP2_ERL_BATCHED,<<"wamp.2.erl.batched">>).
+-define(WAMP2_CBOR_BATCHED, <<"wamp.2.cbor.batched">>).
+-define(WAMP2_MSGPACK_BATCHED, <<"wamp.2.msgpack.batched">>).
+-define(WAMP2_JSON_BATCHED, <<"wamp.2.json.batched">>).
+-define(WAMP2_BERT_BATCHED, <<"wamp.2.bert.batched">>).
+-define(WAMP2_ERL_BATCHED, <<"wamp.2.erl.batched">>).
 -define(WAMP2_JSON_SSE, <<"wamp.2.json.sse">>).
 
 -define(WAMP_ENCODINGS, [
@@ -33,33 +51,26 @@
 
 -define(MAX_ID, 9007199254740992).
 
--type encoding()        ::  json
-                            | msgpack
-                            | bert
-                            | erl
-                            | json_batched
-                            | msgpack_batched
-                            | bert_batched
-                            | erl_batched.
+-type encoding() ::
+    json
+    | msgpack
+    | bert
+    | erl
+    | json_batched
+    | msgpack_batched
+    | bert_batched
+    | erl_batched.
 
--type frame_type()      ::  text | binary.
--type transport()       ::  ws | raw | http_sse | http_longpoll.
--type subprotocol()     ::  {transport(), frame_type(), encoding()}.
+-type frame_type() :: text | binary.
+-type transport() :: ws | raw | http_sse | http_longpoll.
+-type subprotocol() :: {transport(), frame_type(), encoding()}.
 
-
-%% Adictionary describing *features* supported by the peer for that role.
-%% This MUST be empty for WAMP Basic Profile implementations, and MUST
-%% be used by implementations implementing parts of the Advanced Profile
-%% to list the specific set of features they support.
--type uri()             ::  binary().
--type id()              ::  0..?MAX_ID.
-
-
+-type uri() :: binary().
+-type id() :: 0..?MAX_ID.
 
 %% =============================================================================
 %% RAW_SOCKET
 %% =============================================================================
-
 
 -define(RAW_MAGIC, 16#7F).
 -define(RAW_MSG_PREFIX, <<0:5, 0:3>>).
@@ -80,8 +91,7 @@
     <<(?RAW_MSG_PREFIX)/binary, (byte_size(Bin)):24, Bin/binary>>
 ).
 
-
--type raw_error()   ::
+-type raw_error() ::
     invalid_response
     | invalid_socket
     | invalid_handshake
@@ -91,18 +101,14 @@
     | serializer_unsupported
     | use_of_reserved_bits.
 
-
-%% =============================================================================
-%% AUTH
-%% =============================================================================
-
-
-
-
 %% =============================================================================
 %% FEATURE ANNOUNCEMENT
 %% =============================================================================
 
+%% A role's `features` is a dictionary of the features the peer supports for
+%% that role. This MUST be empty for WAMP Basic Profile implementations, and
+%% MUST list the supported features in implementations of Advanced Profile
+%% parts.
 
 -define(ROUTER_ROLES_SPEC, #{
     broker => #{
@@ -133,107 +139,100 @@
     }
 }).
 
--define(WAMP_COMMON_FEATURES_SPEC,
-    begin
-        #{payload_passthru_mode => #{
+-define(WAMP_COMMON_FEATURES_SPEC, begin
+    #{
+        payload_passthru_mode => #{
             alias => <<"payload_passthru_mode">>,
             required => false,
             datatype => boolean
-        }}
-    end
-).
-
-
--define(WAMP_RPC_FEATURES_SPEC,
-    begin
-        (?WAMP_COMMON_FEATURES_SPEC)#{
-            progressive_call_results => #{
-                alias => <<"progressive_call_results">>,
-                required => false,
-                datatype => boolean
-            },
-            progressive_calls => #{
-                alias => <<"progressive_calls">>,
-                required => false,
-                datatype => boolean
-            },
-            call_timeout => #{
-                alias => <<"call_timeout">>,
-                required => false,
-                datatype => boolean
-            },
-            call_canceling => #{
-                alias => <<"call_canceling">>,
-                required => false,
-                datatype => boolean
-            },
-            caller_identification=> #{
-                alias => <<"caller_identification">>,
-                required => false,
-                datatype => boolean
-            },
-            sharded_registration => #{
-                alias => <<"sharded_registration">>,
-                required => false,
-                datatype => boolean
-            }
-    }
-    end
-).
-
-
--define(WAMP_DEALER_FEATURES_SPEC,
-    begin
-        (?WAMP_RPC_FEATURES_SPEC)#{
-            call_reroute => #{
-                alias => <<"call_reroute">>,
-                required => false,
-                datatype => boolean
-            },
-            call_trustlevels => #{
-                alias => <<"call_trustlevels">>,
-                required => false,
-                datatype => boolean
-            },
-            pattern_based_registration => #{
-                alias => <<"pattern_based_registration">>,
-                required => false,
-                datatype => boolean
-            },
-            shared_registration => #{
-                alias => <<"shared_registration">>,
-                required => false,
-                datatype => boolean
-            },
-            registration_revocation => #{
-                alias => <<"registration_revocation">>,
-                required => false,
-                datatype => boolean
-            },
-            testament_meta_api => #{
-                alias => <<"testament_meta_api">>,
-                required => false,
-                datatype => boolean
-            },
-            session_meta_api => #{
-                alias => <<"session_meta_api">>,
-                required => false,
-                datatype => boolean
-            },
-            registration_meta_api => #{
-                alias => <<"registration_meta_api">>,
-                required => false,
-                datatype => boolean
-            },
-            reflection => #{
-                alias => <<"reflection">>,
-                required => false,
-                datatype => boolean
-            }
         }
-    end
-).
+    }
+end).
 
+-define(WAMP_RPC_FEATURES_SPEC, begin
+    (?WAMP_COMMON_FEATURES_SPEC)#{
+        progressive_call_results => #{
+            alias => <<"progressive_call_results">>,
+            required => false,
+            datatype => boolean
+        },
+        progressive_call_invocations => #{
+            alias => <<"progressive_call_invocations">>,
+            required => false,
+            datatype => boolean
+        },
+        call_timeout => #{
+            alias => <<"call_timeout">>,
+            required => false,
+            datatype => boolean
+        },
+        call_canceling => #{
+            alias => <<"call_canceling">>,
+            required => false,
+            datatype => boolean
+        },
+        caller_identification => #{
+            alias => <<"caller_identification">>,
+            required => false,
+            datatype => boolean
+        },
+        sharded_registration => #{
+            alias => <<"sharded_registration">>,
+            required => false,
+            datatype => boolean
+        }
+    }
+end).
+
+-define(WAMP_DEALER_FEATURES_SPEC, begin
+    (?WAMP_RPC_FEATURES_SPEC)#{
+        call_reroute => #{
+            alias => <<"call_reroute">>,
+            required => false,
+            datatype => boolean
+        },
+        call_trustlevels => #{
+            alias => <<"call_trustlevels">>,
+            required => false,
+            datatype => boolean
+        },
+        pattern_based_registration => #{
+            alias => <<"pattern_based_registration">>,
+            required => false,
+            datatype => boolean
+        },
+        shared_registration => #{
+            alias => <<"shared_registration">>,
+            required => false,
+            datatype => boolean
+        },
+        registration_revocation => #{
+            alias => <<"registration_revocation">>,
+            required => false,
+            datatype => boolean
+        },
+        testament_meta_api => #{
+            alias => <<"testament_meta_api">>,
+            required => false,
+            datatype => boolean
+        },
+        session_meta_api => #{
+            alias => <<"session_meta_api">>,
+            required => false,
+            datatype => boolean
+        },
+        registration_meta_api => #{
+            alias => <<"registration_meta_api">>,
+            required => false,
+            datatype => boolean
+        },
+        reflection => #{
+            alias => <<"reflection">>,
+            required => false,
+            datatype => boolean
+        }
+    }
+end).
 
 -define(DEALER_FEATURES_SPEC, ?WAMP_DEALER_FEATURES_SPEC#{
     call_retries => #{
@@ -243,22 +242,20 @@
     }
 }).
 
--define(WAMP_PUBSUB_FEATURES_SPEC,
-    begin
-        (?WAMP_COMMON_FEATURES_SPEC)#{
-            publisher_identification => #{
-                alias => <<"publisher_identification">>,
-                required => false,
-                datatype => boolean
-            },
-            sharded_subscription => #{
-                alias => <<"sharded_subscription">>,
-                required => false,
-                datatype => boolean
-            }
+-define(WAMP_PUBSUB_FEATURES_SPEC, begin
+    (?WAMP_COMMON_FEATURES_SPEC)#{
+        publisher_identification => #{
+            alias => <<"publisher_identification">>,
+            required => false,
+            datatype => boolean
+        },
+        sharded_subscription => #{
+            alias => <<"sharded_subscription">>,
+            required => false,
+            datatype => boolean
         }
-    end
-).
+    }
+end).
 
 -define(BROKER_FEATURES_SPEC, (?WAMP_PUBSUB_FEATURES_SPEC)#{
     subscriber_blackwhite_listing => #{
@@ -323,7 +320,6 @@
         datatype => boolean
     }
 }).
-
 
 -define(CLIENT_ROLES_SPEC, #{
     publisher => #{
@@ -438,7 +434,6 @@
 
 -define(WAMP_CALLER_FEATURES_SPEC, ?WAMP_RPC_FEATURES_SPEC).
 
-
 -define(SUBSCRIBER_FEATURES_SPEC, (?WAMP_PUBSUB_FEATURES_SPEC)#{
     publication_trustlevels => #{
         alias => <<"publication_trustlevels">>,
@@ -487,13 +482,86 @@
     }
 }).
 
+-define(WAMP_PPT_ATTRS, [ppt_cipher, ppt_keyid, ppt_scheme, ppt_serializer]).
 
+%% W3C Trace Context / Baggage carried as Bondy extension options
+%% (declared in bondy_config's WAMP extended_options and extended_details).
+%% The router is a pass-through: values are copied verbatim from
+%% CALL.Options to INVOCATION.Details and from PUBLISH.Options to
+%% EVENT.Details, never parsed or modified.
+-define(WAMP_TRACE_ATTRS, ['_traceparent', '_tracestate', '_baggage']).
+
+-define(WAMP_EXT_OPTIONS, [
+    {call, [
+        %% Total distinct cluster nodes a CALL may be routed to before a
+        %% routing failure is final (default 2 — the original candidate
+        %% plus one retry). Consulted by the dealer's bounded
+        %% pre-invocation retry; retries never extend the call timeout and
+        %% never occur once an invocation may have been delivered.
+        '_routing_max_candidates',
+        %% Absolute time budget for the whole call in milliseconds. For a
+        %% progressive call the WAMP `timeout` is an inter-result
+        %% inactivity window that each progressive result restarts; the
+        %% deadline caps the total duration regardless of progress.
+        '_deadline',
+        %% Attempts the dealer may add after a failure that leaves the call
+        %% unanswered, when the registration is `_idempotent`; see
+        %% `bondy_dealer:retry/1`.
+        '_retries'
+        | ?WAMP_TRACE_ATTRS
+    ]},
+    {cancel, ?WAMP_TRACE_ATTRS},
+    {interrupt, [
+        'x_session_info',
+        '_session_info'
+        | ?WAMP_TRACE_ATTRS
+    ]},
+    {register, [
+        'x_disclose_session_info',
+        '_disclose_session_info',
+        '_prefer_local',
+        '_prefer_local',
+        %% Running an invocation twice is safe, so the dealer may retry a call
+        %% that asked for `_retries`.
+        '_idempotent',
+        %% number of concurrent, outstanding calls that can exist
+        %% for a single endpoint
+        'x_concurrency'
+        | ?WAMP_TRACE_ATTRS
+    ]},
+    {publish, [
+        %% The ttl for retained events
+        '_retained_ttl'
+        | ?WAMP_TRACE_ATTRS
+    ]},
+    {subscribe, [
+        'x_disclose_session_info', '_disclose_session_info'
+    ]},
+    {yield, ?WAMP_TRACE_ATTRS}
+]).
+-define(WAMP_EXT_DETAILS, [
+    {abort, ?WAMP_TRACE_ATTRS},
+    {hello, ['x_authroles', '_authroles' | ?WAMP_TRACE_ATTRS]},
+    {welcome, ['x_authroles', '_authroles' | ?WAMP_TRACE_ATTRS]},
+    {goodbye, ?WAMP_TRACE_ATTRS},
+    {error, ?WAMP_TRACE_ATTRS},
+    {event, [
+        'x_session_info',
+        '_session_info'
+        | ?WAMP_TRACE_ATTRS
+    ]},
+    {call, ?WAMP_TRACE_ATTRS},
+    {invocation, [
+        'x_session_info',
+        '_session_info'
+        | ?WAMP_TRACE_ATTRS
+    ]},
+    {result, ?WAMP_TRACE_ATTRS}
+]).
 
 %% =============================================================================
 %% WAMP MESSAGES
 %% =============================================================================
-
-
 
 -define(HELLO, 1).
 -define(WELCOME, 2).
@@ -534,7 +602,6 @@
 -define(EVENT_RECEIVED_CODE_CHARS, "37").
 -define(SUBSCRIBER_RECEIVED_CODE_CHARS, "38").
 
-
 %% -----------------------------------------------------------------------------
 %% RPC
 %% -----------------------------------------------------------------------------
@@ -560,60 +627,61 @@
 -define(INTERRUPT_CODE_CHARS, "69").
 -define(YIELD_CODE_CHARS, "70").
 
--type message_name()    ::  hello
-                            | welcome
-                            | abort
-                            | challenge
-                            | authenticate
-                            | goodbye
-                            | error
-                            | publish
-                            | published
-                            | subscribe
-                            | subscribed
-                            | unsubscribe
-                            | unsubscribed
-                            | event
-                            | event_received
-                            | subscriber_received
-                            | call
-                            | cancel
-                            | result
-                            | register
-                            | registered
-                            | unregister
-                            | unregistered
-                            | invocation
-                            | interrupt
-                            | yield.
+-type message_name() ::
+    hello
+    | welcome
+    | abort
+    | challenge
+    | authenticate
+    | goodbye
+    | error
+    | publish
+    | published
+    | subscribe
+    | subscribed
+    | unsubscribe
+    | unsubscribed
+    | event
+    | event_received
+    | subscriber_received
+    | call
+    | cancel
+    | result
+    | register
+    | registered
+    | unregister
+    | unregistered
+    | invocation
+    | interrupt
+    | yield.
 
--type wamp_message()     ::  wamp_hello()
-                            | wamp_challenge()
-                            | wamp_authenticate()
-                            | wamp_welcome()
-                            | wamp_abort()
-                            | wamp_goodbye()
-                            | wamp_error()
-                            | wamp_publish()
-                            | wamp_published()
-                            | wamp_subscribe()
-                            | wamp_subscribed()
-                            | wamp_unsubscribe()
-                            | wamp_unsubscribed()
-                            | wamp_event()
-                            | wamp_event_received()
-                            | wamp_subscriber_received()
-                            | wamp_call()
-                            | wamp_cancel()
-                            | wamp_result()
-                            | wamp_register()
-                            | wamp_registered()
-                            | wamp_unregister()
-                            | wamp_unregistered()
-                            | wamp_invocation()
-                            | wamp_interrupt()
-                            | wamp_yield().
-
+-type wamp_message() ::
+    wamp_hello()
+    | wamp_challenge()
+    | wamp_authenticate()
+    | wamp_welcome()
+    | wamp_abort()
+    | wamp_goodbye()
+    | wamp_error()
+    | wamp_publish()
+    | wamp_published()
+    | wamp_subscribe()
+    | wamp_subscribed()
+    | wamp_unsubscribe()
+    | wamp_unsubscribed()
+    | wamp_event()
+    | wamp_event_received()
+    | wamp_subscriber_received()
+    | wamp_call()
+    | wamp_cancel()
+    | wamp_result()
+    | wamp_register()
+    | wamp_registered()
+    | wamp_unregister()
+    | wamp_unregistered()
+    | wamp_invocation()
+    | wamp_interrupt()
+    | wamp_yield().
 
 -define(EXACT_MATCH, <<"exact">>).
 -define(PREFIX_MATCH, <<"prefix">>).
@@ -624,80 +692,79 @@
     ?WILDCARD_MATCH
 ]).
 
--define(PPT_DETAILS_SPEC,
-    begin
-        #{
-    %% The ppt_scheme identifies the Key Management Schema. It is a required
-    %% string attribute. This attribute can contain the name or identifier of a
-    %% key management provider that is known to the target peer, so it can be
-    %% used to obtain information about encryption keys. A Router can recognize
-    %% that Payload Passthru Mode is in use by checking the existence and
-    %% non-empty value of this attribute within the options of CALL, PUBLISH
-    %% and YIELD messages.
-    ppt_scheme => #{
-        alias => <<"ppt_scheme">>,
-        required => false,
-        datatype => binary
-    },
-    %% The ppt_serializer attribute is optional. It specifies what serializer
-    %% was used to encode the payload. It can be a value a such as mqtt, amqp,
-    %% stomp to indicate that the incoming data is tunneling through such
-    %% technologies, or it can be ordinary json, msgpack, cbor, flatbuffers
-    %% data serializers.
-    ppt_serializer => #{
-        alias => <<"ppt_serializer">>,
-        required => false,
-        datatype => binary
-    },
-    %% The ppt_cipher attribute is optional. It is required if the payload is
-    %% encrypted. This attribute specifies the cryptographic algorithm that was
-    %% used to encrypt the payload. It can be xsalsa20poly1305, aes256gcm for
-    %% now.
-    ppt_cipher => #{
-        alias => <<"ppt_cipher">>,
-        required => false,
-        datatype => binary
-    },
-    %% The ppt_keyid attribute is optional. This attribute can contain the
-    %% encryption key id that was used to encrypt the payload. The ppt_keyid
-    %% attribute is a string type. The value can be a hex-encoded string, URI,
-    %% DNS name, Ethereum address, UUID identifier - any meaningful value which
-    %% allows the target peer to choose a private key without guessing. The
-    %% format of the value may depend on the ppt_scheme attribute.
-    ppt_keyid => #{
-        alias => <<"ppt_keyid">>,
-        required => false,
-        datatype => binary
-    }
+-define(PPT_DETAILS_SPEC, begin
+    #{
+        %% The ppt_scheme identifies the Key Management Schema. It is a required
+        %% string attribute. This attribute can contain the name or identifier of a
+        %% key management provider that is known to the target peer, so it can be
+        %% used to obtain information about encryption keys. A Router can recognize
+        %% that Payload Passthru Mode is in use by checking the existence and
+        %% non-empty value of this attribute within the options of CALL, PUBLISH
+        %% and YIELD messages.
+        ppt_scheme => #{
+            alias => <<"ppt_scheme">>,
+            required => false,
+            datatype => binary
+        },
+        %% The ppt_serializer attribute is optional. It specifies what serializer
+        %% was used to encode the payload. It can be a value a such as mqtt, amqp,
+        %% stomp to indicate that the incoming data is tunneling through such
+        %% technologies, or it can be ordinary json, msgpack, cbor, flatbuffers
+        %% data serializers.
+        ppt_serializer => #{
+            alias => <<"ppt_serializer">>,
+            required => false,
+            datatype => binary
+        },
+        %% The ppt_cipher attribute is optional. It is required if the payload is
+        %% encrypted. This attribute specifies the cryptographic algorithm that was
+        %% used to encrypt the payload. It can be xsalsa20poly1305, aes256gcm for
+        %% now.
+        ppt_cipher => #{
+            alias => <<"ppt_cipher">>,
+            required => false,
+            datatype => binary
+        },
+        %% The ppt_keyid attribute is optional. This attribute can contain the
+        %% encryption key id that was used to encrypt the payload. The ppt_keyid
+        %% attribute is a string type. The value can be a hex-encoded string, URI,
+        %% DNS name, Ethereum address, UUID identifier - any meaningful value which
+        %% allows the target peer to choose a private key without guessing. The
+        %% format of the value may depend on the ppt_scheme attribute.
+        ppt_keyid => #{
+            alias => <<"ppt_keyid">>,
+            required => false,
+            datatype => binary
+        }
     }
 end).
-
 
 %% NOTICE: DO NOT CHANGE THE ORDER OF THE RECORD FIELDS as they map
 %% to the order in WAMP messages and we use list_to_tuple/1 to convert from
 %% WAMP list to Erlang tuple and vicecersa
-
 
 %% -----------------------------------------------------------------------------
 %% HELLO 1
 %% -----------------------------------------------------------------------------
 
 -record(hello, {
-    realm_uri       ::  uri(),
-    details         ::  map()
+    realm_uri :: uri(),
+    details :: map()
 }).
 
--type wamp_hello()  ::  #hello{}.
+-type wamp_hello() :: #hello{}.
 
 -define(HELLO_DETAILS_SPEC, #{
     authmethods => #{
-        % description => Used by the client to announce the authentication methods it is prepared to perform.">>,
+        %% description => Used by the client to announce the authentication
+        %% methods it is prepared to perform.">>,
         alias => <<"authmethods">>,
         required => false,
         datatype => {list, binary}
     },
     authid => #{
-        % description => <<"The authentication ID (e.g. username) the client wishes to authenticate as.">>,
+        %% description => <<"The authentication ID (e.g. username) the client
+        %% wishes to authenticate as.">>,
         alias => <<"authid">>,
         required => false,
         datatype => [binary, atom]
@@ -708,7 +775,7 @@ end).
         datatype => [binary, atom]
     },
     authextra => #{
-        % description => <<"Not in RFC">>,
+        %% description => <<"Not in RFC">>,
         alias => <<"authextra">>,
         required => false,
         allow_undefined => true,
@@ -722,14 +789,27 @@ end).
         validator => ?CLIENT_ROLES_SPEC
     },
     agent => #{
-        % description => <<"When a software agent operates in a network protocol, it often identifies itself, its application type, operating system, software vendor, or software revision, by submitting a characteristic identification string to its operating peer. Similar to what browsers do with the User-Agent HTTP header, both the HELLO and the WELCOME message MAY disclose the WAMP implementation in use to its peer">>,
+        %% description => <<"When a software agent operates in a network
+        %% protocol, it often identifies itself, its application type, operating
+        %% system, software vendor, or software revision, by submitting a
+        %% characteristic identification string to its operating peer. Similar
+        %% to what browsers do with the User-Agent HTTP header, both the HELLO
+        %% and the WELCOME message MAY disclose the WAMP implementation in use
+        %% to its peer">>,
         alias => <<"agent">>,
         required => false,
         datatype => binary
     },
     transport => #{
-        % description => <<"When running WAMP over a TLS (either secure WebSocket
-        % or raw TCP) transport, a peer may authenticate to the other via the TLS certificate mechanism. A server might authenticate to the client, and a client may authenticate to the server (TLS client-certificate based authentication). This transport-level authentication information may be forward to the WAMP level within HELLO.Details.transport.auth|any in both directions (if available).">>,
+        %% description => <<"When running WAMP over a TLS (either secure
+        %% WebSocket
+        %% or raw TCP) transport, a peer may authenticate to the other via the
+        %% TLS certificate mechanism. A server might authenticate to the client,
+        %% and a client may authenticate to the server (TLS client-certificate
+        %% based authentication). This transport-level authentication
+        %% information may be forward to the WAMP level within
+        %% HELLO.Details.transport.auth|any in both directions (if
+        %% available).">>,
         alias => <<"transport">>,
         required => false,
         datatype => map,
@@ -743,30 +823,30 @@ end).
         datatype => boolean
     },
     resume_session => #{
-        % description => <<"The session ID the client would like to resume.">>,
+        %% description => <<"The session ID the client would like to resume.">>,
         alias => <<"resume_session">>,
         required => false,
         datatype => binary
     },
     resume_token => #{
-        % description => <<"The secure token required to resume the session defined in 'resume_session'.">>,
+        %% description => <<"The secure token required to resume the session
+        %% defined in 'resume_session'.">>,
         alias => <<"resume_token">>,
         required => false,
         datatype => binary
     }
 }).
 
-
 %% -----------------------------------------------------------------------------
 %% WELCOME 2
 %% -----------------------------------------------------------------------------
 
 -record(welcome, {
-    session_id      ::  id(),
-    details         ::  map()
+    session_id :: id(),
+    details :: map()
 }).
 
--type wamp_welcome()       ::  #welcome{}.
+-type wamp_welcome() :: #welcome{}.
 
 -define(WELCOME_DETAILS_SPEC, #{
     realm => #{
@@ -823,24 +903,24 @@ end).
         datatype => boolean
     },
     resume_token => #{
-        % description => <<"The secure token required to resume the session defined in 'resume_session'.">>,
+        %% description => <<"The secure token required to resume the session
+        %% defined in 'resume_session'.">>,
         alias => <<"resume_token">>,
         required => false,
         datatype => binary
     }
 }).
 
-
 %% -----------------------------------------------------------------------------
 %% ABORT 3
 %% -----------------------------------------------------------------------------
 
 -record(abort, {
-    details         ::  map(),
-    reason_uri      ::  uri()
+    details :: map(),
+    reason_uri :: uri()
 }).
 
--type wamp_abort()       ::  #abort{}.
+-type wamp_abort() :: #abort{}.
 
 -define(ABORT_DETAILS_SPEC, #{
     %% Optional human-readable closing message
@@ -851,17 +931,15 @@ end).
     }
 }).
 
-
 %% -----------------------------------------------------------------------------
 %% CHALLENGE 4
 %% -----------------------------------------------------------------------------
 
 -record(challenge, {
-    auth_method      ::  binary(),
-    extra            ::  map()
+    auth_method :: binary(),
+    extra :: map()
 }).
--type wamp_challenge()       ::  #challenge{}.
-
+-type wamp_challenge() :: #challenge{}.
 
 -define(CHALLENGE_DETAILS_SPEC, #{
     challenge => #{
@@ -908,23 +986,22 @@ end).
 %% -----------------------------------------------------------------------------
 
 -record(authenticate, {
-    signature       ::  binary(),
-    extra           ::  map()
+    signature :: binary(),
+    extra :: map()
 }).
 
--type wamp_authenticate()       ::  #authenticate{}.
-
+-type wamp_authenticate() :: #authenticate{}.
 
 %% -----------------------------------------------------------------------------
 %% GOODBYE 6
 %% -----------------------------------------------------------------------------
 
 -record(goodbye, {
-    details         ::  map(),
-    reason_uri      ::  uri()
+    details :: map(),
+    reason_uri :: uri()
 }).
 
--type wamp_goodbye()       ::  #goodbye{}.
+-type wamp_goodbye() :: #goodbye{}.
 
 -define(GOODBYE_DETAILS_SPEC, #{
     %% Router: Whether the session is able to be resumed or destroyed.
@@ -941,15 +1018,15 @@ end).
 %% -----------------------------------------------------------------------------
 
 -record(error, {
-    request_type    ::  pos_integer(),
-    request_id      ::  id(),
-    details         ::  map(),
-    error_uri       ::  uri(),
-    args            ::  list() | undefined,
-    kwargs          ::  map() | undefined,
-    partial         ::  binary() | undefined
+    request_type :: pos_integer(),
+    request_id :: id(),
+    details :: map(),
+    error_uri :: uri(),
+    args :: list() | undefined,
+    kwargs :: map() | undefined,
+    partial :: binary() | undefined
 }).
--type wamp_error()       ::  #error{}.
+-type wamp_error() :: #error{}.
 
 -define(ERROR_DETAILS_SPEC, ?PPT_DETAILS_SPEC).
 
@@ -959,103 +1036,100 @@ end).
 %% -----------------------------------------------------------------------------
 
 -record(publish, {
-    request_id      ::  id(),
-    options         ::  map(),
-    topic_uri       ::  uri(),
-    args            ::  list() | undefined,
-    kwargs          ::  map() | undefined,
-    partial         ::  binary() | undefined
+    request_id :: id(),
+    options :: map(),
+    topic_uri :: uri(),
+    args :: list() | undefined,
+    kwargs :: map() | undefined,
+    partial :: binary() | undefined
 }).
 
--type wamp_publish()       ::  #publish{}.
+-type wamp_publish() :: #publish{}.
 
-
--define(PUBLISH_OPTS_SPEC,
-    begin
-        ?PPT_DETAILS_SPEC#{
-            %% resource key
-            acknowledge => #{
-                alias => <<"acknowledge">>,
-                required => false,
-                datatype => boolean
-            },
-            rkey => #{
-                alias => <<"rkey">>,
-                required => false,
-                datatype => binary
-            },
-            disclose_me => #{
-                alias => <<"disclose_me">>,
-                required => false,
-                datatype => boolean
-            },
-            %% blacklisting
-            exclude => #{
-                alias => <<"exclude">>,
-                required => false,
-                datatype => {list, integer}
-            },
-            exclude_authid => #{
-                alias => <<"exclude_authid">>,
-                required => false,
-                datatype => {list, binary}
-            },
-            exclude_authrole => #{
-                alias => <<"exclude_authrole">>,
-                required => false,
-                datatype => {list, binary}
-            },
-            exclude_me => #{
-                alias => <<"exclude_me">>,
-                required => false,
-                datatype => boolean
-            },
-            %% whitelisting
-            eligible => #{
-                alias => <<"eligible">>,
-                required => false,
-                datatype => {list, integer}
-            },
-            eligible_authid => #{
-                alias => <<"eligible_authid">>,
-                required => false,
-                datatype => {list, binary}
-            },
-            eligible_authrole => #{
-                alias => <<"eligible_authrole">>,
-                required => false,
-                datatype => {list, binary}
-            },
-            retain => #{
-                alias => <<"retain">>,
-                required => false,
-                datatype => boolean
-            }
+-define(PUBLISH_OPTS_SPEC, begin
+    ?PPT_DETAILS_SPEC#{
+        acknowledge => #{
+            alias => <<"acknowledge">>,
+            required => false,
+            datatype => boolean
+        },
+        %% resource key
+        rkey => #{
+            alias => <<"rkey">>,
+            required => false,
+            datatype => binary
+        },
+        disclose_me => #{
+            alias => <<"disclose_me">>,
+            required => false,
+            datatype => boolean
+        },
+        %% blacklisting
+        exclude => #{
+            alias => <<"exclude">>,
+            required => false,
+            datatype => {list, integer}
+        },
+        exclude_authid => #{
+            alias => <<"exclude_authid">>,
+            required => false,
+            datatype => {list, binary}
+        },
+        exclude_authrole => #{
+            alias => <<"exclude_authrole">>,
+            required => false,
+            datatype => {list, binary}
+        },
+        exclude_me => #{
+            alias => <<"exclude_me">>,
+            required => false,
+            datatype => boolean
+        },
+        %% whitelisting
+        eligible => #{
+            alias => <<"eligible">>,
+            required => false,
+            datatype => {list, integer}
+        },
+        eligible_authid => #{
+            alias => <<"eligible_authid">>,
+            required => false,
+            datatype => {list, binary}
+        },
+        eligible_authrole => #{
+            alias => <<"eligible_authrole">>,
+            required => false,
+            datatype => {list, binary}
+        },
+        retain => #{
+            alias => <<"retain">>,
+            required => false,
+            datatype => boolean
         }
-    end
-).
+    }
+end).
 
 %% -----------------------------------------------------------------------------
 %% PUBLISHED 17
 %% -----------------------------------------------------------------------------
 
 -record(published, {
-    request_id      ::  id(),
-    publication_id  ::  id()
+    request_id :: id(),
+    publication_id :: id()
 }).
--type wamp_published()       ::  #published{}.
+-type wamp_published() :: #published{}.
 
 %% -----------------------------------------------------------------------------
 %% SUBSCRIBE 32
 %% -----------------------------------------------------------------------------
 
 -record(subscribe, {
-    request_id      ::  id(),
-    options         ::  map(),
-    topic_uri       ::  uri()
+    request_id :: id(),
+    options :: map(),
+    topic_uri :: uri()
 }).
 
--type wamp_subscribe()       ::  #subscribe{}.
+-type wamp_subscribe() :: #subscribe{}.
 
 -define(SUBSCRIBE_OPTS_SPEC, #{
     match => #{
@@ -1064,7 +1138,6 @@ end).
         default => ?EXACT_MATCH,
         datatype => {in, ?MATCH_STRATEGIES}
     },
-    %% node key
     nkey => #{
         alias => <<"nkey">>,
         required => false,
@@ -1082,44 +1155,44 @@ end).
 %% -----------------------------------------------------------------------------
 
 -record(subscribed, {
-    request_id      ::  id(),
-    subscription_id ::  id()
+    request_id :: id(),
+    subscription_id :: id()
 }).
--type wamp_subscribed()       ::  #subscribed{}.
+-type wamp_subscribed() :: #subscribed{}.
 
 %% -----------------------------------------------------------------------------
 %% UNSUBSCRIBE 34
 %% -----------------------------------------------------------------------------
 
 -record(unsubscribe, {
-    request_id      ::  id(),
-    subscription_id ::  id()
+    request_id :: id(),
+    subscription_id :: id()
 }).
--type wamp_unsubscribe()       ::  #unsubscribe{}.
+-type wamp_unsubscribe() :: #unsubscribe{}.
 
 %% -----------------------------------------------------------------------------
 %% UNSUBSCRIBED 35
 %% -----------------------------------------------------------------------------
 
 -record(unsubscribed, {
-    request_id      ::  id()
+    request_id :: id()
 }).
--type wamp_unsubscribed()       ::  #unsubscribed{}.
+-type wamp_unsubscribed() :: #unsubscribed{}.
 
 %% -----------------------------------------------------------------------------
 %% EVENT 36
 %% -----------------------------------------------------------------------------
 
 -record(event, {
-    subscription_id ::  id(),
-    publication_id  ::  id(),
-    details         ::  map(),
-    args            ::  list() | undefined,
-    kwargs          ::  map() | undefined,
-    partial         ::  {encoding(), binary()} | undefined
+    subscription_id :: id(),
+    publication_id :: id(),
+    details :: map(),
+    args :: list() | undefined,
+    kwargs :: map() | undefined,
+    partial :: {encoding(), binary()} | undefined
 }).
 
--type wamp_event()       ::  #event{}.
+-type wamp_event() :: #event{}.
 
 -define(EVENT_DETAILS_SPEC, ?PPT_DETAILS_SPEC#{
     acknowledge => #{
@@ -1157,37 +1230,36 @@ end).
     }
 }).
 
-
 %% -----------------------------------------------------------------------------
 %% EVENT_RECEIVED 37
 %% -----------------------------------------------------------------------------
 
 -record(event_received, {
-    publication_id  ::  id(),
-    details         ::  map(),
-    payload         ::  binary() | undefined
+    publication_id :: id(),
+    details :: map(),
+    payload :: binary() | undefined
 }).
 
--type wamp_event_received()  ::  #event_received{}.
+-type wamp_event_received() :: #event_received{}.
 
 -define(EVENT_RECEIVED_DETAILS_SPEC, ?PPT_DETAILS_SPEC).
 
 %% -----------------------------------------------------------------------------
-%% EVENT_RECEIVED 38
+%% SUBSCRIBER_RECEIVED 38
 %% -----------------------------------------------------------------------------
 
 -record(subscriber_received, {
     %% From #event_received.publication_id
-    publication_id  ::  id(),
-    details         ::  map(),
+    publication_id :: id(),
+    details :: map(),
     %% From #event_received.payload
-    payload         ::  binary() | undefined
+    payload :: binary() | undefined
 }).
 
--type wamp_subscriber_received()  ::  #subscriber_received{}.
+-type wamp_subscriber_received() :: #subscriber_received{}.
 
 -define(SUBSCRIBER_RECEIVED_DETAILS_SPEC, ?PPT_DETAILS_SPEC#{
-    %% Set when publisher is disclosed
+    %% Set when subscriber is disclosed
     subscriber => #{
         alias => <<"subscriber">>,
         required => false,
@@ -1212,68 +1284,71 @@ end).
 %% -----------------------------------------------------------------------------
 
 -record(call, {
-    request_id      ::  id(),
-    options         ::  map(),
-    procedure_uri   ::  uri(),
-    args            ::  list() | undefined,
-    kwargs          ::  map() | undefined,
-    partial         ::  binary() | undefined
+    request_id :: id(),
+    options :: map(),
+    procedure_uri :: uri(),
+    args :: list() | undefined,
+    kwargs :: map() | undefined,
+    partial :: binary() | undefined
 }).
 
--type wamp_call()       ::  #call{}.
+-type wamp_call() :: #call{}.
 
--define(WAMP_CALL_OPTS_SPEC,
-    begin
-        ?PPT_DETAILS_SPEC#{
-            timeout => #{
-                alias => <<"timeout">>,
-                required => false,
-                default => 0,
-                datatype => non_neg_integer
-            },
-            receive_progress => #{
-                alias => <<"receive_progress">>,
-                required => false,
-                datatype => boolean
-            },
-            disclose_me => #{
-                alias => <<"disclose_me">>,
-                required => false,
-                datatype => boolean
-            },
-            runmode => #{
-                alias => <<"runmode">>,
-                required => false,
-                datatype => {in, [<<"partition">>]}
-            },
-            %% if runmode is present then rkey should be present
-            rkey => #{
-                alias => <<"rkey">>,
-                required => false,
-                datatype => binary
-            },
-            %% 'all' invocation strategy (ALPHA)
-            yields => #{
-                alias => <<"yields">>,
-                required => false,
-                datatype => {in, [<<"first">>, <<"gather">>, <<"progressive">>]}
-            }
+-define(WAMP_CALL_OPTS_SPEC, begin
+    ?PPT_DETAILS_SPEC#{
+        timeout => #{
+            alias => <<"timeout">>,
+            required => false,
+            default => 0,
+            datatype => non_neg_integer
+        },
+        receive_progress => #{
+            alias => <<"receive_progress">>,
+            required => false,
+            datatype => boolean
+        },
+        %% Progressive Calls (argument streaming): set on every non-final CALL of
+        %% the stream; the final CALL omits it. All chunks reuse one request id.
+        progress => #{
+            alias => <<"progress">>,
+            required => false,
+            datatype => boolean
+        },
+        disclose_me => #{
+            alias => <<"disclose_me">>,
+            required => false,
+            datatype => boolean
+        },
+        runmode => #{
+            alias => <<"runmode">>,
+            required => false,
+            datatype => {in, [<<"partition">>]}
+        },
+        %% if runmode is present then rkey should be present
+        rkey => #{
+            alias => <<"rkey">>,
+            required => false,
+            datatype => binary
+        },
+        %% 'all' invocation strategy (ALPHA)
+        yields => #{
+            alias => <<"yields">>,
+            required => false,
+            datatype => {in, [<<"first">>, <<"gather">>, <<"progressive">>]}
         }
-    end
-).
+    }
+end).
 
--define(CALL_OPTS_SPEC,
-    begin
-        ?WAMP_CALL_OPTS_SPEC#{
-            retries => #{
-                alias => <<"retries">>,
-                required => false,
-                datatype => map,
-                validator => ?RETRIES_SPEC
-            }
+-define(CALL_OPTS_SPEC, begin
+    ?WAMP_CALL_OPTS_SPEC#{
+        retries => #{
+            alias => <<"retries">>,
+            required => false,
+            datatype => map,
+            validator => ?RETRIES_SPEC
         }
-    end
-).
+    }
+end).
 
 -define(RETRIES_SPEC, #{
     allowance => #{
@@ -1333,10 +1408,10 @@ end).
 %% -----------------------------------------------------------------------------
 
 -record(cancel, {
-    request_id      ::  id(),
-    options         ::  map()
+    request_id :: id(),
+    options :: map()
 }).
--type wamp_cancel()       ::  #cancel{}.
+-type wamp_cancel() :: #cancel{}.
 
 -define(CALL_CANCELLING_OPTS_SPEC, #{
     mode => #{
@@ -1351,14 +1426,14 @@ end).
 %% -----------------------------------------------------------------------------
 
 -record(result, {
-    request_id      ::  id(),
-    details         ::  map(),
-    args            ::  list() | undefined,
-    kwargs          ::  map() | undefined,
-    partial         ::  binary() | undefined
+    request_id :: id(),
+    details :: map(),
+    args :: list() | undefined,
+    kwargs :: map() | undefined,
+    partial :: binary() | undefined
 }).
 
--type wamp_result()       ::  #result{}.
+-type wamp_result() :: #result{}.
 
 -define(RESULT_DETAILS_SPEC, ?PPT_DETAILS_SPEC#{
     progress => #{
@@ -1373,20 +1448,18 @@ end).
 %% -----------------------------------------------------------------------------
 
 -record(register, {
-    request_id      ::  id(),
-    options         ::  map(),
-    procedure_uri   ::  uri()
+    request_id :: id(),
+    options :: map(),
+    procedure_uri :: uri()
 }).
 
--type wamp_register()       ::  #register{}.
+-type wamp_register() :: #register{}.
 
 -define(INVOKE_SINGLE, <<"single">>).
 -define(INVOKE_ROUND_ROBIN, <<"roundrobin">>).
 -define(INVOKE_RANDOM, <<"random">>).
 -define(INVOKE_FIRST, <<"first">>).
 -define(INVOKE_LAST, <<"last">>).
-%% ALPHA
--define(INVOKE_ALL, <<"last">>).
 
 -define(REGISTER_OPTS_SPEC, #{
     disclose_caller => #{
@@ -1404,14 +1477,14 @@ end).
         alias => <<"invoke">>,
         required => false,
         default => ?INVOKE_SINGLE,
-        datatype => {in, [
-            ?INVOKE_SINGLE,
-            ?INVOKE_ROUND_ROBIN,
-            ?INVOKE_RANDOM,
-            ?INVOKE_FIRST,
-            ?INVOKE_LAST,
-            ?INVOKE_ALL
-        ]}
+        datatype =>
+            {in, [
+                ?INVOKE_SINGLE,
+                ?INVOKE_ROUND_ROBIN,
+                ?INVOKE_RANDOM,
+                ?INVOKE_FIRST,
+                ?INVOKE_LAST
+            ]}
     },
     %% The (maximum) concurrency to be used for the registration. A value of 0
     %% disables it.
@@ -1436,45 +1509,43 @@ end).
 %% -----------------------------------------------------------------------------
 
 -record(registered, {
-    request_id      ::  id(),
-    registration_id ::  id()
+    request_id :: id(),
+    registration_id :: id()
 }).
--type wamp_registered()       ::  #registered{}.
+-type wamp_registered() :: #registered{}.
 
 %% -----------------------------------------------------------------------------
 %% UNREGISTER 66
 %% -----------------------------------------------------------------------------
 
 -record(unregister, {
-    request_id      ::  id(),
-    registration_id ::  id()
+    request_id :: id(),
+    registration_id :: id()
 }).
 
--type wamp_unregister()       ::  #unregister{}.
-
+-type wamp_unregister() :: #unregister{}.
 
 %% -----------------------------------------------------------------------------
 %% UNREGISTERED 67
 %% -----------------------------------------------------------------------------
 
 -record(unregistered, {
-    request_id      ::  id(),
-    details         ::  map() | undefined
+    request_id :: id(),
+    details :: map() | undefined
 }).
 
--type wamp_unregistered()       ::  #unregistered{}.
-
+-type wamp_unregistered() :: #unregistered{}.
 
 %% -----------------------------------------------------------------------------
 %% UNREGISTERED 67
 %% -----------------------------------------------------------------------------
 
 -record(unregistered_2, {
-    request_id      ::  id(),
-    details         ::  map()
+    request_id :: id(),
+    details :: map()
 }).
 
--type wamp_unregister_ext()       ::  #unregister{}.
+-type wamp_unregister_ext() :: #unregister{}.
 
 -define(UNREGISTERED_DETAILS_SPEC, #{
     %% The reason URI for revocation.
@@ -1495,15 +1566,15 @@ end).
 %% -----------------------------------------------------------------------------
 
 -record(invocation, {
-    request_id      ::  id(),
-    registration_id ::  id(),
-    details         ::  map(),
-    args            ::  list() | undefined,
-    kwargs          ::  map() | undefined,
-    partial         ::  binary() | undefined
+    request_id :: id(),
+    registration_id :: id(),
+    details :: map(),
+    args :: list() | undefined,
+    kwargs :: map() | undefined,
+    partial :: binary() | undefined
 }).
 
--type wamp_invocation()       ::  #invocation{}.
+-type wamp_invocation() :: #invocation{}.
 
 -define(INVOCATION_DETAILS_SPEC, ?PPT_DETAILS_SPEC#{
     trustlevel => #{
@@ -1525,6 +1596,13 @@ end).
     %% Tells callee to produce progressive results
     receive_progress => #{
         alias => <<"receive_progress">>,
+        required => false,
+        datatype => boolean
+    },
+    %% Progressive Calls: marks a non-final INVOCATION of a streamed-argument
+    %% call; the final chunk omits it. All chunks reuse one invocation id.
+    progress => #{
+        alias => <<"progress">>,
         required => false,
         datatype => boolean
     },
@@ -1553,11 +1631,10 @@ end).
 %% -----------------------------------------------------------------------------
 
 -record(interrupt, {
-    request_id      ::  id(),
-    options         ::  map()
+    request_id :: id(),
+    options :: map()
 }).
--type wamp_interrupt()       ::  #interrupt{}.
-
+-type wamp_interrupt() :: #interrupt{}.
 
 -define(INTERRUPT_OPTIONS_SPEC, #{
     mode => #{
@@ -1572,24 +1649,28 @@ end).
 %% -----------------------------------------------------------------------------
 
 -record(yield, {
-    request_id      ::  id(),
-    options         ::  map(),
-    args            ::  list() | undefined,
-    kwargs          ::  map() | undefined,
-    partial         ::  binary() | undefined
+    request_id :: id(),
+    options :: map(),
+    args :: list() | undefined,
+    kwargs :: map() | undefined,
+    partial :: binary() | undefined
 }).
 
--type wamp_yield()  ::  #yield{}.
+-type wamp_yield() :: #yield{}.
 
--define(YIELD_OPTIONS_SPEC, ?PPT_DETAILS_SPEC).
-
-
+-define(YIELD_OPTIONS_SPEC, ?PPT_DETAILS_SPEC#{
+    %% Set by the callee to mark a progressive result. Carried into
+    %% RESULT.Details.progress by the dealer.
+    progress => #{
+        alias => <<"progress">>,
+        required => false,
+        datatype => boolean
+    }
+}).
 
 %% =============================================================================
 %% URIs
 %% =============================================================================
-
-
 
 -define(WAMP_CLOSE_LOGOUT, <<"wamp.close.logout">>).
 -define(WAMP_CLOSE_NORMAL, <<"wamp.close.normal">>).
@@ -1597,19 +1678,17 @@ end).
 
 -define(WAMP_UNAVAILABLE, <<"wamp.error.unavailable">>).
 -define(WAMP_NO_AVAILABLE_CALLEE, <<"wamp.error.no_available_callee">>).
--define(WAMP_FEATURE_NOT_SUPPORTED, <<"wamp.error.no_available_callee">>).
+-define(WAMP_FEATURE_NOT_SUPPORTED, <<"wamp.error.feature_not_supported">>).
 -define(WAMP_AUTHENTICATION_FAILED, <<"wamp.error.authentication_failed">>).
 -define(WAMP_AUTHORIZATION_FAILED, <<"wamp.error.authorization_failed">>).
 -define(WAMP_CANCELLED, <<"wamp.error.canceled">>).
--define(WAMP_COUNT_CALLEES,             <<"wamp.registration.count_callees">>).
+-define(WAMP_COUNT_CALLEES, <<"wamp.registration.count_callees">>).
 -define(WAMP_DISCLOSE_ME_NOT_ALLOWED, <<"wamp.error.disclose_me.not_allowed">>).
--define(WAMP_ERROR_INVALID_URI,         <<"wamp.error.invalid_uri">>).
--define(WAMP_ERROR_NO_SUCH_SESSION,     <<"wamp.error.no_such_session">>).
 -define(WAMP_GOODBYE_AND_OUT, <<"wamp.close.goodbye_and_out">>).
 -define(WAMP_INVALID_ARGUMENT, <<"wamp.error.invalid_argument">>).
 -define(WAMP_INVALID_PAYLOAD, <<"wamp.error.invalid_payload">>).
 -define(WAMP_INVALID_URI, <<"wamp.error.invalid_uri">>).
--define(WAMP_LIST_CALLEES,              <<"wamp.registration.list_callees">>).
+-define(WAMP_LIST_CALLEES, <<"wamp.registration.list_callees">>).
 -define(WAMP_NET_FAILURE, <<"wamp.error.network_failure">>).
 -define(WAMP_NOT_AUTHORIZED, <<"wamp.error.not_authorized">>).
 -define(WAMP_NOT_AUTH_METHOD, <<"wamp.error.not_auth_method">>).
@@ -1622,53 +1701,74 @@ end).
 -define(WAMP_NO_SUCH_SESSION, <<"wamp.error.no_such_session">>).
 -define(WAMP_NO_SUCH_SUBSCRIPTION, <<"wamp.error.no_such_subscription">>).
 -define(WAMP_OPTION_DISALLOWED_DISCLOSE_ME,
-    <<"wamp.error.option_disallowed.disclose_me">>).
+    <<"wamp.error.option_disallowed.disclose_me">>
+).
 -define(WAMP_OPTION_NOT_ALLOWED,
-    <<"wamp.error.option_not_allowed">>).
+    <<"wamp.error.option_not_allowed">>
+).
 -define(WAMP_PAYLOAD_SIZE_EXCEEDED,
-    <<"wamp.error.payload_size_exceeded">>).
+    <<"wamp.error.payload_size_exceeded">>
+).
 -define(WAMP_PROCEDURE_ALREADY_EXISTS,
-    <<"wamp.error.procedure_already_exists">>).
+    <<"wamp.error.procedure_already_exists">>
+).
 -define(WAMP_PROCEDURE_EXISTS_WITH_DIFF_POLICY,
-    <<"wamp.error.procedure_exists_with_different_invocation_policy">>).
--define(WAMP_PROTOCOL_VIOLATION,    <<"wamp.error.protocol_violation">>).
--define(WAMP_REGISTRATION_ON_CREATE,    <<"wamp.registration.on_create">>).
--define(WAMP_REGISTRATION_ON_DELETE,    <<"wamp.registration.on_delete">>).
--define(WAMP_REGISTRATION_ON_REGISTER,  <<"wamp.registration.on_register">>).
+    <<"wamp.error.procedure_exists_with_different_invocation_policy">>
+).
+-define(WAMP_PROTOCOL_VIOLATION, <<"wamp.error.protocol_violation">>).
+%% Interface Reflection (spec §16.3, status `sketch`): Bondy adopts the six
+%% procedure names, not the FlatBuffers IDL.
+-define(WAMP_REFLECTION_ERROR_DESCRIBE, <<"wamp.reflection.error.describe">>).
+-define(WAMP_REFLECTION_ERROR_LIST, <<"wamp.reflection.error.list">>).
+-define(WAMP_REFLECTION_PROC_DESCRIBE,
+    <<"wamp.reflection.procedure.describe">>
+).
+-define(WAMP_REFLECTION_PROC_LIST, <<"wamp.reflection.procedure.list">>).
+-define(WAMP_REFLECTION_TOPIC_DESCRIBE,
+    <<"wamp.reflection.topic.describe">>
+).
+-define(WAMP_REFLECTION_TOPIC_LIST, <<"wamp.reflection.topic.list">>).
+-define(WAMP_REGISTRATION_ON_CREATE, <<"wamp.registration.on_create">>).
+-define(WAMP_REGISTRATION_ON_DELETE, <<"wamp.registration.on_delete">>).
+-define(WAMP_REGISTRATION_ON_REGISTER, <<"wamp.registration.on_register">>).
 -define(WAMP_REGISTRATION_ON_UNREGISTER, <<"wamp.registration.on_unregister">>).
--define(WAMP_REG_GET,                   <<"wamp.registration.get">>).
--define(WAMP_REG_LIST,                  <<"wamp.registration.list">>).
--define(WAMP_REG_LOOKUP,                <<"wamp.registration.lookup">>).
--define(WAMP_REG_MATCH,                 <<"wamp.registration.match">>).
--define(WAMP_REG_ON_CREATE,             <<"wamp.registration.on_create">>).
--define(WAMP_REG_ON_DELETE,             <<"wamp.registration.on_delete">>).
--define(WAMP_REG_ON_REGISTER,           <<"wamp.registration.on_register">>).
--define(WAMP_REG_ON_UNREGISTER,         <<"wamp.registration.on_unregister">>).
--define(WAMP_SESSION_COUNT,             <<"wamp.session.count">>).
--define(WAMP_SESSION_GET,               <<"wamp.session.get">>).
--define(WAMP_SESSION_KILL,              <<"wamp.session.kill">>).
--define(WAMP_SESSION_KILL_ALL,          <<"wamp.session.kill_all">>).
--define(WAMP_SESSION_KILL_BY_AUTHID,    <<"wamp.session.kill_by_authid">>).
--define(WAMP_SESSION_KILL_BY_AUTHROLE,  <<"wamp.session.kill_by_authrole">>).
--define(WAMP_SESSION_LIST,              <<"wamp.session.list">>).
--define(WAMP_SESSION_ON_JOIN,           <<"wamp.session.on_join">>).
--define(WAMP_SESSION_ON_LEAVE,          <<"wamp.session.on_leave">>).
+-define(WAMP_REG_GET, <<"wamp.registration.get">>).
+-define(WAMP_REG_LIST, <<"wamp.registration.list">>).
+-define(WAMP_REG_LOOKUP, <<"wamp.registration.lookup">>).
+-define(WAMP_REG_MATCH, <<"wamp.registration.match">>).
+-define(WAMP_REG_ON_CREATE, <<"wamp.registration.on_create">>).
+-define(WAMP_REG_ON_DELETE, <<"wamp.registration.on_delete">>).
+-define(WAMP_REG_ON_REGISTER, <<"wamp.registration.on_register">>).
+-define(WAMP_REG_ON_UNREGISTER, <<"wamp.registration.on_unregister">>).
+-define(WAMP_SESSION_COUNT, <<"wamp.session.count">>).
+-define(WAMP_SESSION_GET, <<"wamp.session.get">>).
+-define(WAMP_SESSION_KILL, <<"wamp.session.kill">>).
+-define(WAMP_SESSION_KILL_ALL, <<"wamp.session.kill_all">>).
+-define(WAMP_SESSION_KILL_BY_AUTHID, <<"wamp.session.kill_by_authid">>).
+-define(WAMP_SESSION_KILL_BY_AUTHROLE, <<"wamp.session.kill_by_authrole">>).
+-define(WAMP_SESSION_LIST, <<"wamp.session.list">>).
+-define(WAMP_SESSION_ON_JOIN, <<"wamp.session.on_join">>).
+-define(WAMP_SESSION_ON_LEAVE, <<"wamp.session.on_leave">>).
 -define(WAMP_SUBCRIPTION_ON_CREATE, <<"wamp.subscription.on_create">>).
 -define(WAMP_SUBCRIPTION_ON_DELETE, <<"wamp.subscription.on_delete">>).
 -define(WAMP_SUBCRIPTION_ON_REGISTER, <<"wamp.subscription.on_subscribe">>).
 -define(WAMP_SUBCRIPTION_ON_UNREGISTER, <<"wamp.subscription.on_unsubscribe">>).
 -define(WAMP_SUBSCRIPTION_COUNT_SUBSCRIBERS,
-    <<"wamp.subscription.count_subscribers">>).
--define(WAMP_SUBSCRIPTION_GET,                  <<"wamp.subscription.get">>).
--define(WAMP_SUBSCRIPTION_LIST,                 <<"wamp.subscription.list">>).
+    <<"wamp.subscription.count_subscribers">>
+).
+-define(WAMP_SUBSCRIPTION_GET, <<"wamp.subscription.get">>).
+-define(WAMP_SUBSCRIPTION_LIST, <<"wamp.subscription.list">>).
 -define(WAMP_SUBSCRIPTION_LIST_SUBSCRIBERS,
-    <<"wamp.subscription.list_subscribers">>).
--define(WAMP_SUBSCRIPTION_LOOKUP,               <<"wamp.subscription.lookup">>).
--define(WAMP_SUBSCRIPTION_MATCH,                <<"wamp.subscription.match">>).
--define(WAMP_SUBSCRIPTION_ON_CREATE,            <<"wamp.subscription.on_create">>).
--define(WAMP_SUBSCRIPTION_ON_DELETE,            <<"wamp.subscription.on_delete">>).
--define(WAMP_SUBSCRIPTION_ON_SUBSCRIBE,         <<"wamp.subscription.on_subscribe">>).
--define(WAMP_SUBSCRIPTION_ON_UNSUBSCRIBE,       <<"wamp.subscription.on_unsubscribe">>).
--define(WAMP_SYSTEM_SHUTDOWN,           <<"wamp.close.system_shutdown">>).
--define(WAMP_ERROR_TIMEOUT,                   <<"wamp.error.timeout">>).
--define(WAMP_TYPE_CHECK_ERROR,          <<"wamp.error.type_check_error">>).
+    <<"wamp.subscription.list_subscribers">>
+).
+-define(WAMP_SUBSCRIPTION_LOOKUP, <<"wamp.subscription.lookup">>).
+-define(WAMP_SUBSCRIPTION_MATCH, <<"wamp.subscription.match">>).
+-define(WAMP_SUBSCRIPTION_ON_CREATE, <<"wamp.subscription.on_create">>).
+-define(WAMP_SUBSCRIPTION_ON_DELETE, <<"wamp.subscription.on_delete">>).
+-define(WAMP_SUBSCRIPTION_ON_SUBSCRIBE, <<"wamp.subscription.on_subscribe">>).
+-define(WAMP_SUBSCRIPTION_ON_UNSUBSCRIBE,
+    <<"wamp.subscription.on_unsubscribe">>
+).
+-define(WAMP_SYSTEM_SHUTDOWN, <<"wamp.close.system_shutdown">>).
+-define(WAMP_ERROR_TIMEOUT, <<"wamp.error.timeout">>).
+-define(WAMP_TYPE_CHECK_ERROR, <<"wamp.error.type_check_error">>).

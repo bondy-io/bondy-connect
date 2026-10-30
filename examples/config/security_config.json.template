@@ -114,8 +114,10 @@
             {
                 "username" : "peer1",
                 "password" : "changethispassword",
+                "authorized_keys": ["9becba5df08521e04400e308aaac40d65ba3e2192d59ba2ca22f2e1e9dfe0c8d"],
                 "groups" : ["microservices", "account_user"],
-                "meta" : {}
+                "meta" : {},
+                "comment": "for testing the corresponding private key seed is '0040b3bd868adc0effb8c6ac69109223fb943206cfeb11a2663afb2edce7c83f'"
             },
             {
                 "username" : "peer2",

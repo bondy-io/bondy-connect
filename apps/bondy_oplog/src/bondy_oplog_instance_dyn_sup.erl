@@ -1,0 +1,265 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_oplog_instance_dyn_sup).
+
+-behaviour(supervisor).
+
+-include("bondy_oplog.hrl").
+
+-moduledoc #{format => "text/markdown"}.
+-moduledoc """
+Dynamic supervisor that hosts one `bondy_oplog_instance_sup` subtree
+per running instance.
+
+`simple_one_for_one` of *supervisors* — each child is a per-instance
+one_for_all subtree (WAL writer + instance gen_server + applier).
+The dyn sup keeps the registry's `sup_pid` field in step with
+`supervisor:start_child/2` so `start_instance/2` is idempotent and
+`stop_instance/1` can locate the subtree by `InstanceId`.
+
+This supervisor starts each subtree empty and the caller of
+`start_instance/2` fills it (`bondy_oplog_instance_sup:start_children/3`),
+so instances recover concurrently rather than one at a time inside this
+process (`bondy_oplog_instance_sup_test`). The subtree is `temporary`:
+restarted here it would come back empty. `bondy_oplog_instance_keeper`
+starts a stopped instance again instead.
+""".
+
+-export([start_link/0]).
+-export([start_instance/2]).
+-export([restart_instance/2]).
+-export([stop_instance/1]).
+-export([init/1]).
+
+-define(SERVER, ?MODULE).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-spec start_link() -> supervisor:startlink_ret().
+
+start_link() ->
+    supervisor:start_link({local, ?SERVER}, ?MODULE, []).
+
+-doc """
+Spawns a per-instance subtree. Idempotent: if a subtree for
+`InstanceId` is already running, returns its existing supervisor pid
+without starting a duplicate. Otherwise returns
+`{error, {missing_required_opt, cell_apply_target}}`, before any process
+starts, when `Opts` has no `applier.cell_apply_target`.
+
+Raises `{invalid_instance_id, InstanceId, Reason}` for an id that cannot
+name one directory (`bondy_oplog_path:validate_instance_id/1`). This is
+the ONE place the library admits an instance, so the check here is what
+makes the id well-formed for every directory the subtree will derive from
+it — the WAL's `filename:join(BaseDir, InstanceId)` included, which with an
+explicit `wal_dir` or the `/tmp` default never goes through
+`bondy_oplog_path:storage_path/3`.
+""".
+-spec start_instance(instance_id(), bondy_oplog_instance:opts()) ->
+    {ok, pid()} | {error, term()}.
+
+start_instance(InstanceId, Opts) when
+    is_binary(InstanceId), is_map(Opts)
+->
+    ok = bondy_oplog_path:validate_instance_id(InstanceId),
+    case running(InstanceId) of
+        {ok, _} = Running ->
+            Running;
+        undefined ->
+            maybe
+                ok ?= require_cell_apply_target(Opts),
+                first_start(InstanceId, Opts)
+            end
+    end.
+
+-doc """
+`start_instance/2` for `bondy_oplog_instance_keeper`, which already keeps
+`InstanceId`: starts it unless a subtree for it is running.
+""".
+-spec restart_instance(instance_id(), bondy_oplog_instance:opts()) ->
+    {ok, pid()} | {error, term()}.
+
+restart_instance(InstanceId, Opts) ->
+    case running(InstanceId) of
+        {ok, _} = Running -> Running;
+        undefined -> do_start(InstanceId, Opts)
+    end.
+
+-spec stop_instance(instance_id() | pid()) -> ok | {error, not_found}.
+
+stop_instance(InstanceId) when is_binary(InstanceId) ->
+    ok = bondy_oplog_instance_keeper:forget(InstanceId),
+    case bondy_oplog_registry:sup_pid(InstanceId) of
+        undefined ->
+            %% No registry row, but the SUBTREE may still be running: a
+            %% consumer teardown that failed mid-close drops the row while the
+            %% supervisor child survives. `list_instances/0` enumerates ROWS,
+            %% so such an instance is invisible to every scheduler driven
+            %% from it — and invisible must not mean unkillable, or it holds
+            %% its WAL and storage for the VM's lifetime. Resolve it through
+            %% the supervisor
+            %% (`bondy_oplog_lifecycle_test:stop_survives_missing_registry_row/0`).
+            case find_child_by_instance_id(InstanceId) of
+                undefined ->
+                    {error, not_found};
+                SupPid ->
+                    supervisor:terminate_child(?SERVER, SupPid)
+            end;
+        SupPid ->
+            case supervisor:terminate_child(?SERVER, SupPid) of
+                ok ->
+                    %% Drop the registry row only on explicit
+                    %% stop_instance — one_for_all subtree restarts
+                    %% must leave it in place so the dyn_sup mapping
+                    %% (`sup_pid`) survives.
+                    _ = bondy_oplog_registry:unregister(InstanceId),
+                    ok;
+                {error, not_found} ->
+                    {error, not_found}
+            end
+    end;
+stop_instance(SupPid) when is_pid(SupPid) ->
+    %% Reverse-look-up the instance_id so the registry row is dropped
+    %% in step with the supervisor child. The lookup happens *before*
+    %% terminate_child because terminating the subtree clears the row's
+    %% `sup_pid` indirectly (via the dyn supervisor's child bookkeeping)
+    %% on some Erlang versions.
+    InstanceId = bondy_oplog_registry:instance_id_by_sup_pid(SupPid),
+    ok = bondy_oplog_instance_keeper:forget(SupPid),
+    case supervisor:terminate_child(?SERVER, SupPid) of
+        ok ->
+            case InstanceId of
+                undefined ->
+                    ok;
+                Id ->
+                    _ = bondy_oplog_registry:unregister(Id),
+                    ok
+            end;
+        {error, not_found} ->
+            {error, not_found}
+    end.
+
+%% =============================================================================
+%% supervisor CALLBACKS
+%% =============================================================================
+
+init([]) ->
+    SupFlags = #{
+        strategy => simple_one_for_one,
+        intensity => 10,
+        period => 10
+    },
+    ChildSpec = #{
+        id => bondy_oplog_instance_sup,
+        start => {bondy_oplog_instance_sup, start_link, []},
+        restart => temporary,
+        shutdown => infinity,
+        type => supervisor,
+        modules => [bondy_oplog_instance_sup]
+    },
+    {ok, {SupFlags, [ChildSpec]}}.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+require_cell_apply_target(#{applier := #{cell_apply_target := T}}) when
+    T =/= undefined
+->
+    ok;
+require_cell_apply_target(_) ->
+    {error, {missing_required_opt, cell_apply_target}}.
+
+%% @private
+first_start(InstanceId, Opts) ->
+    case bondy_oplog_instance_keeper:is_kept(InstanceId) of
+        true ->
+            bondy_oplog_instance_keeper:start_now(InstanceId);
+        false ->
+            maybe
+                {ok, SupPid} ?= do_start(InstanceId, Opts),
+                ok = bondy_oplog_instance_keeper:watch(
+                    InstanceId, SupPid, Opts
+                ),
+                {ok, SupPid}
+            end
+    end.
+
+%% @private
+running(InstanceId) ->
+    case bondy_oplog_registry:sup_pid(InstanceId) of
+        Pid when is_pid(Pid) ->
+            case is_process_alive(Pid) of
+                true -> {ok, Pid};
+                false -> undefined
+            end;
+        undefined ->
+            undefined
+    end.
+
+%% @private
+%% Locates a running per-instance subtree by the instance id in its child
+%% spec — the same enumeration `bondy_oplog:list_instances/0` performs, so
+%% anything that function can see, `stop_instance/1` can kill. O(children);
+%% only reached on the registry-row-missing path, which is a teardown
+%% anomaly, not steady state.
+find_child_by_instance_id(InstanceId) ->
+    Children = supervisor:which_children(?SERVER),
+    Found = [
+        SupPid
+     || {_Id, SupPid, supervisor, _} <- Children,
+        is_pid(SupPid),
+        instance_id_of(SupPid) =:= InstanceId
+    ],
+    case Found of
+        [SupPid | _] -> SupPid;
+        [] -> undefined
+    end.
+
+%% @private
+%% Read from the subtree's child spec, so no call reaches an instance that
+%% may be stopping; a subtree gone mid-scan reads as a non-match.
+instance_id_of(SupPid) ->
+    try supervisor:get_childspec(SupPid, bondy_oplog_instance) of
+        {ok, #{start := {bondy_oplog_instance, start_link, [Id, _]}}} -> Id;
+        {error, not_found} -> undefined
+    catch
+        exit:{noproc, _} -> undefined
+    end.
+
+%% @private
+do_start(InstanceId, Opts) ->
+    maybe
+        {ok, SupPid} ?= supervisor:start_child(?SERVER, [InstanceId]),
+        ok ?= start_children(SupPid, InstanceId, Opts),
+        ok = bondy_oplog_registry:set_sup_pid(InstanceId, SupPid),
+        {ok, SupPid}
+    else
+        {error, _} = E ->
+            %% A subtree that dies during start leaves its registry row
+            %% behind: the instance registers in its own `init/1`, before a
+            %% later child brings the subtree down. Because `list_instances/0`
+            %% enumerates the registry, that row is a phantom instance every
+            %% scheduler would dispatch gc and sync work to for the node's
+            %% lifetime. Unregistering here cannot take the row from a healthy
+            %% instance: `start_instance/2` reaches `do_start/2` only when
+            %% `sup_pid` is `undefined` or its process is dead.
+            _ = bondy_oplog_registry:unregister(InstanceId),
+            E
+    end.
+
+%% @private
+start_children(SupPid, InstanceId, Opts) ->
+    case bondy_oplog_instance_sup:start_children(SupPid, InstanceId, Opts) of
+        ok ->
+            ok;
+        {error, _} = Err ->
+            _ = supervisor:terminate_child(?SERVER, SupPid),
+            Err
+    end.

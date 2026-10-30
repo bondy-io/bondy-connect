@@ -1,0 +1,630 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_session_manager).
+-moduledoc """
+A pooled `gen_server` worker that manages the lifecycle of WAMP sessions. It
+stores sessions, monitors their owner (connection) process to clean up on
+crashes, registers per-session WAMP procedures, and closes sessions
+individually or in bulk.
+""".
+-behaviour(gen_server).
+
+-include_lib("kernel/include/logger.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("bondy_security.hrl").
+-include("bondy_uris.hrl").
+-include("bondy.hrl").
+
+%% Node-local set of realms whose per-node `wamp.session.<hash>..get` wildcard is
+%% already registered, so register_procedures/1 registers it once per realm
+%% instead of once per session. Owned by bondy_session_manager_sup (stable across
+%% worker restarts).
+-define(REG_REALMS_TAB, bondy_session_manager_registered_realms).
+
+-record(state, {
+    name :: atom(),
+    monitor_refs = #{} :: #{id() => reference()}
+}).
+
+-type close_opts() :: #{
+    exclude => [bondy_session_id:t()]
+}.
+-type pool() :: #{
+    name := term(),
+    size := pos_integer(),
+    algorithm := hash
+}.
+
+%% API
+-export([start_link/2]).
+-export([ensure_reg_realms_table/0]).
+-export([forget_realm/1]).
+-export([pool/0]).
+-export([open/1]).
+-export([open/3]).
+-export([close/1]).
+-export([close/2]).
+-export([close_all/1]).
+-export([close_all/2]).
+-export([close_all/4]).
+-export([invalidate_rbac_all/1]).
+
+%% GEN_SERVER CALLBACKS
+-export([init/1]).
+-export([handle_info/2]).
+-export([terminate/2]).
+-export([code_change/3]).
+-export([handle_call/3]).
+-export([handle_cast/2]).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+start_link(PoolName, WorkerName) ->
+    gen_server:start_link(
+        {local, WorkerName}, ?MODULE, [PoolName, WorkerName], []
+    ).
+
+-doc """
+Creates the node-local table tracking which realms already have their per-node
+`wamp.session.<hash>..get` wildcard registered. Called once by
+`bondy_session_manager_sup` (its owner) before the worker pool starts.
+""".
+-spec ensure_reg_realms_table() -> ok.
+
+ensure_reg_realms_table() ->
+    Opts = [
+        named_table,
+        public,
+        set,
+        {read_concurrency, true},
+        {write_concurrency, true}
+    ],
+    _ =
+        case ets:whereis(?REG_REALMS_TAB) of
+            undefined -> ets:new(?REG_REALMS_TAB, Opts);
+            Tid -> Tid
+        end,
+    ok.
+
+-doc """
+Drops `RealmUri` from the node-local table of realms whose per-node
+`wamp.session.<hash>..get` wildcard is registered, so the next session opened on
+a realm with this URI registers it again.
+
+Called by `bondy_realm:teardown/1` together with the removal of the realm's
+registry entries. The two must move together: the table is only a cache of what
+the registry holds, and a realm that reclaimed this URI while the cache still
+named it would never get its wildcard back — `wamp.session.get` would answer
+`no_such_procedure` for every session on it until the node restarted
+(`bondy_session_cleanup_SUITE:realm_delete_purges_registry`).
+""".
+-spec forget_realm(RealmUri :: uri()) -> ok.
+
+forget_realm(RealmUri) when is_binary(RealmUri) ->
+    true = ets:delete(?REG_REALMS_TAB, RealmUri),
+    ok.
+
+-spec pool() -> pool().
+
+pool() ->
+    #{
+        name => {?MODULE, pool},
+        size => bondy_config:get([session_manager_pool, size]),
+        %% hash is the only valid algorithm as the worker will monitor the
+        %% session owner (connection process) and we need to demonitor on close,
+        %% so we need all calls for a given session to be send to the same
+        %% worker deterministically.
+        algorithm => hash
+    }.
+
+-doc """
+Stores the session `Session` and sets up a monitor for the calling process
+which is assumed to be the client connection process e.g. WAMP connection. In
+case the connection crashes it performs the cleanup of any session data that
+should not be retained.
+
+The session manager worker is picked from the pool based on the hash of the
+calling process' pid.
+""".
+-spec open(Session :: bondy_session:t()) -> ok | {error, timeout | any()}.
+
+open(Session) ->
+    do_for_worker(
+        fun(ServerRef) ->
+            try
+                EnqueuedAt = erlang:monotonic_time(microsecond),
+                gen_server:call(ServerRef, {open, Session, EnqueuedAt}, 15000)
+            catch
+                exit:{timeout, _} ->
+                    {error, timeout}
+            end
+        end,
+        bondy_session:id(Session)
+    ).
+
+-doc """
+Creates a new session provided the RealmUri exists or can be dynamically
+created. It calls `bondy_session:new/4` which will fail with an exception if the
+realm does not exist or cannot be created.
+
+This function also sets up a monitor for the calling process which is assumed to
+be the client connection process e.g. WAMP connection. In case the connection
+crashes it performs the cleanup of any session data that should not be retained.
+""".
+-spec open(
+    bondy_session_id:t(),
+    uri() | bondy_realm:t(),
+    bondy_session:properties()
+) ->
+    {ok, bondy_session:t()} | {error, timeout | any()}.
+
+open(Id, RealmOrUri, Opts) ->
+    do_for_worker(
+        fun(ServerRef) ->
+            try
+                Session = bondy_session:new(Id, RealmOrUri, Opts),
+                EnqueuedAt = erlang:monotonic_time(microsecond),
+                gen_server:call(ServerRef, {open, Session, EnqueuedAt}, 15000)
+            catch
+                exit:{timeout, _} ->
+                    {error, timeout}
+            end
+        end,
+        Id
+    ).
+
+-doc """
+Closes the session.
+
+This function does NOT send a GOODBYE WAMP message to the session owner.
+""".
+-spec close(bondy_session:t()) -> ok.
+
+close(Session) ->
+    do_for_worker(
+        fun(ServerRef) ->
+            gen_server:cast(ServerRef, {close, Session, undefined})
+        end,
+        bondy_session:id(Session)
+    ).
+
+-doc """
+Closes the session.
+
+This function sends a GOODBYE WAMP message to the session owner.
+""".
+-spec close(bondy_session:t(), uri()) -> ok.
+
+close(Session, ReasonUri) when is_binary(ReasonUri) ->
+    do_for_worker(
+        fun(ServerRef) ->
+            gen_server:cast(ServerRef, {close, Session, ReasonUri})
+        end,
+        bondy_session:id(Session)
+    ).
+
+-doc """
+Closes all managed sessions in realm with URI `RealmUri`.
+
+Notice that `RealmUri` will be used to match the session's `authrealm` property
+and not `realm_uri`. If the user is an SSO user `authrealm` is the SSO realm and
+as result all sessions in all associated realms will be closed.
+""".
+-spec close_all(RealmUri :: uri()) -> ok.
+
+close_all(RealmUri) ->
+    close_all(RealmUri, ?WAMP_CLOSE_NORMAL).
+
+-doc """
+Closes all managed sessions in realm with URI `RealmUri`.
+
+Notice that `RealmUri` will be used to match the session's `authrealm` property
+and not `realm_uri`. If the user is an SSO user `authrealm` is the SSO realm and
+as result all sessions in all associated realms will be closed.
+""".
+-spec close_all(RealmUri :: uri(), ReasonUri :: uri()) -> ok.
+
+close_all(RealmUri, ReasonUri) when is_binary(ReasonUri) ->
+    Bindings = #{realm_uri => RealmUri},
+    do_close_all(Bindings, #{}, ReasonUri).
+
+-doc """
+Closes all sessions for user `Username` on realm `RealmUri` according to the
+options `Opts`.
+
+Notice that `RealmUri` will be used to match the session's `authrealm` property
+and not `realm_uri`. If the user is an SSO user `authrealm` is the SSO realm and
+as result all sessions in all associated realms will be closed.
+""".
+-spec close_all(
+    RealmUri :: uri(),
+    Authid :: uri(),
+    ReasonUri :: uri(),
+    Opts :: close_opts()
+) -> ok.
+
+close_all(RealmUri, Authid, ReasonUri, Opts) ->
+    Bindings = #{authrealm => RealmUri, authid => Authid},
+    do_close_all(Bindings, Opts, ReasonUri).
+
+-doc """
+Invalidates the cached RBAC context of every session on realm `RealmUri`
+(`STORAGE_ARCHITECTURE` §9.5). Each session's next authorisation re-reads the
+subject's current grants; the sessions themselves are NOT closed.
+
+Used on a local grant/revoke so a permission change re-evaluates active sessions
+in place. The scope is the whole realm (rather than a single subject) because a
+group grant change affects every member — the over-invalidation of unaffected
+sessions costs only a one-time context rebuild on their next op, and grant
+changes are rare admin operations.
+""".
+-spec invalidate_rbac_all(RealmUri :: uri()) -> ok.
+
+invalidate_rbac_all(RealmUri) ->
+    do_invalidate_rbac_all(#{realm_uri => RealmUri}).
+
+%% =============================================================================
+%% GEN_SERVER CALLBACKS
+%% =============================================================================
+
+init([PoolName, WorkerName]) ->
+    true = gproc_pool:connect_worker(PoolName, WorkerName),
+    {ok, #state{name = WorkerName}}.
+
+handle_call({open, Session0, EnqueuedAt}, _From, State0) ->
+    %% Mailbox wait vs service time; the split tells whether slow opens
+    %% are queued behind other worker work or slow to serve.
+    ServiceStart = erlang:monotonic_time(microsecond),
+    QueueUs = ServiceStart - EnqueuedAt,
+
+    {ok, Session} = bondy_session:store(Session0),
+
+    %% We init the session-scoped counters
+    RealmUri = bondy_session:realm_uri(Session),
+    SessionId = bondy_session:id(Session),
+    ok = bondy_message_id:init_session(RealmUri, SessionId),
+
+    Id = bondy_session:id(Session),
+    Pid = bondy_session:pid(Session),
+
+    %% We monitor the session owner (pid) so that we can cleanup when the
+    %% process terminates
+    Ref = erlang:monitor(process, Pid),
+
+    case register_procedures(Session) of
+        ok ->
+            Refs = State0#state.monitor_refs,
+            State = State0#state{monitor_refs = Refs#{Id => Ref, Ref => Id}},
+            ok = maybe_schedule_oidc_refresh(Session),
+            ServiceUs = erlang:monotonic_time(microsecond) - ServiceStart,
+            ok = bondy_telemetry:session_manager_open(QueueUs, ServiceUs),
+            {reply, {ok, Session}, State};
+        {error, Reason} ->
+            ?LOG_ERROR(#{
+                description =>
+                    "Error while registering session 'get' procedure",
+                reason => Reason
+            }),
+            true = erlang:demonitor(Ref, [flush]),
+            ok = timed_cleanup(error, Session, undefined),
+            ErrServiceUs = erlang:monotonic_time(microsecond) - ServiceStart,
+            ok = bondy_telemetry:session_manager_open(QueueUs, ErrServiceUs),
+            {reply, {error, Reason}, State0}
+    end;
+handle_call(Event, From, State) ->
+    ?LOG_WARNING(#{
+        reason => unsupported_event,
+        event => Event,
+        from => From
+    }),
+    {reply, {error, {unsupported_call, Event}}, State}.
+
+handle_cast({close, Session, ReasonUri}, State0) ->
+    T0 = erlang:monotonic_time(microsecond),
+    State = do_close(State0, Session, ReasonUri),
+    DurationUs = erlang:monotonic_time(microsecond) - T0,
+    ok = bondy_telemetry:session_manager_cleanup(close, DurationUs),
+    {noreply, State};
+handle_cast(Event, State) ->
+    ?LOG_WARNING(#{
+        reason => unsupported_event,
+        event => Event
+    }),
+    {noreply, State}.
+
+handle_info({'DOWN', Ref, _, _, _}, State0) ->
+    %% The connection process has terminated
+    Refs = State0#state.monitor_refs,
+
+    State =
+        case maps:find(Ref, Refs) of
+            {ok, Id} ->
+                case bondy_session:lookup(Id) of
+                    {ok, Session} ->
+                        ProtocolId = bondy_session:external_id(Session),
+                        ?LOG_DEBUG(#{
+                            description =>
+                                "Connection process for session terminated, "
+                                " cleaning up.",
+                            protocol_session_id => ProtocolId,
+                            session_id => Id
+                        }),
+                        timed_cleanup(down, Session, undefined);
+                    {error, not_found} ->
+                        ok
+                end,
+                State0#state{monitor_refs = maps:without([Ref, Id], Refs)};
+            error ->
+                State0#state{monitor_refs = maps:without([Ref], Refs)}
+        end,
+
+    {noreply, State};
+handle_info(Info, State) ->
+    ?LOG_WARNING(#{
+        reason => unsupported_event,
+        event => Info
+    }),
+    {noreply, State}.
+
+terminate(_Reason, State) ->
+    #{name := PoolName} = pool(),
+    true = gproc_pool:disconnect_worker(PoolName, State#state.name),
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+%% Ensures this node's `wamp.session.<hash>..get` wildcard is registered for the
+%% session's realm — once per realm, not once per session.
+%%
+%% `wamp.session.get` is served by routing to the node that owns the (non-
+%% replicated) session. The client-facing session id is `{NodeHash}.{Rest}`, so
+%% the meta API rewrites the call to `wamp.session.{NodeHash}.{Rest}.get`; the
+%% wildcard `wamp.session.{NodeHash}..get` registered here matches every such
+%% URI for a session owned by this node, letting the dealer forward it with no
+%% per-session registration (the old per-session exact registration cost a
+%% `bondy_wamp_callback:validate_target/2` on every session open).
+register_procedures(Session) ->
+    RealmUri = bondy_session:realm_uri(Session),
+
+    %% ets:insert_new is atomic, so exactly one worker registers per realm.
+    case ets:insert_new(?REG_REALMS_TAB, {RealmUri}) of
+        true ->
+            case register_node_session_get(RealmUri) of
+                ok ->
+                    ok;
+                {error, _} = Error ->
+                    %% Undo the guard so a later open retries the registration.
+                    true = ets:delete(?REG_REALMS_TAB, RealmUri),
+                    Error
+            end;
+        false ->
+            ok
+    end.
+
+%% @private
+register_node_session_get(RealmUri) ->
+    NodeHash = bondy_session_id:node_hash(),
+
+    %% The empty component between the two dots is the wildcard that matches the
+    %% session's `{Rest}` URI segment.
+    ProcUri = <<"wamp.session.", NodeHash/binary, "..get">>,
+
+    %% A single node-level callback reference (no owning session). The handler
+    %% resolves the session from the guid passed in the call, so the only static
+    %% argument is the realm (used for the realm-scoped lookup).
+    Ref = bondy_ref:new(internal, {bondy_session_api, get}),
+    Opts = #{match => ?WILDCARD_MATCH, callback_args => [RealmUri]},
+
+    case bondy_dealer:register(ProcUri, Opts, RealmUri, Ref) of
+        {ok, _} ->
+            ok;
+        {error, already_exists} ->
+            %% The guard and the registry can diverge only across a supervisor
+            %% restart; the existing wildcard is exactly what we wanted.
+            ok;
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @private
+timed_cleanup(Kind, Session, Reason) ->
+    T0 = erlang:monotonic_time(microsecond),
+    ok = cleanup(Session, Reason),
+    DurationUs = erlang:monotonic_time(microsecond) - T0,
+    ok = bondy_telemetry:session_manager_cleanup(Kind, DurationUs).
+
+%% @private
+%% The single teardown for a session, whatever ended it. Both the owner-DOWN
+%% path and the `close` cast run it, so a session the ROUTER closes (a protocol
+%% violation, `close_all/1`, a realm delete) releases exactly what a crashed
+%% connection releases.
+%%
+%% That symmetry is load-bearing, not tidiness: the flush used to live only on
+%% the DOWN path, and that path gives up as soon as `bondy_session:lookup/1`
+%% misses. A router-initiated close deletes the session record FIRST, so the
+%% owner's later death found nothing and flushed nothing — the session's
+%% registrations and subscriptions stayed in the registry for the life of the
+%% node whenever the owner did not itself run `bondy_wamp_protocol:terminate/1`
+%% (`bondy_session_cleanup_SUITE:graceful_close_removes_session_records`).
+%%
+%% Running it on both paths means the ordinary WAMP disconnect flushes twice —
+%% once here, once in the connection's own `bondy_context:close/1`. `remove_all`
+%% is a bounded prefix select keyed by (type, realm, session), so the second
+%% flush is an empty range scan.
+cleanup(Session, Reason) ->
+    %% TODO We need a new API to be the underlying cleanup function behind
+    %% bondy_context:close/1. In the meantime we create a fakce context,
+    %% knowing what it should contain for the close/2 call to work.
+    FakeCtxt = #{
+        session => Session,
+        realm_uri => bondy_session:realm_uri(Session),
+        node => bondy_session:node(Session),
+        ref => bondy_session:ref(Session)
+    },
+    %% Flushes the session's registry entries (subscriptions and
+    %% registrations) and its RPC promises via bondy_router:flush/2.
+    bondy_context:close(FakeCtxt, crash),
+    %% And deletes the stored session itself — `bondy_context:close/2`
+    %% only flushes, so without this a connection that died WITHOUT the
+    %% graceful `close` cast (a crash, a kill, a dropped transport whose
+    %% handler never ran) leaked its session rows in ETS forever.
+    %% During shutdown the event manager is unregistered, so its `notify/1`
+    %% raises `badarg`.
+    _ =
+        try
+            bondy_session:close(Session, Reason)
+        catch
+            error:badarg -> ok
+        end,
+    ok.
+
+%% @private
+do_for_worker(Fun, Key) ->
+    Pid = gproc_pool:pick_worker(maps:get(name, pool()), Key),
+    ?LOG_DEBUG(#{
+        description => "Using worker pool",
+        pid => Pid
+    }),
+    Fun(Pid).
+
+do_close(State0, Session, ReasonUri) ->
+    Id = bondy_session:id(Session),
+    ExtId = bondy_session:external_id(Session),
+    RealmUri = bondy_session:realm_uri(Session),
+    Refs = State0#state.monitor_refs,
+
+    ?LOG_DEBUG(#{
+        description => "Session closing, demonitoring session connection",
+        realm => RealmUri,
+        session_id => Id,
+        protocol_session_id => ExtId
+    }),
+
+    State =
+        case maps:find(Id, Refs) of
+            {ok, Ref} ->
+                true = erlang:demonitor(Ref, [flush]),
+                State0#state{monitor_refs = maps:without([Id, Ref], Refs)};
+            error ->
+                State0#state{monitor_refs = maps:without([Id], Refs)}
+        end,
+
+    ok = maybe_send_goodbye(Session, ReasonUri),
+
+    %% Flush the session's routing state and delete its records. The caller
+    %% (`handle_cast/2`) already times this, so it calls `cleanup/2` rather
+    %% than `timed_cleanup/3`.
+    ok = cleanup(Session, ReasonUri),
+
+    State.
+
+%% @private
+do_close_all(Bindings, Opts0, ReasonUri) ->
+    Opts = #{
+        limit => 100,
+        return => object,
+        exclude => maps:get(exclude, Opts0, undefined)
+    },
+
+    Fun = fun
+        ({continue, Cont}) ->
+            bondy_session:match(Cont);
+        (Session) ->
+            do_for_worker(
+                fun(ServerRef) ->
+                    gen_server:cast(ServerRef, {close, Session, ReasonUri})
+                end,
+                bondy_session:id(Session)
+            )
+    end,
+
+    Matches = bondy_session:match(Bindings, Opts),
+    ok = bondy_router_utils:foreach(Fun, Matches).
+
+%% @private
+do_invalidate_rbac_all(Bindings) ->
+    Opts = #{limit => 100, return => object, exclude => undefined},
+
+    Fun = fun
+        ({continue, Cont}) ->
+            bondy_session:match(Cont);
+        (Session) ->
+            %% Re-evaluate in place (no teardown): the next authorize rebuilds
+            %% the context from the subject's current grants.
+            ok = bondy_session:invalidate_rbac_context(
+                bondy_session:id(Session)
+            )
+    end,
+
+    Matches = bondy_session:match(Bindings, Opts),
+    ok = bondy_router_utils:foreach(Fun, Matches).
+
+%% @private
+maybe_send_goodbye(_, undefined) ->
+    ok;
+maybe_send_goodbye(Session, ReasonUri) ->
+    RealmUri = bondy_session:realm_uri(Session),
+    ProcRef = bondy_session:ref(Session),
+
+    Msg = bondy_wamp_message:goodbye(
+        #{message => <<"The session was closed by the Router.">>},
+        ReasonUri
+    ),
+    %% `bondy_ref:pid/1` raises `badarg` once the session's gproc name is
+    %% gone, and `!` raises `badarg` for a ref with no pid.
+    _ =
+        try
+            bondy_router_peer:send(RealmUri, ProcRef, Msg)
+        catch
+            error:badarg -> ok
+        end,
+    ok.
+
+%% @private
+maybe_schedule_oidc_refresh(Session) ->
+    case bondy_session:authmethod(Session) of
+        ?OIDCRP_AUTH ->
+            do_schedule_oidc_refresh(Session);
+        _ ->
+            ok
+    end.
+
+%% @private
+do_schedule_oidc_refresh(Session) ->
+    case bondy_session:authmethod_details(Session) of
+        #{oidc_provider := Provider, oidc_refresh_token := RT} = Details when
+            is_binary(Provider) andalso is_binary(RT)
+        ->
+            RealmUri = bondy_session:realm_uri(Session),
+            Authid = bondy_session:authid(Session),
+            AccessExp = maps:get(
+                oidc_access_token_expires_in, Details, 0
+            ),
+            %% Keyed by the session, so the queue entry is addressable by the
+            %% only identifier that outlives a re-schedule. The close path
+            %% stores nothing and removes nothing — the worker drops the entry
+            %% when it comes due and the session is gone.
+            bondy_oidc_refresh_worker:schedule_refresh(
+                bondy_session:id(Session),
+                RealmUri,
+                Authid,
+                Provider,
+                #{
+                    refresh_token => RT,
+                    access_token_expires_in => AccessExp
+                }
+            );
+        _ ->
+            ok
+    end.

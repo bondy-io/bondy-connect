@@ -1,24 +1,7 @@
 %% =============================================================================
-%%  bondy_broker_bridge.schema - Bondy configuration schema for Cuttlefish
-%%
-%%  Copyright (c) 2016-2024 Leapsight. All rights reserved.
-%%
-%%  Licensed under the Apache License, Version 2.0 (the "License");
-%%  you may not use this file except in compliance with the License.
-%%  You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%%  Unless required by applicable law or agreed to in writing, software
-%%  distributed under the License is distributed on an "AS IS" BASIS,
-%%  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%%  See the License for the specific language governing permissions and
-%%  limitations under the License.
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
 %% =============================================================================
-
-
-
-
 
 
 %% =============================================================================
@@ -470,4 +453,29 @@ end}.
 %% -----------------------------------------------------------------------------
 {mapping, "broker_bridge.sendgrid.sender", "bondy_broker_bridge.bridges.bondy_sendgrid_bridge.email_sender", [
   {datatype, string}
+]}.
+
+
+%% =============================================================================
+%% SMTP BRIDGE
+%%
+%% Sends email through bondy_mail, so relays -- hosts, credentials, TLS and
+%% sending policy -- are declared under `mail.relay.$name.*` and never here. A
+%% bridge specification names a relay; it cannot describe one.
+%%
+%% Enable it on EVERY node. A broker bridge subscribes with a group id, so each
+%% node handles only events published locally; a node without the bridge
+%% silently drops the events published on it.
+%% =============================================================================
+
+
+%% -----------------------------------------------------------------------------
+%% @doc Whether the SMTP broker bridge is enabled on this node. With no
+%% `mail.relay.$name.*` declared, enabling it warns at boot and every action
+%% fails: the bridge has nothing to send through.
+%% @end
+%% -----------------------------------------------------------------------------
+{mapping, "broker_bridge.smtp.enabled", "bondy_broker_bridge.bridges.bondy_smtp_bridge.enabled", [
+  {datatype, flag},
+  {default, off}
 ]}.

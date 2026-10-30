@@ -1,3 +1,8 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
 %% @doc Specifies the primary log level, that is, log event that are equally or
 %% more severe than this level, are forwarded to the primary filters. Less
 %% severe log events are immediately discarded.
@@ -352,12 +357,14 @@
 %% @doc allows to enable or disable a comnfigured handler
 {mapping, "log.handlers.$id.enabled", "kernel.logger", [
     {default, off},
+    {commented, off},
     {datatype, flag}
 ]}.
 
 %% @doc The destination backend handler.
 {mapping, "log.handlers.$id.backend", "kernel.logger", [
     {default, console},
+    {commented, console},
     {datatype, {enum, [disk, console]}}
 ]}.
 
@@ -366,6 +373,7 @@
 %% for this handler.
 {mapping, "log.handlers.$id.level", "kernel.logger", [
     {default, info},
+    {commented, info},
     {datatype, {enum, [
         debug, info, notice, warning, error, critical, alert, emergency
     ]}}
@@ -375,6 +383,7 @@
 %% given, in which case it defaults to file.
 {mapping, "log.handlers.$id.config.type", "kernel.logger", [
     {default, standard_io},
+    {commented, standard_io},
     {datatype, {enum, [standard_io, standard_error, file]}}
 ]}.
 
@@ -397,6 +406,7 @@
 %% Value true enables burst control and false disables it.
 {mapping, "log.handlers.$id.config.burst_limit_enable", "kernel.logger", [
     {default, on},
+    {commented, on},
     {datatype, flag}
 ]}.
 
@@ -415,6 +425,7 @@
 %% events are dropped until the end of the time frame.
 {mapping, "log.handlers.$id.config.burst_limit_max_count", "kernel.logger", [
     {default, 500},
+    {commented, 500},
     {datatype, integer}
 ]}.
 
@@ -431,6 +442,7 @@
 %% See the previous description of burst_limit_max_count.
 {mapping, "log.handlers.$id.config.burst_limit_window_time", "kernel.logger", [
     {default, "1s"},
+    {commented, "1s"},
     {datatype, {duration, ms}}
 ]}.
 
@@ -460,6 +472,7 @@
 %% situation of many busy concurrent senders.
 {mapping, "log.handlers.$id.config.sync_mode_qlen", "kernel.logger", [
 {default, 10},
+{commented, 10},
 {datatype, integer}
 ]}.
 
@@ -485,6 +498,7 @@
 %% information about it is printed in the log.
 {mapping, "log.handlers.$id.config.drop_mode_qlen", "kernel.logger", [
     {default, 200},
+    {commented, 200},
     {datatype, integer}
 ]}.
 
@@ -510,6 +524,7 @@
 %% about how many events have been deleted.
 {mapping, "log.handlers.$id.config.flush_qlen", "kernel.logger", [
     {default, 1000},
+    {commented, 1000},
     {datatype, integer}
 ]}.
 
@@ -518,6 +533,7 @@
 %% data is written to disk.
 {mapping, "log.handlers.$id.config.filesync_repeat_enable", "kernel.logger", [
     {default, on},
+    {commented, on},
     {datatype, flag}
 ]}.
 
@@ -527,6 +543,7 @@
 %% been logged.
 {mapping, "log.handlers.$id.config.filesync_repeat_interval", "kernel.logger", [
     {default, "5s"},
+    {commented, "5s"},
     {datatype, {duration, ms}}
 ]}.
 
@@ -543,6 +560,7 @@
 %% Value true enables the feature and false disables it.
 {mapping, "log.handlers.$id.config.overload_kill_enable", "kernel.logger", [
     {default, off},
+    {commented, off},
     {datatype, flag}
 ]}.
 
@@ -555,6 +573,7 @@
 %% This is the maximum memory size that the handler process is allowed to use. If the handler grows larger than this, the process is terminated.
 {mapping, "log.handlers.$id.config.overload_kill_mem_size", "kernel.logger", [
     {default, 3000000},
+    {commented, 3000000},
     {datatype, integer}
 ]}.
 
@@ -568,6 +587,7 @@
 %% than this, the handler process is terminated.
 {mapping, "log.handlers.$id.config.overload_kill_qlen", "kernel.logger", [
     {default, 20000},
+    {commented, 20000},
     {datatype, integer}
 ]}.
 
@@ -581,6 +601,7 @@
 %% specified in milliseconds. The value infinity prevents restarts.
 {mapping, "log.handlers.$id.config.overload_kill_restart_after", "kernel.logger", [
     {default, "5s"},
+    {commented, "5s"},
     {datatype, {duration, ms}}
 ]}.
 
@@ -588,6 +609,7 @@
 %% if no filters exist.
 {mapping, "log.handlers.$id.filter_default", "kernel.logger", [
     {default, stop},
+    {commented, stop},
     {datatype, {enum, [log, stop]}}
 ]}.
 
@@ -600,11 +622,13 @@
 %% following elements: "otp", "sasl" and "bondy_audit"
 {mapping, "log.handlers.$id.filter_domains", "kernel.logger", [
     {default, "otp, bondy_audit"},
+    {commented, "otp, bondy_audit"},
     {datatype, string}
 ]}.
 
 {mapping, "log.handlers.$id.allow_progress_reports", "kernel.logger", [
     {default, off},
+    {commented, off},
     {datatype, flag}
 ]}.
 
@@ -612,6 +636,7 @@
 %% option is disabled.
 {mapping, "log.handlers.$id.formatter.map_depth", "kernel.logger", [
     {default, 3},
+    {commented, 3},
     {datatype, integer}
 ]}.
 
@@ -619,61 +644,73 @@
 %% provided, this option is disabled.
 {mapping, "log.handlers.$id.formatter.term_depth", "kernel.logger", [
     {default, 50},
+    {commented, 50},
     {datatype, integer}
 ]}.
 
 {mapping, "log.handlers.$id.formatter.colored", "kernel.logger", [
     {default, on},
+    {commented, on},
     {datatype, flag}
 ]}.
 
 {mapping, "log.handlers.$id.formatter.colored_debug", "kernel.logger", [
     {default, "\e[0;38m"},
+    {commented, "\e[0;38m"},
     {datatype, string}
 ]}.
 
 {mapping, "log.handlers.$id.formatter.colored_info", "kernel.logger", [
     {default, "\e[0;39m"},
+    {commented, "\e[0;39m"},
     {datatype, string}
 ]}.
 
 {mapping, "log.handlers.$id.formatter.colored_notice", "kernel.logger", [
     {default, "\e[0;36m"},
+    {commented, "\e[0;36m"},
     {datatype, string}
 ]}.
 
 {mapping, "log.handlers.$id.formatter.colored_warning", "kernel.logger", [
     {default, "\e[0;33m"},
+    {commented, "\e[0;33m"},
     {datatype, string}
 ]}.
 
 {mapping, "log.handlers.$id.formatter.colored_error", "kernel.logger", [
     {default, "\e[0;31m"},
+    {commented, "\e[0;31m"},
     {datatype, string}
 ]}.
 
 {mapping, "log.handlers.$id.formatter.colored_critical", "kernel.logger", [
     {default, "\e[0;35m"},
+    {commented, "\e[0;35m"},
     {datatype, string}
 ]}.
 
 {mapping, "log.handlers.$id.formatter.colored_alert", "kernel.logger", [
     {default, "\e[0;45m"},
+    {commented, "\e[0;45m"},
     {datatype, string}
 ]}.
 
 {mapping, "log.handlers.$id.formatter.colored_emergency", "kernel.logger", [
     {default, "\e[1;41;1m"},
+    {commented, "\e[1;41;1m"},
     {datatype, string}
 ]}.
 
 {mapping, "log.handlers.$id.formatter.time_offset", "kernel.logger", [
     {default, 0},
+    {commented, 0},
     {datatype, integer}
 ]}.
 
 {mapping, "log.handlers.$id.formatter.time_designator", "kernel.logger", [
     {default, "T"},
+    {commented, "T"},
     {datatype, string}
 ]}.
 

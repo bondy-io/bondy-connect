@@ -1,0 +1,173 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_oauth_jwt).
+-moduledoc """
+Encodes, decodes and verifies OAuth JWTs, validating realm-scoped claims,
+signatures and expiry.
+""".
+
+-include_lib("kernel/include/logger.hrl").
+-include("bondy_security.hrl").
+
+-define(NOW, erlang:system_time(second)).
+-define(LEEWAY_SECS, 2 * 60).
+-define(EXPIRY_TIME_SECS(Ts, Secs), Ts + Secs + ?LEEWAY_SECS).
+
+-type claims() :: map().
+-type error() :: oauth2_invalid_grant | any().
+
+-export([encode/2]).
+-export([decode/1]).
+-export([verify/2]).
+-export([verify/3]).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-spec encode(claims(), PrivKey :: binary()) -> binary().
+
+encode(Claims, PrivKey) ->
+    {_, JWT} = jose_jws:compact(jose_jwt:sign(PrivKey, Claims)),
+    JWT.
+
+-spec decode(binary()) -> claims().
+
+decode(JWT) when is_binary(JWT) andalso byte_size(JWT) >= 32 ->
+    {jose_jwt, Map} = jose_jwt:peek(JWT),
+    Map;
+decode(Term) ->
+    error({badarg, [Term]}).
+
+-spec verify(binary(), binary()) -> {ok, map()} | {error, error()}.
+
+verify(RealmUri, JWT) ->
+    verify(RealmUri, JWT, #{}).
+
+-doc """
+Verifies `JWT` for `RealmUri`: its issuer must be trusted by the realm, its
+signature must verify under the issuer's key, it must not have expired, its
+scope must cover the realm, and its claims must equal `MatchSpec` on every key
+`MatchSpec` names.
+
+Access tokens are bearer tokens (RFC 6750). The scope's `client_id` and
+`device_id` record whom the token was issued to, for refresh and revocation;
+they are not compared with the presenter, whose client is not authenticated
+here. Binding a token to its client needs sender-constrained tokens (RFC 8705,
+RFC 9449).
+""".
+-spec verify(RealmUri :: binary(), JWT :: binary(), MatchSpec :: map()) ->
+    {ok, claims()} | {error, error()}.
+
+verify(RealmUri, JWT, MatchSpec) ->
+    maybe_expired(do_verify(RealmUri, JWT, MatchSpec), JWT).
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+authscope(RealmUri, Claims) ->
+    case maps:get(~"auth", Claims, undefined) of
+        undefined ->
+            %% V1 token
+            DeviceId = key_value:get(
+                [~"meta", ~"client_device_id"], Claims, all
+            ),
+            bondy_auth_scope:new(RealmUri, all, DeviceId);
+        Auth ->
+            %% V1.1 Token
+            Scope = key_value:get(~"scope", Auth, #{}),
+            ScopeRealm = maps:get(~"realm", Scope, RealmUri),
+            ClientId = maps:get(~"client_id", Scope, all),
+            DeviceId = maps:get(~"device_id", Scope, all),
+            bondy_auth_scope:new(ScopeRealm, ClientId, DeviceId)
+    end.
+
+%% @private
+matches(RealmUri, Claims, Spec) ->
+    TokenScope = authscope(RealmUri, Claims),
+    Keys = maps:keys(Spec),
+
+    maybe
+        true ?= bondy_auth_scope:matches_realm(TokenScope, RealmUri),
+        true ?=
+            maps_utils:collect(Keys, Claims) =:=
+            maps_utils:collect(Keys, Spec),
+        {ok, Claims}
+    else
+        false ->
+            {error, oauth2_invalid_grant}
+    end.
+
+%% @private
+-spec do_verify(Realm :: binary(), binary(), map()) ->
+    {ok, map()} | {error, error()}.
+
+do_verify(RealmUri, JWT, Spec) ->
+    try
+        {jose_jwt, Claims} = jose_jwt:peek(JWT),
+        #{
+            ~"aud" := AuthRealmUri,
+            ~"kid" := Kid
+        } = Claims,
+
+        %% The token's issuer (`aud`) has to be trusted by the target realm
+        %% (itself or its SSO realm), else a token minted under an unrelated
+        %% realm/SSO family could be replayed here against its own issuer's key.
+        case bondy_realm:is_trusted_issuer(RealmUri, AuthRealmUri) of
+            true ->
+                ok;
+            false ->
+                ?LOG_WARNING(#{
+                    description =>
+                        "Rejected OAuth2 token: issuer not trusted by "
+                        "target realm",
+                    realm_uri => RealmUri,
+                    token_authrealm => AuthRealmUri
+                }),
+                throw(untrusted_issuer)
+        end,
+
+        AuthRealm = bondy_realm:fetch(AuthRealmUri),
+
+        case bondy_realm:get_public_key(AuthRealm, Kid) of
+            undefined ->
+                {error, oauth2_invalid_grant};
+            JWK ->
+                case jose_jwt:verify_strict(JWK, ?ALLOWED_JWT_ALGS, JWT) of
+                    {true, {jose_jwt, Claims}, _} ->
+                        matches(RealmUri, Claims, Spec);
+                    {false, {jose_jwt, _Claims}, _} ->
+                        {error, oauth2_invalid_grant}
+                end
+        end
+    catch
+        throw:Reason ->
+            {error, Reason};
+        error:{not_found, Uri} ->
+            {error, {no_such_realm, Uri}};
+        error:{no_such_realm, _} = Reason ->
+            {error, Reason};
+        Class:Reason:Stacktrace ->
+            ?LOG_ERROR(#{
+                class => Class,
+                reason => Reason,
+                stacktrace => Stacktrace
+            }),
+            {error, internal_error}
+    end.
+
+%% @private
+maybe_expired({ok, #{<<"iat">> := Ts, <<"exp">> := Secs} = Claims}, _JWT) ->
+    case ?EXPIRY_TIME_SECS(Ts, Secs) =< ?NOW of
+        true ->
+            {error, oauth2_invalid_grant};
+        false ->
+            {ok, Claims}
+    end;
+maybe_expired(Error, _) ->
+    Error.

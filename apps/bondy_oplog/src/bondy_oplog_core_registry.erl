@@ -1,0 +1,1640 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_oplog_core_registry).
+
+-behaviour(gen_server).
+
+-include_lib("kernel/include/logger.hrl").
+
+-moduledoc #{format => "text/markdown"}.
+-moduledoc """
+Node-shared registry of per-`(namespace, index, shard)` triples for
+`bondy_oplog_core`.
+
+Each shard publishes one entry containing the handles `bondy_oplog_core`
+needs to satisfy a read:
+
+| Field | Source |
+|---|---|
+| `shard_count` | namespace configuration |
+| `cache_adapter` + `cache_handle` | owner's cache adapter init |
+| `projection_adapter` + `projection_handle` | owner's projection open |
+| `overlay` | owner's `bondy_oplog_db_overlay:new/0` |
+| `fold_module` | namespace's fold strategy |
+
+The table is a single `public set` ETS. Reads go directly to ETS
+(`lookup/3` is the hot path; no roundtrip). `register/4` and
+`unregister/3` are `gen_server:call/2` so the server can monitor the
+registering process and tear the row down if the owner dies. The hot
+read path remains lock-free.
+
+## Restart semantics
+
+The table is borrowed from `bondy_connect_table_manager`, its heir, so it and
+its rows outlive a crash of this process: the atomics and handles the
+owners and appliers hold stay the ones the rows point to. A restarted
+registry claims the table back and monitors the owner recorded in every
+row, so an owner that died meanwhile has its row deleted as if it had
+died under the old process (`bondy_db_bookie_restart_test`).
+
+## Owner DOWN cleanup
+
+When an owner dies, the registry deletes the ETS row and removes the
+monitor. It does **not** call `close/1` on the cache, projection, or
+overlay adapters — those handles were created by (and may be tied to
+the lifecycle of) the owner process. For ETS-based adapters this is
+correct: ETS reclaims tables owned by the dead process. Adapters that
+own external resources (file handles, sub-processes, connection
+pools) MUST set up their own owner-monitoring inside the adapter — the
+substrate guarantees registry-row cleanup only.
+
+## Why a separate registry from `bondy_oplog_registry`
+
+`bondy_oplog_registry` is per-instance (effectively per-namespace —
+the existing substrate uses `instance_id` as the namespace). The
+read API needs a richer key: `(namespace, index, shard)` —
+indexes (primary and secondaries) are a new dimension not present in
+`bondy_oplog_instance`. Keeping the registries separate avoids
+retrofitting `bondy_oplog_registry`'s record with index/shard fields
+that would be `undefined` for the 99% of consumers that have not opted
+into the read-side projection.
+
+## Why ETS, not persistent_term
+
+`persistent_term:put/2` triggers a global GC scan on every process on
+the node. With many shards doing many config refreshes (e.g., a
+secondary's lag bound changing), that's a non-starter. ETS `insert` is
+constant-time, no global side effects, and `read_concurrency: true`
+keeps reads parallel.
+""".
+
+-define(TABLE, bondy_oplog_core_registry_tab).
+
+%% "Infinitely stale" freshness sentinel. Chosen so that on a node whose
+%% `monotonic_time(millisecond)` offset is large and negative,
+%% `Now - sentinel` is always a huge positive number — an un-bumped (or
+%% deliberately invalidated) shard fails any finite `max_lag` check.
+%% `-(1 bsl 62)` leaves headroom above the signed-int64 floor so the
+%% subtraction never wraps.
+-define(STALE_SENTINEL, -(1 bsl 62)).
+
+%% The reserved `Index` value of a primary shard's registry key
+%% (`{NS, primary, Shard}`); secondary-index shards key on the index name.
+%% Mirrors `bondy_oplog_instance:?PRIMARY_INDEX` / `bondy_db:?INDEX`.
+-define(PRIMARY_INDEX, primary).
+
+%% Atomics slot layout for an index shard's `inflight_ref` (back-pressure).
+%% Slot 1 counts ops dispatched to the secondary writer but not yet flushed
+%% (the unbounded-mailbox bound); slot 2 counts the marks for rebuild since
+%% the last completed rebuild (`needs_rebuild` is a non-zero count), so a
+%% rebuild can tell whether a mark arrived while it ran.
+-define(INFLIGHT_SLOT, 1).
+-define(NEEDS_REBUILD_SLOT, 2).
+
+%% Atomics slot layout for a primary shard's `version_ref`. Slot 1 is the
+%% index version counter; slot 2 the highest version whose ops the shard has
+%% dispatched to the writers or dropped. Slot 1 starts at the seed, slot 2 at
+%% the version the shard's intents are cleared up to; starting slot 2 at the
+%% seed lets a compaction clear intents the open has not yet replayed
+%% (`proofs/quint/configs/IndexIntents/OpenSeed.qnt`).
+-define(VERSION_SLOT, 1).
+-define(DISPATCHED_SLOT, 2).
+%% Intents read per range scan when the registry folds a shard's intents.
+-define(INTENT_PAGE, 1000).
+
+%% The index cell format a trust marker certifies: cells ordered by the
+%% primary shard's index version. A marker without it reads as absent, so a
+%% shard built in any other format is rebuilt on open.
+-define(INDEX_FORMAT, <<"version">>).
+
+-record(entry, {
+    key :: shard_key(),
+    shard_count :: pos_integer(),
+    cache_adapter :: module(),
+    cache_handle :: term(),
+    projection_adapter :: module(),
+    projection_handle :: term(),
+    overlay :: disabled | bondy_oplog_db_overlay:tid(),
+    fold_module :: atom() | undefined,
+    %% Per-shard freshness counter, written by the applier on each
+    %% projection commit (or by anti-entropy on each successful round).
+    %% Stored as `monotonic_time(millisecond)`; read wait-free by
+    %% `ensure_fresh/2`.
+    ae_atomics :: atomics:atomics_ref(),
+    %% Primary shards only. Per-shard high-water HLC mark
+    %% (`bondy_oplog_high_water`). Tracks the highest HLC of any
+    %% `cell_apply` event the applier has materialised into the
+    %% shard's projection. Allocated here so it can be shared between
+    %% the applier (writer) and read-only consumers
+    %% (catalogue-freshness reporting, bootstrap finalisation) without
+    %% threading through the applier's process state.
+    high_water_ref :: bondy_oplog_high_water:ref() | undefined,
+    %% Per-namespace policy. `ap` (default) places no constraint on reads;
+    %% `cp` rejects `eventual`-consistency batch reads to prevent unfenced
+    %% staleness. Owners pass this on `register/4`; the substrate trusts the
+    %% value to be consistent across shards of the same namespace (consumer
+    %% responsibility).
+    consistency_class :: ap | cp,
+    %% Secondary-index writer pid for this `(NS, IndexName, SecShard)`
+    %% triple. `undefined` for primary shards and for index shards whose
+    %% `bondy_oplog_secondary_writer` has not yet stamped itself (a brief
+    %% startup window). The primary applier reads it via
+    %% `entry_writer_pid/1` to dispatch index updates after a successful
+    %% projection write. Set out-of-band via `set_writer_pid/4` (a
+    %% single-field `ets:update_element`, no monitor change) — the
+    %% projection-handle owner, not the writer, owns the registry monitor.
+    writer_pid = undefined :: pid() | undefined,
+    %% Per-index-shard back-pressure atomics. `undefined` for primary shards.
+    %% Two slots: in-flight op count (slot `?INFLIGHT_SLOT`) and the count
+    %% of marks for rebuild (slot `?NEEDS_REBUILD_SLOT`). The primary applier
+    %% reads slot 1 at dispatch to decide whether to drop a saturating batch;
+    %% the secondary writer decrements it on flush. Slot 2 gates
+    %% `index_get`/`index_range` freshness so reads refuse from a saturation
+    %% drop until a rebuild clears it. Allocated by the facade on index-shard
+    %% registration.
+    inflight_ref = undefined :: atomics:atomics_ref() | undefined,
+    %% Primary shard's oplog `instance_id` (`bondy_oplog`), recorded so a
+    %% secondary-index rebuild can discover the primary appliers for a
+    %% namespace from the registry alone (no table handle), re-fold each
+    %% one's MST, and re-dispatch the index ops. `undefined` for secondary
+    %% (index) shards, which have no oplog instance.
+    instance_id = undefined :: binary() | undefined,
+    %% Optional native operation-based CRDT module
+    %% (`bondy_oplog_crdt`) for this table's cell projection. When set,
+    %% the applier's cell kernel routes through `interpret_cog`/`apply_op`
+    %% instead of the `fold_module`. `undefined` (default) keeps the legacy
+    %% fold path, so the selector is reversible per table. Appended last so
+    %% existing `#entry`-index `ets:update_element` writes stay valid.
+    crdt_module = undefined :: module() | undefined,
+    %% The CRDT module's declared causal tier (`bondy_oplog_crdt:tier()`),
+    %% read from `crdt_module:causal_tier()` at table open. `tier_0`
+    %% (default) = scalar HLC only; `tier_2` = the applier stamps a
+    %% per-cell causal context (DVV) into the event `meta` for this
+    %% table's writes. Appended last so existing `#entry`-index
+    %% `ets:update_element` writes stay valid.
+    causal_tier = tier_0 :: bondy_oplog_crdt:tier(),
+    %% Index shards only. The `bondy_oplog_projection_adapter:clear_scope()` the
+    %% rebuild passes to `Adapter:clear/2` when wiping this shard before a
+    %% re-fold. The owner (`bondy_db`) computes it from the topology's keyspace
+    %% layout: `{entity, ET, IndexName}` on a backend that co-locates several
+    %% tables in one Bookie (`shared_shards`, `single_bookie`), so a sibling
+    %% table sharing the same `IndexName` is not over-wiped; `{suffix, _}` on a
+    %% single-table handle. `undefined` for primary shards, and
+    %% `reset_target_shard/1` then falls back to the bare-suffix scope.
+    index_clear_scope = undefined ::
+        bondy_oplog_projection_adapter:clear_scope() | undefined,
+    %% Primary shards only. The `cell_keys_scope()` the secondary-index
+    %% rebuild passes to `Adapter:cell_keys/2` to enumerate this primary's
+    %% complete cell directory from the durable projection. The owner
+    %% (`bondy_db`) computes it from the topology's keyspace layout:
+    %% `{entity, EntityType}` on a backend whose primary bucket carries the
+    %% entity type (`shared_shards`, `single_bookie`); `all_primary` on a
+    %% realm-keyed dedicated Bookie (`per_entity`). `undefined` for index
+    %% shards, whose rebuild then walks the MST instead.
+    primary_cell_scope = undefined ::
+        bondy_oplog_projection_adapter:cell_keys_scope() | undefined,
+    %% Primary shards only. The per-table routing config the multiplexer needs
+    %% to rebuild a cell-apply ctx from the registry alone, so a `one_for_all`
+    %% instance-subtree restart can self-heal its `cell_apply_source` for every
+    %% table on the shard; runtime `register_table/4` adds would otherwise be
+    %% lost. `cell_apply_bucket` is the entity-type Bucket this table's events
+    %% carry, the multiplexer's directory key: set only for a `per_shard`
+    %% (collapsed) instance, where it is realm-independent
+    %% (`atom_to_binary(ET)`); `undefined` for a `per_table_shard` instance.
+    cell_apply_bucket = undefined :: binary() | undefined,
+    %% `publish_ns`: the namespace remote-merge events publish under
+    %% (`publish => true` tables), or `undefined`. Authoritative here so a
+    %% restart-rebuilt ctx keeps emitting; `undefined` falls back to the opts.
+    %% Appended last.
+    publish_ns = undefined :: atom() | undefined,
+    %% `secondary_indexes`: the index descriptors the applier dispatches index
+    %% ops against. Authoritative here so a restart-rebuilt ctx keeps indexing;
+    %% `undefined` (NOT `[]`) means "unset — fall back to the opts" (a raw,
+    %% non-`bondy_db` registration), while `[]` means "no indexes". Appended last.
+    secondary_indexes = undefined :: [map()] | undefined,
+    %% Index shards only. The grouping key of the `bondy_oplog_secondary_writer`
+    %% that drives this index shard, the secondary-side twin of `instance_id`.
+    %% One writer serves every index shard sharing a `writer_key`, demuxing the
+    %% dispatched ops back to each `(NS, IndexName, SecShard)` stream. The owner
+    %% (`bondy_db`) sets its granularity from the topology's instance strategy:
+    %% `DbName/idx/SecShard` on `per_shard`, `NS/IndexName/idx/SecShard` on
+    %% `per_table_shard`. `undefined` for primary shards and raw registrations;
+    %% the basis for refcounted writer teardown and self-healing.
+    writer_key = undefined :: binary() | undefined,
+    %% Optional per-table construction config for a `crdt_module` that needs
+    %% more than an event to build its bottom state (e.g.
+    %% `bondy_oplog_crdt_struct`'s schema) — passed to
+    %% `bondy_oplog_cell_kernel:init/2` instead of the plain `init/1` at
+    %% cold-start. `#{}` (default) for every CRDT whose `init/0` needs
+    %% nothing. Appended last so existing `#entry`-index `ets:update_element`
+    %% writes stay valid.
+    crdt_opts = #{} :: map(),
+    %% The process whose exit deletes this row: `register/4`'s `owner`.
+    owner :: pid() | undefined,
+    %% Index shards only. The `coalesce_ms` its index spec asked for, or
+    %% `undefined` for the writer default.
+    coalesce_ms :: non_neg_integer() | undefined,
+    %% Primary shards only. The counter whose next value every index op
+    %% derived from this shard carries as its order (`entry_version_ref/1`),
+    %% and the highest version dispatched (`index_dispatched_version/1`).
+    %% Allocated here, set to the config's `index_version` and
+    %% `index_dispatched` before the row is visible, so it outlives an applier
+    %% restart and no op draws below it.
+    version_ref = undefined :: atomics:atomics_ref() | undefined
+}).
+
+-record(state, {
+    mon_to_key = #{} :: #{reference() := shard_key()},
+    key_to_mon = #{} :: #{shard_key() := reference()},
+    %% Fresh `make_ref()` per gen_server start. Exposed via
+    %% `current_epoch/0` and broadcast on `bondy_oplog_core_events`
+    %% under topic `bondy_oplog_core_registry_started`. Owners cache the
+    %% epoch and treat a change as "registry was restarted; re-register".
+    epoch :: reference()
+}).
+
+-type shard_key() :: {atom(), atom(), non_neg_integer()}.
+-type shard_entry() :: #entry{}.
+-type config() :: #{
+    shard_count := pos_integer(),
+    cache_adapter := module(),
+    cache_handle := term(),
+    projection_adapter := module(),
+    projection_handle := term(),
+    fold_module := atom() | undefined,
+    %% Optional. Native operation-based CRDT module for the cell
+    %% projection; when present it takes precedence over `fold_module`.
+    crdt_module => module(),
+    %% Optional. Per-table construction config for `crdt_module`, passed to
+    %% `bondy_oplog_cell_kernel:init/2` at cold-start (see `#entry.crdt_opts`).
+    %% `#{}` (default) for every CRDT whose `init/0` needs nothing.
+    crdt_opts => map(),
+    %% Optional. The `crdt_module`'s declared `causal_tier()`. Defaults
+    %% to `tier_0` (scalar HLC). `tier_2` provisions the per-cell DVV
+    %% causal-context stamp for this table's writes.
+    causal_tier => bondy_oplog_crdt:tier(),
+    %% Required. Pass `disabled` to opt out of overlay-merge on the read
+    %% path (the facade does this — `apply/4`'s `await_apply` step
+    %% provides read-your-writes without an overlay). Pass a `tid()`
+    %% when overlay-merge is desired.
+    overlay := disabled | bondy_oplog_db_overlay:tid(),
+    %% Optional. If absent, the registry allocates a single-counter
+    %% atomics ref on register. Owners that want shared accounting
+    %% (e.g., across a hot/cold reload) can pass their own ref.
+    ae_atomics => atomics:atomics_ref(),
+    %% Optional. Pid the registry will monitor; when this process exits
+    %% the registration is torn down automatically. Defaults to the
+    %% calling process.
+    owner => pid(),
+    %% Optional. Per-namespace consistency policy. Defaults to `ap`. See
+    %% `read_batch/2` for the enforcement rule.
+    consistency_class => ap | cp,
+    %% Optional. Per-index-shard back-pressure atomics. Allocated by the
+    %% facade for index shards (`atomics:new(2, [{signed, true}])`); absent
+    %% for primary shards.
+    inflight_atomics => atomics:atomics_ref(),
+    %% Optional. The owning oplog `instance_id` for a primary shard, so a
+    %% rebuild can find the primary applier. Absent for index shards.
+    instance_id => binary(),
+    %% Optional. Index shards only. The
+    %% `bondy_oplog_projection_adapter:clear_scope()` the rebuild passes to
+    %% `Adapter:clear/2`. Absent ⇒ `reset_target_shard/1` falls back to the
+    %% bare-suffix scope.
+    index_clear_scope => bondy_oplog_projection_adapter:clear_scope(),
+    %% Optional. Primary shards only. The
+    %% `bondy_oplog_projection_adapter:cell_keys_scope()` the rebuild passes to
+    %% `Adapter:cell_keys/2` to enumerate this primary's cells. Absent ⇒ the
+    %% rebuild falls back to the MST walk.
+    primary_cell_scope => bondy_oplog_projection_adapter:cell_keys_scope(),
+    %% Optional. Index shards only. See `#entry.writer_key`.
+    writer_key => binary(),
+    %% Optional. Index shards only. See `#entry.coalesce_ms`.
+    coalesce_ms => non_neg_integer(),
+    %% Optional. Primary shards only. The value the shard's index version
+    %% counter starts at (`index_version_recorded/3`). Defaults to `0`.
+    index_version => non_neg_integer(),
+    %% Optional. Primary shards only. The value the shard's dispatched version
+    %% starts at (`index_dispatched_version/1`): the version its intents are
+    %% cleared up to (`index_intents_leftover/4`). Defaults to `0`.
+    index_dispatched => non_neg_integer()
+}.
+
+-export_type([shard_entry/0, config/0]).
+
+-export([child_spec/0]).
+-export([start_link/0]).
+
+-export([register/4]).
+-export([unregister/3]).
+-export([set_writer_pid/4]).
+-export([lookup/3]).
+-export([shard_count/2]).
+-export([list/0]).
+
+%% Diagnostic / invariant-checking helper.
+-export([snapshot_for_invariants/0]).
+
+%% Freshness.
+-export([bump_ae/3]).
+-export([bump_ae/4]).
+-export([high_water_hlc/3]).
+-export([bump_ae_targets/2]).
+-export([last_ae_at/3]).
+-export([ever_freshened/3]).
+-export([shards_for/1]).
+-export([primary_shards_for/1]).
+-export([instance_id_in_use/1]).
+-export([primary_entries_for_instance/1]).
+-export([primary_entries/1]).
+-export([instance_ae_targets/2]).
+-export([writer_key_in_use/1]).
+-export([index_entries_for_writer/1]).
+-export([index_writers/0]).
+-export([namespaces/0]).
+
+%% Field accessors (so callers do not need the header).
+-export([entry_key/1]).
+-export([entry_cache_adapter/1]).
+-export([entry_cache_handle/1]).
+-export([entry_projection_adapter/1]).
+-export([entry_projection_handle/1]).
+-export([entry_overlay/1]).
+-export([entry_fold_module/1]).
+-export([entry_shard_count/1]).
+-export([entry_ae_atomics/1]).
+-export([entry_high_water_ref/1]).
+-export([entry_consistency_class/1]).
+-export([entry_writer_pid/1]).
+-export([entry_instance_id/1]).
+-export([entry_crdt_module/1]).
+-export([entry_crdt_opts/1]).
+-export([entry_causal_tier/1]).
+-export([entry_index_clear_scope/1]).
+-export([entry_primary_cell_scope/1]).
+-export([entry_cell_apply_bucket/1]).
+-export([entry_publish_ns/1]).
+-export([entry_secondary_indexes/1]).
+-export([entry_writer_key/1]).
+-export([entry_coalesce_ms/1]).
+-export([entry_version_ref/1]).
+-export([entry_last_ae/1]).
+-export([entry_ever_freshened/1]).
+
+%% Index-shard back-pressure helpers. Operate on the entry's `inflight_ref`;
+%% all are wait-free and a strict no-op (or `false`) when the ref is
+%% `undefined` (a primary shard).
+-export([index_inflight_add/2]).
+-export([index_inflight_sub/2]).
+-export([index_inflight/1]).
+-export([index_inflight_reset/1]).
+-export([index_mark_rebuild/1]).
+-export([index_untrust/1]).
+-export([index_rebuild_marks/1]).
+-export([index_clear_rebuild/2]).
+-export([index_needs_rebuild/1]).
+-export([index_load_rebuild_marker/1]).
+-export([index_version_recorded/3]).
+-export([index_recorded_version/2]).
+-export([index_version_cell/3]).
+-export([index_version_next/1]).
+-export([index_version_dispatched/2]).
+-export([index_dispatched_version/1]).
+-export([index_intent_cell/4]).
+-export([index_intents_leftover/4]).
+-export([index_clear_intents/2]).
+-export([index_intents_cleared/1]).
+-export([reset_stale_ae/1]).
+
+%% Namespace-level consistency_class lookup.
+-export([consistency_class/1]).
+
+-export([
+    init/1,
+    handle_call/3,
+    handle_cast/2,
+    handle_info/2,
+    terminate/2,
+    code_change/3
+]).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+child_spec() ->
+    #{
+        id => ?MODULE,
+        start => {?MODULE, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [?MODULE]
+    }.
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+-spec register(
+    Namespace :: atom(),
+    Index :: atom(),
+    Shard :: non_neg_integer(),
+    Config :: config()
+) -> ok | {error, {missing_required_field, atom()}}.
+
+register(NS, Index, Shard, Config) when
+    is_atom(NS),
+    is_atom(Index),
+    is_integer(Shard),
+    Shard >= 0,
+    is_map(Config)
+->
+    %% Validate required keys here, before the gen_server call. A bad
+    %% config crashing inside the gen_server would wipe the monitor
+    %% bookkeeping for every other registration on the node — a
+    %% single misconfigured call is not allowed to take the substrate
+    %% down with it.
+    case validate_config(Config) of
+        ok ->
+            Owner = maps:get(owner, Config, self()),
+            gen_server:call(
+                ?MODULE, {register, NS, Index, Shard, Owner, Config}
+            );
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec unregister(atom(), atom(), non_neg_integer()) -> ok.
+
+unregister(NS, Index, Shard) ->
+    gen_server:call(?MODULE, {unregister, {NS, Index, Shard}}).
+
+-doc """
+Stamp the secondary-index writer pid onto an already-registered
+`(NS, IndexName, SecShard)` row. A single-field `ets:update_element/3`:
+lock-free, no monitor change (the registry monitor stays bound to the
+projection-handle owner from `register/4` — the writer is a client, not
+the owner, of that row). Returns `not_found` when no row exists for the
+triple (e.g. the index shard was torn down). Called by
+`bondy_oplog_secondary_writer` at init.
+""".
+-spec set_writer_pid(atom(), atom(), non_neg_integer(), pid()) ->
+    ok | not_found.
+
+set_writer_pid(NS, Index, Shard, Pid) when
+    is_atom(NS), is_atom(Index), is_integer(Shard), Shard >= 0, is_pid(Pid)
+->
+    case
+        ets:update_element(
+            ?TABLE, {NS, Index, Shard}, {#entry.writer_pid, Pid}
+        )
+    of
+        true -> ok;
+        false -> not_found
+    end.
+
+-doc """
+Atomic snapshot of `(ETS entries, mon_to_key, key_to_mon)` for
+invariant-checking callers. Runs inside the gen_server so the ETS
+read and the in-memory maps come from the same instant — an outside
+observer combining `sys:get_state/1` with `lookup/3` would race against
+DOWN handlers and unregister calls. Intended for tests and operator
+diagnostics; ordinary callers should use `lookup/3`.
+""".
+-spec snapshot_for_invariants() ->
+    #{
+        entries := [shard_entry()],
+        mon_to_key := #{reference() := shard_key()},
+        key_to_mon := #{shard_key() := reference()}
+    }.
+
+snapshot_for_invariants() ->
+    gen_server:call(?MODULE, snapshot_for_invariants).
+
+-spec lookup(atom(), atom(), non_neg_integer()) ->
+    {ok, shard_entry()} | not_found.
+
+lookup(NS, Index, Shard) ->
+    case ets:lookup(?TABLE, {NS, Index, Shard}) of
+        [#entry{} = E] -> {ok, E};
+        [] -> not_found
+    end.
+
+-spec shard_count(atom(), atom()) -> {ok, pos_integer()} | not_found.
+
+shard_count(NS, Index) ->
+    MS = [
+        {
+            #entry{
+                key = {NS, Index, '_'},
+                shard_count = '$1',
+                _ = '_'
+            },
+            [],
+            ['$1']
+        }
+    ],
+    case ets:select(?TABLE, MS, 1) of
+        {[Count], _} -> {ok, Count};
+        '$end_of_table' -> not_found
+    end.
+
+-spec list() -> [shard_entry()].
+
+list() ->
+    ets:select(?TABLE, [{'_', [], ['$_']}]).
+
+-doc """
+Record on the shard's atomics counter that the shard has just had a
+fresh round of applier activity (or anti-entropy convergence). Wait-free.
+
+Uses `erlang:monotonic_time(millisecond)` as the bump timestamp. For
+applier loops that bump several shards in one logical step and want
+to reuse the same "now" across them, see `bump_ae/4`.
+""".
+-spec bump_ae(atom(), atom(), non_neg_integer()) -> ok | not_found.
+
+bump_ae(NS, Index, Shard) ->
+    bump_ae(NS, Index, Shard, erlang:monotonic_time(millisecond)).
+
+-doc """
+Like `bump_ae/3` but caller supplies the monotonic millisecond
+timestamp so the same "now" can be reused across a batch of shards.
+""".
+-spec bump_ae(atom(), atom(), non_neg_integer(), integer()) ->
+    ok | not_found.
+
+bump_ae(NS, Index, Shard, Now) when is_integer(Now) ->
+    case lookup(NS, Index, Shard) of
+        {ok, #entry{ae_atomics = Ref}} ->
+            atomics:put(Ref, 1, Now),
+            ok;
+        not_found ->
+            not_found
+    end.
+
+-doc """
+Read the per-shard high-water HLC mark
+(`bondy_oplog_high_water`).
+
+Returns `{ok, Hlc}` when at least one `cell_apply` event has been
+materialised into the shard's projection since the shard's last
+registration (or `finalize_catalogue_bootstrap/4` call), `{ok,
+no_watermark}` otherwise, and `not_found` when no primary shard is
+registered under the given key.
+
+The watermark is *not* durable across instance restarts — see
+`bondy_oplog_high_water` module docs.
+""".
+-spec high_water_hlc(atom(), atom(), non_neg_integer()) ->
+    {ok, non_neg_integer()} | {ok, no_watermark} | not_found.
+
+high_water_hlc(NS, Index, Shard) ->
+    case lookup(NS, Index, Shard) of
+        {ok, #entry{high_water_ref = Ref}} when Ref =/= undefined ->
+            bondy_oplog_high_water:read(Ref);
+        _ ->
+            not_found
+    end.
+
+-doc """
+Bump every shard in `Targets` to the monotonic millisecond time `Now`, so the
+shards of one anti-entropy round observe the same "now". Returns
+`{Bumped, NotFound}` counts for telemetry; an empty list returns `{0, 0}`.
+""".
+-spec bump_ae_targets([shard_key()], integer()) ->
+    {non_neg_integer(), non_neg_integer()}.
+
+bump_ae_targets([], _Now) ->
+    {0, 0};
+bump_ae_targets(Targets, Now) when is_list(Targets), is_integer(Now) ->
+    lists:foldl(
+        fun({NS, Index, Shard}, {B, NF}) ->
+            case bump_ae(NS, Index, Shard, Now) of
+                ok -> {B + 1, NF};
+                not_found -> {B, NF + 1}
+            end
+        end,
+        {0, 0},
+        Targets
+    ).
+
+-doc """
+Return the monotonic millisecond timestamp of the shard's last AE bump.
+Wait-free.
+
+A shard that has never been bumped reads `-(1 bsl 62)` (an
+"infinitely stale" sentinel chosen so `Now - sentinel` is a very large
+positive number regardless of the node's `monotonic_time` offset).
+The sentinel ensures un-bumped shards reliably fail any finite
+`max_lag` check until the applier or AE has driven the counter
+forward at least once.
+""".
+-spec last_ae_at(atom(), atom(), non_neg_integer()) ->
+    integer() | not_found.
+
+last_ae_at(NS, Index, Shard) ->
+    case lookup(NS, Index, Shard) of
+        {ok, #entry{ae_atomics = Ref}} ->
+            atomics:get(Ref, 1);
+        not_found ->
+            not_found
+    end.
+
+-doc """
+Whether the shard has ever been freshened (AE bumped past the
+"infinitely stale" sentinel). Used by a restarting secondary writer to
+tell a crash-restart of a previously-populated shard (rebuild to recover
+the lost buffer) from a first-ever start, which has no trust marker and
+is rebuilt when its table opens. `false` for an unknown or never-bumped
+shard.
+""".
+-spec ever_freshened(atom(), atom(), non_neg_integer()) -> boolean().
+
+ever_freshened(NS, Index, Shard) ->
+    case last_ae_at(NS, Index, Shard) of
+        not_found -> false;
+        ?STALE_SENTINEL -> false;
+        _ -> true
+    end.
+
+-doc """
+Return all entries registered for the namespace. Used by callers that
+need the atomics ref directly to avoid the second `lookup/3`.
+""".
+-spec shards_for(atom()) -> [shard_entry()].
+
+shards_for(NS) when is_atom(NS) ->
+    MS = [
+        {
+            #entry{
+                key = {NS, '_', '_'},
+                _ = '_'
+            },
+            [],
+            ['$_']
+        }
+    ],
+    ets:select(?TABLE, MS).
+
+-doc """
+List of all distinct namespaces registered. Used by callers that want
+to apply a freshness check over "every namespace this node knows about"
+without spelling them out.
+""".
+-spec namespaces() -> [atom()].
+
+namespaces() ->
+    MS = [
+        {
+            #entry{
+                key = {'$1', '_', '_'},
+                _ = '_'
+            },
+            [],
+            ['$1']
+        }
+    ],
+    lists:usort(ets:select(?TABLE, MS)).
+
+-doc """
+Like `shards_for/1` but only the namespace's PRIMARY shards
+(`{NS, primary, _}`), excluding secondary-index shards.
+
+The auth freshness fence (`ensure_fresh/2`) reads primary-projection
+cells (user / grant), so it gates on primary freshness only; index-read
+staleness is governed separately by the `index_get` `max_lag` path.
+""".
+-spec primary_shards_for(atom()) -> [shard_entry()].
+
+primary_shards_for(NS) when is_atom(NS) ->
+    MS = [
+        {
+            #entry{
+                key = {NS, ?PRIMARY_INDEX, '_'},
+                _ = '_'
+            },
+            [],
+            ['$_']
+        }
+    ],
+    ets:select(?TABLE, MS).
+
+-doc """
+True when any registered primary shard entry still names `InstanceId` as its
+oplog instance.
+
+Backs the facade's refcounted teardown of a shard instance shared by several
+tables (one-log-per-shard): the shared instance is stopped only once the last
+table's registry entry has been unregistered, exactly as a shared Bookie stays
+up until the DB shuts down. Secondary (index) shards carry no `instance_id`, so
+they never count.
+""".
+-spec instance_id_in_use(InstanceId :: binary()) -> boolean().
+
+instance_id_in_use(InstanceId) when is_binary(InstanceId) ->
+    MS = [
+        {
+            #entry{instance_id = InstanceId, _ = '_'},
+            [],
+            [true]
+        }
+    ],
+    case ets:select(?TABLE, MS, 1) of
+        '$end_of_table' -> false;
+        {[true], _Cont} -> true
+    end.
+
+-doc "Every primary shard entry of namespace `NS`.".
+-spec primary_entries(NS :: atom()) -> [shard_entry()].
+
+primary_entries(NS) when is_atom(NS) ->
+    MS = [
+        {
+            #entry{key = {NS, ?PRIMARY_INDEX, '_'}, _ = '_'},
+            [],
+            ['$_']
+        }
+    ],
+    ets:select(?TABLE, MS).
+
+-doc """
+Every primary shard entry whose oplog `instance_id` is `InstanceId`.
+
+The durable basis for self-healing the per-shard multiplexer: an instance shared
+by several tables rebuilds its `cell_apply_source` from these entries on
+applier/fused init, so a `one_for_all` subtree restart restores routing for
+every table on the shard (not just the founding one) without re-running
+provisioning. On a fresh start only the founding entry exists; on a restart all
+of the shard's tables' entries do.
+""".
+-spec primary_entries_for_instance(InstanceId :: binary()) ->
+    [shard_entry()].
+
+primary_entries_for_instance(InstanceId) when is_binary(InstanceId) ->
+    MS = [
+        {
+            #entry{instance_id = InstanceId, _ = '_'},
+            [],
+            ['$_']
+        }
+    ],
+    ets:select(?TABLE, MS).
+
+-doc """
+The anti-entropy freshness targets of `InstanceId`: `Base` plus the key of
+every primary entry registered against it (see
+`primary_entries_for_instance/1`). Read at every start, so a restarted
+instance keeps the targets its sibling tables added with `register_table`
+(`bondy_db_bookie_restart_test`).
+""".
+-spec instance_ae_targets(InstanceId :: binary(), Base :: [shard_key()]) ->
+    [shard_key()].
+
+instance_ae_targets(InstanceId, Base) when
+    is_binary(InstanceId), is_list(Base)
+->
+    MS = [{#entry{instance_id = InstanceId, key = '$1', _ = '_'}, [], ['$1']}],
+    lists:usort(Base ++ ets:select(?TABLE, MS)).
+
+-doc """
+Whether any index shard entry still references the `bondy_oplog_secondary_writer`
+grouping key `WriterKey`.
+
+The secondary-side twin of `instance_id_in_use/1`: backs the facade's refcounted
+teardown of a writer shared by several index shards (one-writer-per-secondary-
+shard), so the shared writer is stopped only once the last index shard's registry
+entry has been unregistered. Primary shards carry no `writer_key`, so they never
+count.
+""".
+-spec writer_key_in_use(WriterKey :: binary()) -> boolean().
+
+writer_key_in_use(WriterKey) when is_binary(WriterKey) ->
+    MS = [
+        {
+            #entry{writer_key = WriterKey, _ = '_'},
+            [],
+            [true]
+        }
+    ],
+    case ets:select(?TABLE, MS, 1) of
+        '$end_of_table' -> false;
+        {[true], _Cont} -> true
+    end.
+
+-doc """
+Every index shard entry whose `bondy_oplog_secondary_writer` grouping key is
+`WriterKey`.
+
+The secondary-side twin of `primary_entries_for_instance/1`: the durable basis
+for a shared writer's crash self-healing. A writer that serves several index
+shards re-stamps its pid onto every one of these entries (and re-checks each
+for a pending rebuild) on init, so a writer crash restores dispatch for every
+stream on the shard — not just the founding one — without re-running
+provisioning.
+""".
+-spec index_entries_for_writer(WriterKey :: binary()) -> [shard_entry()].
+
+index_entries_for_writer(WriterKey) when is_binary(WriterKey) ->
+    MS = [
+        {
+            #entry{writer_key = WriterKey, _ = '_'},
+            [],
+            ['$_']
+        }
+    ],
+    ets:select(?TABLE, MS).
+
+-doc """
+`{WriterKey, SecShard}` for every writer the registered index shards need:
+the writers `bondy_oplog_secondary_sup` must run.
+""".
+-spec index_writers() -> [{binary(), non_neg_integer()}].
+
+index_writers() ->
+    MS = [
+        {
+            #entry{
+                key = {'_', '_', '$2'},
+                writer_key = '$1',
+                _ = '_'
+            },
+            [{is_binary, '$1'}],
+            [{{'$1', '$2'}}]
+        }
+    ],
+    lists:usort(ets:select(?TABLE, MS)).
+
+%% =============================================================================
+%% Accessors
+%% =============================================================================
+
+entry_key(#entry{key = V}) -> V.
+entry_cache_adapter(#entry{cache_adapter = V}) -> V.
+entry_cache_handle(#entry{cache_handle = V}) -> V.
+entry_projection_adapter(#entry{projection_adapter = V}) -> V.
+entry_projection_handle(#entry{projection_handle = V}) -> V.
+entry_overlay(#entry{overlay = V}) -> V.
+entry_fold_module(#entry{fold_module = V}) -> V.
+entry_shard_count(#entry{shard_count = V}) -> V.
+entry_ae_atomics(#entry{ae_atomics = V}) -> V.
+entry_high_water_ref(#entry{high_water_ref = V}) -> V.
+entry_consistency_class(#entry{consistency_class = V}) -> V.
+entry_writer_pid(#entry{writer_pid = V}) -> V.
+entry_instance_id(#entry{instance_id = V}) -> V.
+entry_crdt_module(#entry{crdt_module = V}) -> V.
+
+-doc """
+Per-table construction config for `crdt_module` (`#{}` default) — see
+`#entry.crdt_opts`.
+""".
+-spec entry_crdt_opts(shard_entry()) -> map().
+
+entry_crdt_opts(#entry{crdt_opts = V}) -> V.
+
+-doc "The shard's CRDT causal tier (`tier_0` default).".
+-spec entry_causal_tier(shard_entry()) -> bondy_oplog_crdt:tier().
+
+entry_causal_tier(#entry{causal_tier = V}) -> V.
+
+-doc """
+The index shard's `bondy_oplog_projection_adapter:clear_scope()` (the scope the
+rebuild passes to `Adapter:clear/2`), or `undefined` for a primary shard or a
+registration that predates the field.
+""".
+-spec entry_index_clear_scope(shard_entry()) ->
+    bondy_oplog_projection_adapter:clear_scope() | undefined.
+
+entry_index_clear_scope(#entry{index_clear_scope = V}) -> V.
+
+-doc """
+The primary shard's `bondy_oplog_projection_adapter:cell_keys_scope()` (the
+scope the secondary-index rebuild passes to `Adapter:cell_keys/2` to enumerate
+its complete cell directory), or `undefined` for an index shard or a
+registration that predates the field (the rebuild then falls back to the MST).
+""".
+-spec entry_primary_cell_scope(shard_entry()) ->
+    bondy_oplog_projection_adapter:cell_keys_scope() | undefined.
+
+entry_primary_cell_scope(#entry{primary_cell_scope = V}) -> V.
+
+%% The multiplexer routing bucket (entity-type tag) for a `per_shard` primary
+%% shard, or `undefined` for a `per_table_shard` shard / a registration that
+%% predates the field.
+entry_cell_apply_bucket(#entry{cell_apply_bucket = V}) -> V.
+
+%% The remote-merge publish namespace (`publish => true` tables), or `undefined`.
+entry_publish_ns(#entry{publish_ns = V}) -> V.
+
+%% The secondary-index descriptors, `undefined` when unset (fall back to opts),
+%% or `[]` for a table with no indexes.
+entry_secondary_indexes(#entry{secondary_indexes = V}) -> V.
+
+%% The index shard's `bondy_oplog_secondary_writer` grouping key (the
+%% secondary-side twin of `instance_id`), `undefined` for primary shards.
+entry_writer_key(#entry{writer_key = V}) -> V.
+entry_coalesce_ms(#entry{coalesce_ms = V}) -> V.
+entry_version_ref(#entry{version_ref = V}) -> V.
+
+%% Last AE-freshness timestamp (monotonic ms), read straight off the
+%% entry's atomics — the sentinel `?STALE_SENTINEL` for a never-freshened
+%% shard. Lets a caller that already holds the entry compute the lag
+%% without a second `lookup/3`.
+entry_last_ae(#entry{ae_atomics = Ref}) -> atomics:get(Ref, 1).
+
+%% Whether this shard has ever been freshened (AE bumped past the stale
+%% sentinel).
+entry_ever_freshened(#entry{ae_atomics = Ref}) ->
+    atomics:get(Ref, 1) =/= ?STALE_SENTINEL.
+
+%% =============================================================================
+%% Index-shard back-pressure
+%% =============================================================================
+
+-doc """
+Add `N` to the index shard's in-flight op counter and return the new
+value. Called by the primary applier when it accepts a batch for the
+secondary writer. A no-op returning `0` for a primary shard (no
+`inflight_ref`).
+""".
+-spec index_inflight_add(shard_entry(), non_neg_integer()) ->
+    non_neg_integer().
+
+index_inflight_add(#entry{inflight_ref = undefined}, _N) ->
+    0;
+index_inflight_add(#entry{inflight_ref = Ref}, N) when is_integer(N), N >= 0 ->
+    atomics:add_get(Ref, ?INFLIGHT_SLOT, N).
+
+-doc """
+Subtract `N` from the index shard's in-flight op counter, flooring at
+`0` (a flush can never legitimately drive it negative, but a concurrent
+reset must not leave it below zero). No-op for a primary shard.
+""".
+-spec index_inflight_sub(shard_entry(), non_neg_integer()) -> ok.
+
+index_inflight_sub(#entry{inflight_ref = undefined}, _N) ->
+    ok;
+index_inflight_sub(#entry{inflight_ref = Ref}, N) when is_integer(N), N >= 0 ->
+    case atomics:sub_get(Ref, ?INFLIGHT_SLOT, N) of
+        V when V < 0 -> atomics:put(Ref, ?INFLIGHT_SLOT, 0);
+        _ -> ok
+    end.
+
+-doc "Current in-flight op count for the index shard (`0` for a primary).".
+-spec index_inflight(shard_entry()) -> non_neg_integer().
+
+index_inflight(#entry{inflight_ref = undefined}) ->
+    0;
+index_inflight(#entry{inflight_ref = Ref}) ->
+    erlang:max(0, atomics:get(Ref, ?INFLIGHT_SLOT)).
+
+-doc """
+Reset the in-flight counter to `0`. Used by a rebuild before it re-folds
+the primary, since the rebuild also discards the writer's buffer — the
+counter and the buffer are reset together so they stay consistent.
+""".
+-spec index_inflight_reset(shard_entry()) -> ok.
+
+index_inflight_reset(#entry{inflight_ref = undefined}) ->
+    ok;
+index_inflight_reset(#entry{inflight_ref = Ref}) ->
+    atomics:put(Ref, ?INFLIGHT_SLOT, 0).
+
+-doc """
+Mark the index shard for rebuild (a saturation drop, a writer restart or a
+rebuild's own wipe). Each call counts one mark. While the count is non-zero,
+`index_get`/`index_range` treat the shard as stale regardless of its AE
+timestamp, so reads refuse (or fall back to the primary) until a rebuild
+clears it (`index_clear_rebuild/2`). No-op for a primary.
+""".
+-spec index_mark_rebuild(shard_entry()) -> ok.
+
+index_mark_rebuild(#entry{inflight_ref = undefined}) ->
+    ok;
+index_mark_rebuild(#entry{inflight_ref = Ref} = E) ->
+    %% The first mark removes the durable trust marker, best-effort: a lost
+    %% removal leaves the mark's ops in the primaries' intents, which the next
+    %% open replays (`proofs/quint/configs/IndexIntents/UnmarkLost.qnt`).
+    case atomics:add_get(Ref, ?NEEDS_REBUILD_SLOT, 1) of
+        1 -> remove_trust_marker(E);
+        _ -> ok
+    end.
+
+-doc """
+Delete the index shard's durable trust marker, so the next open rebuilds the
+shard. Unlike the removal by the first mark for rebuild, it raises when the
+delete fails. A rebuild calls it before its wipe, so no wipe sits behind a
+marker that a lost removal left on disk
+(`proofs/quint/configs/IndexIntents/UnmarkLost_2Shards.qnt`; without it,
+`proofs/quint/configs/IndexIntents/UnmarkLost_2Shards_NoRebuildUnmark.qnt`
+loses an index entry). No-op for a primary.
+""".
+-spec index_untrust(shard_entry()) -> ok.
+
+index_untrust(#entry{inflight_ref = undefined}) ->
+    ok;
+index_untrust(#entry{
+    key = {NS, IndexName, Shard},
+    projection_adapter = A,
+    projection_handle = H
+}) when A =/= undefined ->
+    {B, K} = bondy_oplog_index_key:trust_marker_loc(NS, IndexName, Shard),
+    ok = A:delete(H, B, K);
+index_untrust(_) ->
+    ok.
+
+-doc """
+The number of marks for rebuild since the last completed rebuild (`0` for a
+primary). A rebuild reads it once its wipe is done and passes it to
+`index_clear_rebuild/2`.
+""".
+-spec index_rebuild_marks(shard_entry()) -> non_neg_integer().
+
+index_rebuild_marks(#entry{inflight_ref = undefined}) ->
+    0;
+index_rebuild_marks(#entry{inflight_ref = Ref}) ->
+    atomics:get(Ref, ?NEEDS_REBUILD_SLOT).
+
+-doc """
+Write the durable trust marker and clear the marks, unless the shard was
+marked again after the rebuild read `Seen` (`index_rebuild_marks/1`). Returns
+`remarked` in that case, with the marker removed again and the marks kept,
+so the shard stays untrusted for the next rebuild.
+
+The marker is written before the marks are cleared: a mark that finds the
+count at zero removes it, and a mark made before the clear makes it return
+`remarked`, which removes it. A crash before a removal, or a lost removal,
+leaves the marker present, and the next open trusts the shard: the mark's ops
+are still in the primaries' index intents, which no clear removes while the
+shard is marked, and the open replays them
+(`proofs/quint/configs/IndexIntents/Dispatched_Remark.qnt`,
+`proofs/quint/configs/IndexIntents/UnmarkLost_Remark.qnt`).
+""".
+-spec index_clear_rebuild(shard_entry(), non_neg_integer()) -> ok | remarked.
+
+index_clear_rebuild(#entry{inflight_ref = undefined}, _Seen) ->
+    ok;
+index_clear_rebuild(#entry{inflight_ref = Ref} = E, Seen) ->
+    ok = persist_trust_marker(E),
+    case atomics:compare_exchange(Ref, ?NEEDS_REBUILD_SLOT, Seen, 0) of
+        ok ->
+            ok;
+        _ ->
+            ok = remove_trust_marker(E),
+            remarked
+    end.
+
+-doc "Whether the index shard has a mark for rebuild (`false` for a primary).".
+-spec index_needs_rebuild(shard_entry()) -> boolean().
+
+index_needs_rebuild(#entry{inflight_ref = undefined}) ->
+    false;
+index_needs_rebuild(#entry{inflight_ref = Ref}) ->
+    atomics:get(Ref, ?NEEDS_REBUILD_SLOT) =/= 0.
+
+-doc """
+Cold-start: read the index shard's durable **trust marker** and, when it is
+absent, count a mark for rebuild. A present marker leaves the count as it is,
+so a mark made while the marker was read is kept. Returns whether the shard
+needs a rebuild. Called by `bondy_db` at index-shard
+provisioning so that:
+
+- a shard with the trust marker (built + clean, kept complete by the flush
+  barrier) is trusted and only freshened — no O(table) re-derive;
+- a shard WITHOUT it (a newly-declared index, or one left incomplete by a
+  pre-restart drop) refuses reads and is rebuilt.
+
+Returns `false` (no rebuild) for a primary or an entry without `inflight_ref`.
+For an index entry an absent marker returns `true` (rebuild).
+""".
+-spec index_load_rebuild_marker(shard_entry()) -> boolean().
+
+index_load_rebuild_marker(#entry{inflight_ref = undefined}) ->
+    false;
+index_load_rebuild_marker(#entry{inflight_ref = Ref} = E) ->
+    case has_trust_marker(E) of
+        true ->
+            false;
+        false ->
+            _ = atomics:add_get(Ref, ?NEEDS_REBUILD_SLOT, 1),
+            true
+    end.
+
+-doc """
+Reset the shard's AE freshness counter to the "infinitely stale"
+sentinel, so any finite `max_lag` read refuses until the shard is
+freshened again. Used by a saturation drop. No-op when the entry has
+no AE atomics.
+""".
+-spec reset_stale_ae(shard_entry()) -> ok.
+
+reset_stale_ae(#entry{ae_atomics = undefined}) ->
+    ok;
+reset_stale_ae(#entry{ae_atomics = Ref}) ->
+    atomics:put(Ref, 1, ?STALE_SENTINEL).
+
+-doc """
+Return the consistency class declared for the namespace. Reads it from
+any registered shard of the namespace (the substrate trusts the value
+to be consistent across shards — see `register/4`). Returns `ap` for an
+unknown namespace, matching the default.
+""".
+-spec consistency_class(atom()) -> ap | cp.
+
+consistency_class(NS) when is_atom(NS) ->
+    MS = [
+        {
+            #entry{
+                key = {NS, '_', '_'},
+                consistency_class = '$1',
+                _ = '_'
+            },
+            [],
+            ['$1']
+        }
+    ],
+    case ets:select(?TABLE, MS, 1) of
+        {[Class], _} -> Class;
+        '$end_of_table' -> ap
+    end.
+
+%% =============================================================================
+%% PRIVATE: durable index trust marker
+%% =============================================================================
+
+%% @private
+%% The durable twin of the in-memory `needs_rebuild` atomic, with inverted
+%% ("trusted") semantics: presence = built + clean, absence = rebuild. A marker
+%% naming another index cell format counts as absent. Stored as a reserved cell
+%% in the index shard's own projection at
+%% `bondy_oplog_index_key:trust_marker_loc/3` (bucket `<<"$idx_trusted">>`,
+%% outside the index keyspace, so `clear/2` and range scans never see it). A
+%% `put_batch` error goes to the caller; a raise (dead handle) propagates.
+persist_trust_marker(#entry{
+    key = {NS, IndexName, Shard},
+    projection_adapter = A,
+    projection_handle = H
+}) when A =/= undefined ->
+    {B, K} = bondy_oplog_index_key:trust_marker_loc(NS, IndexName, Shard),
+    A:put_batch(H, [{B, K, trust_marker_frame()}]);
+persist_trust_marker(_) ->
+    ok.
+
+%% @private
+remove_trust_marker(E) ->
+    index_untrust(E).
+
+%% @private
+has_trust_marker(#entry{
+    key = {NS, IndexName, Shard},
+    projection_adapter = A,
+    projection_handle = H
+}) when A =/= undefined ->
+    {B, K} = bondy_oplog_index_key:trust_marker_loc(NS, IndexName, Shard),
+    case A:get(H, B, K) of
+        {ok, Frame} -> frame_state(Frame) =:= ?INDEX_FORMAT;
+        not_found -> false
+    end;
+has_trust_marker(_) ->
+    false.
+
+%% @private
+%% The marker's state is the index cell format the shard was built with.
+trust_marker_frame() ->
+    reserved_frame(?INDEX_FORMAT).
+
+%% =============================================================================
+%% API: index version
+%% =============================================================================
+
+-doc """
+The highest index version the shards of `Indexes` (each an index name of `NS`
+with its shard count) record for primary shard `Shard`
+(`bondy_oplog_index_key:version_loc/4`), `0` when none does. `bondy_db` passes
+it to `register/4` as the primary row's `index_version`, so the row's counter
+starts above every index cell the shard wrote before, and no op can take a
+version below it.
+""".
+-spec index_version_recorded(
+    atom(), [{atom(), pos_integer()}], non_neg_integer()
+) ->
+    {ok, non_neg_integer()} | {error, {index_version_unreadable, dead_handle}}.
+
+index_version_recorded(NS, Indexes, Shard) ->
+    try
+        {ok,
+            lists:max([
+                0
+                | [
+                    index_recorded_version(E, Shard)
+                 || {IndexName, Count} <- Indexes,
+                    SecShard <- lists:seq(0, Count - 1),
+                    {ok, E} <- [lookup(NS, IndexName, SecShard)]
+                ]
+            ])}
+    catch
+        error:badarg -> {error, {index_version_unreadable, dead_handle}};
+        exit:{noproc, _} -> {error, {index_version_unreadable, dead_handle}}
+    end.
+
+-doc """
+The index shard's version record for primary shard `PrimaryShard`, as a
+`{Bucket, Key, Frame}` cell for the writer's `put_batch`
+(`bondy_oplog_index_key:version_loc/4`).
+""".
+-spec index_version_cell(shard_entry(), non_neg_integer(), non_neg_integer()) ->
+    {binary(), binary(), binary()}.
+
+index_version_cell(
+    #entry{key = {NS, IndexName, Shard}}, PrimaryShard, Version
+) ->
+    {B, K} = bondy_oplog_index_key:version_loc(
+        NS, IndexName, Shard, PrimaryShard
+    ),
+    {B, K, reserved_frame(<<Version:64>>)}.
+
+-doc """
+The version the index shard records for primary shard `PrimaryShard`, `0`
+when it records none. Raises when the record cannot be read.
+""".
+-spec index_recorded_version(shard_entry(), non_neg_integer()) ->
+    non_neg_integer().
+
+index_recorded_version(
+    #entry{
+        key = {NS, IndexName, Shard},
+        projection_adapter = A,
+        projection_handle = H
+    },
+    PrimaryShard
+) ->
+    {B, K} = bondy_oplog_index_key:version_loc(
+        NS, IndexName, Shard, PrimaryShard
+    ),
+    case A:get(H, B, K) of
+        not_found ->
+            0;
+        {ok, Frame} ->
+            frame_version(Frame)
+    end.
+
+%% @private
+high_water_ref(?PRIMARY_INDEX) -> bondy_oplog_high_water:new();
+high_water_ref(_Index) -> undefined.
+
+-doc """
+Take the next index version from a primary shard's counter
+(`entry_version_ref/1`).
+""".
+-spec index_version_next(atomics:atomics_ref()) -> pos_integer().
+
+index_version_next(Ref) ->
+    atomics:add_get(Ref, ?VERSION_SLOT, 1).
+
+-doc """
+Record that the primary shard has dispatched, or dropped, the ops of every
+version up to `Version`. It is meant to be called, after the casts, by the one
+process that dispatches the shard's ops at the time (its applier, or before
+the applier starts, the replay of its leftover intents), so that it only
+grows; a lower value only delays a clear.
+""".
+-spec index_version_dispatched(atomics:atomics_ref(), non_neg_integer()) -> ok.
+
+index_version_dispatched(Ref, Version) ->
+    atomics:put(Ref, ?DISPATCHED_SLOT, Version).
+
+-doc """
+The highest version whose ops the primary shard has dispatched or dropped
+(`index_version_dispatched/2`).
+""".
+-spec index_dispatched_version(shard_entry()) -> non_neg_integer().
+
+index_dispatched_version(#entry{version_ref = Ref}) ->
+    atomics:get(Ref, ?DISPATCHED_SLOT).
+
+-doc """
+The intent of a batch of primary shard `Shard` of `NS` whose highest index
+version is `Version`, as a `{Bucket, Key, Frame}` cell for the batch's own
+`put_batch` (`bondy_oplog_index_key:intent_loc/3`). `Ops` are the batch's index
+ops as `bondy_oplog_cell_apply:dispatch_index_ops/3` takes them.
+""".
+-spec index_intent_cell(atom(), non_neg_integer(), non_neg_integer(), map()) ->
+    {binary(), binary(), binary()}.
+
+index_intent_cell(NS, Shard, Version, Ops) ->
+    {B, K} = bondy_oplog_index_key:intent_loc(NS, Shard, Version),
+    {B, K, reserved_frame(term_to_binary(Ops))}.
+
+-doc """
+What primary shard `Shard` of `NS` records of its intents in its own
+projection (`Adapter`, `Handle`): the version they are cleared up to
+(`index_intents_cleared/1`), and each intent above it as its version and the
+index ops `index_intent_cell/4` stored, in version order.
+
+`{error, {index_intents_unreadable, dead_handle}}` when the primary's
+projection handle is dead: an ETS table or `persistent_term` pool entry that
+is gone raises `badarg`, a stopped Bookie exits `noproc`. A registry row can
+outlive its handle because `bondy_db:close/1` does not close the DB's open
+tables (`bondy_db_index_coldstart_test`, "an index dropped after a crash does
+not block the open"); `index_version_recorded/3` answers the same way.
+""".
+-spec index_intents_leftover(module(), term(), atom(), non_neg_integer()) ->
+    {ok, non_neg_integer(), [{pos_integer(), map()}]}
+    | {error, {index_intents_unreadable, dead_handle}}.
+
+index_intents_leftover(Adapter, Handle, NS, Shard) ->
+    try
+        Cleared = intents_cleared(Adapter, Handle, NS, Shard),
+        Leftover = fold_intents(
+            Adapter,
+            Handle,
+            NS,
+            Shard,
+            Cleared + 1,
+            infinity,
+            fun(Page, Acc) ->
+                lists:reverse(
+                    [
+                        {V, binary_to_term(frame_state(Frame))}
+                     || {V, _Cell, Frame} <- Page
+                    ],
+                    Acc
+                )
+            end,
+            []
+        ),
+        {ok, Cleared, lists:reverse(Leftover)}
+    catch
+        error:badarg -> {error, {index_intents_unreadable, dead_handle}};
+        exit:{noproc, _} -> {error, {index_intents_unreadable, dead_handle}}
+    end.
+
+-doc """
+Clear primary shard `Entry`'s intents up to `Version`: record the bound, then
+delete them. A crash between the two leaves intents that the record marks as
+cleared. The caller has flushed every writer of the shard's table, found none
+of its index shards marked for rebuild, and synced the index since it read
+`Version` (`index_dispatched_version/1`), so the index holds every op of a
+cleared intent (`bondy_db_index_coldstart_test`:
+`wedged_writer_keeps_intents/1`, `failed_index_write_keeps_intents/1`).
+""".
+-spec index_clear_intents(shard_entry(), non_neg_integer()) ->
+    ok | {error, term()}.
+
+index_clear_intents(
+    #entry{
+        key = {NS, ?PRIMARY_INDEX, Shard},
+        projection_adapter = A,
+        projection_handle = H
+    },
+    Version
+) ->
+    {B, K} = bondy_oplog_index_key:intents_cleared_loc(NS, Shard),
+    maybe
+        ok ?= A:put_batch(H, [{B, K, reserved_frame(<<Version:64>>)}]),
+        fold_intents(
+            A,
+            H,
+            NS,
+            Shard,
+            0,
+            Version,
+            fun(Page, ok) ->
+                bondy_oplog_projection_adapter:write_batch(
+                    A, H, [], [Cell || {_V, Cell, _Frame} <- Page]
+                )
+            end,
+            ok
+        )
+    end.
+
+-doc """
+The version up to which primary shard `Entry` has cleared its intents
+(`bondy_oplog_index_key:intents_cleared_loc/2`), `0` when it has cleared none.
+""".
+-spec index_intents_cleared(shard_entry()) -> non_neg_integer().
+
+index_intents_cleared(#entry{
+    key = {NS, ?PRIMARY_INDEX, Shard},
+    projection_adapter = A,
+    projection_handle = H
+}) ->
+    intents_cleared(A, H, NS, Shard).
+
+%% @private
+intents_cleared(Adapter, Handle, NS, Shard) ->
+    {B, K} = bondy_oplog_index_key:intents_cleared_loc(NS, Shard),
+    case Adapter:get(Handle, B, K) of
+        not_found -> 0;
+        {ok, Frame} -> frame_version(Frame)
+    end.
+
+%% @private
+%% Folds `Fun(Page, Acc)` over the shard's intents from `From` up to `Upto`
+%% (`infinity` for all), a page of `[{Version, {Bucket, Key}, Frame}]` at a
+%% time, in version order.
+fold_intents(Adapter, Handle, NS, Shard, From, Upto, Fun, Acc) ->
+    {B, _Low, High0} = bondy_oplog_index_key:intent_range(NS, Shard),
+    {B, Low} = bondy_oplog_index_key:intent_loc(NS, Shard, From),
+    High =
+        case Upto of
+            infinity ->
+                High0;
+            _ ->
+                element(
+                    2, bondy_oplog_index_key:intent_loc(NS, Shard, Upto + 1)
+                )
+        end,
+    fold_intent_pages(Adapter, Handle, B, Low, High, Fun, Acc).
+
+%% @private
+fold_intent_pages(Adapter, Handle, B, Low, High, Fun, Acc0) ->
+    {ok, Rows} = Adapter:range(Handle, B, Low, High, #{limit => ?INTENT_PAGE}),
+    Acc = Fun(
+        [
+            {Version, {B, Key}, Frame}
+         || {Key, Frame} <- Rows,
+            <<_:(byte_size(Key) - 8)/binary, Version:64>> <- [Key]
+        ],
+        Acc0
+    ),
+    case length(Rows) < ?INTENT_PAGE of
+        true ->
+            Acc;
+        false ->
+            {LastKey, _} = lists:last(Rows),
+            fold_intent_pages(
+                Adapter, Handle, B, <<LastKey/binary, 0>>, High, Fun, Acc
+            )
+    end.
+
+%% @private
+%% A reserved cell's frame: a `value_equals_state` V2 frame (HLC 0, value
+%% omitted) carrying `State`.
+reserved_frame(State) ->
+    bondy_oplog_cell_frame:encode(0, State, undefined, true).
+
+%% @private
+frame_version(Frame) ->
+    <<Version:64>> = frame_state(Frame),
+    Version.
+
+%% @private
+frame_state(Frame) ->
+    {_, State, _} = bondy_oplog_cell_frame:decode_full(Frame),
+    State.
+
+%% @private
+version_ref(?PRIMARY_INDEX, Config) ->
+    Version = maps:get(index_version, Config, 0),
+    Ref = atomics:new(2, [{signed, false}]),
+    ok = atomics:put(Ref, ?VERSION_SLOT, Version),
+    ok = atomics:put(
+        Ref, ?DISPATCHED_SLOT, maps:get(index_dispatched, Config, 0)
+    ),
+    Ref;
+version_ref(_Index, _Config) ->
+    undefined.
+
+%% =============================================================================
+%% gen_server callbacks
+%% =============================================================================
+
+init([]) ->
+    {ok, ?TABLE} = bondy_connect_table_manager:add_or_claim(?TABLE, [
+        set,
+        public,
+        named_table,
+        {keypos, #entry.key},
+        {read_concurrency, true}
+    ]),
+    MS = [{#entry{key = '$1', owner = '$2', _ = '_'}, [], [{{'$1', '$2'}}]}],
+    State = lists:foldl(
+        fun({Key, Owner}, S) -> monitor_owner(Key, Owner, S) end,
+        #state{},
+        ets:select(?TABLE, MS)
+    ),
+    {ok, State}.
+
+handle_call({register, NS, Index, Shard, Owner, Config}, _From, State0) ->
+    Key = {NS, Index, Shard},
+    State1 = drop_monitor_for_key(Key, State0),
+    Ae =
+        case maps:find(ae_atomics, Config) of
+            {ok, ExistingRef} ->
+                ExistingRef;
+            error ->
+                NewRef = atomics:new(1, [{signed, true}]),
+                ok = atomics:put(NewRef, 1, ?STALE_SENTINEL),
+                NewRef
+        end,
+    Entry = #entry{
+        key = Key,
+        shard_count = maps:get(shard_count, Config),
+        cache_adapter = maps:get(cache_adapter, Config),
+        cache_handle = maps:get(cache_handle, Config),
+        projection_adapter = maps:get(projection_adapter, Config),
+        projection_handle = maps:get(projection_handle, Config),
+        overlay = maps:get(overlay, Config),
+        fold_module = maps:get(fold_module, Config),
+        ae_atomics = Ae,
+        high_water_ref = high_water_ref(Index),
+        consistency_class = maps:get(consistency_class, Config, ap),
+        inflight_ref = maps:get(inflight_atomics, Config, undefined),
+        instance_id = maps:get(instance_id, Config, undefined),
+        crdt_module = maps:get(crdt_module, Config, undefined),
+        causal_tier = maps:get(causal_tier, Config, tier_0),
+        index_clear_scope = maps:get(index_clear_scope, Config, undefined),
+        primary_cell_scope = maps:get(primary_cell_scope, Config, undefined),
+        cell_apply_bucket = maps:get(cell_apply_bucket, Config, undefined),
+        publish_ns = maps:get(publish_ns, Config, undefined),
+        secondary_indexes = maps:get(secondary_indexes, Config, undefined),
+        writer_key = maps:get(writer_key, Config, undefined),
+        crdt_opts = maps:get(crdt_opts, Config, #{}),
+        owner = Owner,
+        coalesce_ms = maps:get(coalesce_ms, Config, undefined),
+        version_ref = version_ref(Index, Config)
+    },
+    true = ets:insert(?TABLE, Entry),
+    {reply, ok, monitor_owner(Key, Owner, State1)};
+handle_call({unregister, Key}, _From, State0) ->
+    State1 = drop_monitor_for_key(Key, State0),
+    true = ets:delete(?TABLE, Key),
+    {reply, ok, State1};
+handle_call(snapshot_for_invariants, _From, State) ->
+    Snapshot = #{
+        entries => ets:select(?TABLE, [{'_', [], ['$_']}]),
+        mon_to_key => State#state.mon_to_key,
+        key_to_mon => State#state.key_to_mon
+    },
+    {reply, Snapshot, State};
+handle_call(_Req, _From, State) ->
+    {reply, {error, unknown}, State}.
+
+handle_cast(_, State) -> {noreply, State}.
+
+handle_info({'DOWN', Mon, process, _Pid, _Reason}, State0) ->
+    case maps:take(Mon, State0#state.mon_to_key) of
+        {Key, MonToKey1} ->
+            true = ets:delete(?TABLE, Key),
+            State1 = State0#state{
+                mon_to_key = MonToKey1,
+                key_to_mon = maps:remove(Key, State0#state.key_to_mon)
+            },
+            {noreply, State1};
+        error ->
+            {noreply, State0}
+    end;
+handle_info(_, State) ->
+    {noreply, State}.
+
+terminate(_, _) -> ok.
+code_change(_, State, _) -> {ok, State}.
+
+%% =============================================================================
+%% Internal
+%% =============================================================================
+
+-define(REQUIRED_FIELDS, [
+    shard_count,
+    cache_adapter,
+    cache_handle,
+    projection_adapter,
+    projection_handle,
+    fold_module,
+    overlay
+]).
+
+validate_config(Config) ->
+    case [K || K <- ?REQUIRED_FIELDS, not maps:is_key(K, Config)] of
+        [] -> validate_consistency_class(Config);
+        [K | _] -> {error, {missing_required_field, K}}
+    end.
+
+validate_consistency_class(Config) ->
+    case maps:find(consistency_class, Config) of
+        {ok, V} when V =:= ap; V =:= cp -> ok;
+        {ok, Bad} -> {error, {invalid_consistency_class, Bad}};
+        error -> ok
+    end.
+
+monitor_owner(Key, Owner, State) ->
+    Mon = erlang:monitor(process, Owner),
+    State#state{
+        mon_to_key = maps:put(Mon, Key, State#state.mon_to_key),
+        key_to_mon = maps:put(Key, Mon, State#state.key_to_mon)
+    }.
+
+drop_monitor_for_key(Key, State) ->
+    case maps:take(Key, State#state.key_to_mon) of
+        {OldMon, KeyToMon1} ->
+            true = erlang:demonitor(OldMon, [flush]),
+            State#state{
+                mon_to_key = maps:remove(OldMon, State#state.mon_to_key),
+                key_to_mon = KeyToMon1
+            };
+        error ->
+            State
+    end.

@@ -1,0 +1,85 @@
+%% =============================================================================
+%%  bondy_oplog.hrl -
+%%
+%%  Copyright (c) 2023-2025 Leapsight. All rights reserved.
+%%
+%%  Licensed under the Apache License, Version 2.0 (the "License");
+%%  you may not use this file except in compliance with the License.
+%%  You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%% =============================================================================
+
+%% -----------------------------------------------------------------------------
+%% Records and constants for the MST-based event-store replication layer.
+%% -----------------------------------------------------------------------------
+
+-ifndef(BONDY_OPLOG_HRL).
+-define(BONDY_OPLOG_HRL, true).
+
+%% Rows a range read returns when the caller passes no `limit`.
+%% `bondy_oplog_core` and both projection adapters resolve to it. A default,
+%% not a bound: every range API takes an explicit `limit`.
+-define(DEFAULT_RANGE_LIMIT, 1000).
+
+%% Origin identifier: opaque binary. 16 bytes is the recommended default
+%% (random per-replica id). Larger values are accepted (e.g. SHA-256 of a
+%% public key) — the replication layer treats it as opaque.
+-define(BONDY_OPLOG_ORIGIN_BYTES, 16).
+
+%% An *instance id* is the unit of independence. One MST per instance.
+%% Instance ids are opaque binaries chosen by the consumer; the library
+%% does not interpret them. Consumers that need atom-friendly ids can
+%% encode them as binaries (e.g. `atom_to_binary/1`) at their boundary.
+-type instance_id() :: binary().
+
+%% A *peer id* identifies a remote replica to the library. The library
+%% treats it as opaque — it is the consumer's choice (a node atom, a
+%% binary URL, a `{ip, port}` tuple, etc.). The transport behaviour
+%% interprets peer ids; the peer-state ETS keys on them.
+-type peer_id() :: term().
+
+%% The HLC pack layout (`?BONDY_HLC_LOGICAL_*`) comes from the clock's own
+%% header; event keys are ordered by that integer.
+-include_lib("bondy_connect_lib/include/bondy_connect_hlc.hrl").
+
+%% A globally unique event identity and total order key. Tuple element order
+%% is significant because ETS ordered_set sorts tuples lexicographically:
+%% by HLC first (time), then Origin (deterministic tie-break across replicas),
+%% then Seq (per-origin monotonic). This is the "dot" referenced by Tier 1
+%% causal metadata.
+-record(bondy_oplog_event_key, {
+    hlc :: non_neg_integer(),
+    origin :: binary(),
+    seq :: non_neg_integer()
+}).
+
+%% Event payload stored in the write log. The replication layer never
+%% interprets `op` or `meta`. The CRDT's COG-Interpreter does.
+%%
+%% `prev_hash` and `signature` are populated by the configured event
+%% validator (`bondy_oplog_validator`). Trust validator
+%% leaves both `undefined`; crypto validator fills them with the
+%% per-origin chain hash and the Ed25519 signature respectively.
+-record(bondy_oplog_event, {
+    key :: #bondy_oplog_event_key{},
+    op :: term(),
+    meta :: undefined | term(),
+    prev_hash :: undefined | binary(),
+    signature :: undefined | binary()
+}).
+
+%% Overlay row shape (`ordered_set`, public, per-instance), keyed by the
+%% event key. The value slot carries the encoded value so reads need not
+%% go back to the WAL; the HLC slot serves CAS-eviction; the notify slot
+%% holds the process alias (`erlang:alias/0`) of the appender awaiting the
+%% apply, or `undefined`. Whoever evicts the row answers the alias:
+%% `{Alias, ok}` once the event is installed, `{Alias, {error, rejected}}`
+%% when the applier refused it. Tuple positions appear in match-specs.
+-define(OVERLAY_KEY_POS, 1).
+-define(OVERLAY_VALUE_POS, 2).
+-define(OVERLAY_HLC_POS, 3).
+-define(OVERLAY_ORIGIN_POS, 4).
+-define(OVERLAY_NOTIFY_POS, 5).
+
+-endif.

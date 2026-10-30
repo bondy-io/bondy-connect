@@ -7,7 +7,7 @@
     {description,
         "Bondy Broker Bridge is an application that is part of Bondy and provides a way to integrate Events with external brokers and systems."
     },
-    {vsn, "1.0.0-rc.37"},
+    {vsn, "1.0.0"},
     {registered, []},
     {mod, {bondy_broker_bridge_app, []}},
     {applications, [
@@ -27,9 +27,9 @@
     {maintainers, ["Alejandro M. Ramallo"]},
     {licenses, ["Apache 2.0"]},
     {links, [
-        {"Github", "https://github/leapsight/bondy"},
+        {"Github", "https://github.com/bondy-io/bondy-connect"},
         {"Docs", "https://docs.getbondy.io"},
         {"Website", "https://getbondy.io"},
-        {"Docker", "https://hub.docker.com/r/leapsight/bondy"}
+        {"Docker", "https://hub.docker.com/r/leapsight/bondy-connect"}
     ]}
 ]}.

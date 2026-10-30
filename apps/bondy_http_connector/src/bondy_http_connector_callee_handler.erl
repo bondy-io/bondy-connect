@@ -1,0 +1,626 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_http_connector_callee_handler).
+
+-moduledoc """
+Stateless callback module for WAMP-to-HTTP procedure translation.
+
+The Bondy dealer invokes `handle_wamp_call/2,3` via `erlang:apply/3` when a
+WAMP client calls a registered procedure. This module translates the
+caller's kwargs into an upstream HTTP request (path interpolation, query
+params or JSON body), authenticates via the service's auth module, and
+returns the HTTP response as a WAMP result or error.
+
+## Dealer callback mechanism
+
+The dealer's `apply_dynamic_callback` flattens args:
+
+```
+A = CBArgs ++ Args ++ KWArgs ++ Options
+```
+
+With `callback_args => [ProcConf]` and no positional args from the caller:
+
+- When kwargs is a map: `handle_wamp_call(ProcConf, KWargsMap, OptionsMap)`
+- When kwargs is undefined: `handle_wamp_call(ProcConf, OptionsMap)`
+
+## Kwargs routing
+
+Path template variables (`{{var}}`) are consumed from kwargs first.
+Remaining kwargs are routed by HTTP method:
+
+- GET, DELETE, HEAD → query parameters
+- POST, PUT, PATCH → JSON request body
+
+The optional `<<"_headers">>` kwarg is extracted before routing and
+merged into the outgoing HTTP headers.
+
+## Example
+
+```erlang
+%% GET /invoices/INV-001?status=paid
+%% KWArgs = #{<<"id">> => <<"INV-001">>, <<"status">> => <<"paid">>}
+%% → HTTP GET https://billing.example.com/api/invoices/INV-001?status=paid
+%% (path template: /invoices/{{id}})
+%% → {ok, #{}, [], #{<<"status">> => 200, <<"body">> => #{...}}}
+```
+""".
+
+-include_lib("kernel/include/logger.hrl").
+-include("bondy_http_connector.hrl").
+
+-export([handle_wamp_call/2]).
+-export([handle_wamp_call/3]).
+
+%% Used by bondy_http_connector_callee for registration-time precomputation
+%% and merging of resolved secret vars
+-export([apply_secrets/2]).
+-export([extract_path_vars/1]).
+
+%% Exported for testing
+-export([interpolate_path/2]).
+-export([interpolate_path/3]).
+-export([route_kwargs/3]).
+-export([http_to_wamp/2]).
+
+%% ===================================================================
+%% BONDY_DEALER CALLBACKS
+%% ===================================================================
+
+-doc """
+Called when kwargs is undefined (dealer flattens to 2 args).
+Delegates to `handle_wamp_call/3` with an empty kwargs map.
+""".
+-spec handle_wamp_call(#http_connector_proc_conf{}, map()) ->
+    {ok, map(), list(), map()}
+    | {error, binary(), map(), list(), map()}.
+
+handle_wamp_call(ProcConf, Options) ->
+    handle_wamp_call(ProcConf, #{}, Options).
+
+-doc """
+Called when the WAMP client provides kwargs.
+
+Checks service readiness (secret resolution status) before proceeding.
+If the service's secrets are still pending, returns `bondy.error.unavailable`.
+Otherwise merges any resolved secret vars into ProcConf and delegates
+to the HTTP forwarding logic.
+""".
+-spec handle_wamp_call(#http_connector_proc_conf{}, map(), map()) ->
+    {ok, map(), list(), map()}
+    | {error, binary(), map(), list(), map()}.
+
+handle_wamp_call(
+    #http_connector_proc_conf{vars_resolved = true} = ProcConf,
+    KWArgs0,
+    _Options
+) ->
+    %% Fast path: secrets were merged at registration time, no need to check
+    %% readiness or merge per-call.
+    do_handle_wamp_call(ProcConf, KWArgs0);
+handle_wamp_call(
+    #http_connector_proc_conf{service_name = ServiceName} = ProcConf,
+    KWArgs0,
+    _Options
+) ->
+    %% Fallback: callee was started before its secrets resolved. Check
+    %% readiness on each call and merge as needed.
+    case bondy_http_connector_manager:service_readiness(ServiceName) of
+        {ok, Vars} ->
+            do_handle_wamp_call(apply_secrets(ProcConf, Vars), KWArgs0);
+        {error, not_ready} ->
+            wamp_error(
+                bondy_connect_error:uri(unavailable),
+                503,
+                <<"Service credentials pending">>
+            )
+    end.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+-doc """
+Merge resolved secret `Vars` into the procedure's `auth_conf.vars` map and
+flag the record as fully-resolved.
+
+Called by `bondy_http_connector_callee` at registration time when secrets are
+already resolved (so the WAMP hot path bypasses readiness checks), and by
+the slow-fallback clause of `handle_wamp_call/3` when a callee was
+registered before its service's secrets came back.
+""".
+-spec apply_secrets(#http_connector_proc_conf{}, map()) ->
+    #http_connector_proc_conf{}.
+
+apply_secrets(ProcConf, SecretVars) when map_size(SecretVars) =:= 0 ->
+    ProcConf#http_connector_proc_conf{vars_resolved = true};
+apply_secrets(
+    #http_connector_proc_conf{auth_conf = AuthConf0} = ProcConf,
+    SecretVars
+) ->
+    ExistingVars = maps:get(vars, AuthConf0, #{}),
+    MergedVars = maps:merge(ExistingVars, SecretVars),
+    ProcConf#http_connector_proc_conf{
+        auth_conf = AuthConf0#{vars => MergedVars},
+        vars_resolved = true
+    }.
+
+%% @private
+%% Single emission point for `[bondy, http_connector, request]`, covering
+%% every return path of `do_handle_wamp_call_/2` (success, upstream
+%% errors, and every `wamp_error/3` site) without instrumenting each one
+%% individually.
+do_handle_wamp_call(#http_connector_proc_conf{} = ProcConf, KWArgs0) ->
+    StartTs = erlang:monotonic_time(millisecond),
+    Result = do_handle_wamp_call_(ProcConf, KWArgs0),
+    ok = bondy_http_connector_telemetry:request(ProcConf, StartTs, Result),
+    Result.
+
+do_handle_wamp_call_(#http_connector_proc_conf{} = ProcConf, KWArgs0) ->
+    #http_connector_proc_conf{
+        service_name = ServiceName,
+        base_url = BaseUrl,
+        auth_mod = AuthMod,
+        auth_conf = AuthConf,
+        method = Method,
+        path = PathTemplate,
+        path_vars = PathVars,
+        timeout = Timeout,
+        retries = Retries,
+        pool = Pool,
+        uri = ProcUri
+    } = ProcConf,
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    Retry = bondy_connect_retry:init(ProcUri, #{
+        max_retries => Retries,
+        deadline => 0,
+        backoff_enabled => true,
+        backoff_min => ?RETRY_BACKOFF_MIN_MS,
+        backoff_max => ?RETRY_BACKOFF_MAX_MS,
+        backoff_type => jitter
+    }),
+
+    try
+        {CustomHeaders, KWArgs1} = extract_custom_headers(KWArgs0),
+
+        {Path, KWArgs2} = interpolate_path(PathTemplate, KWArgs1, PathVars),
+
+        Endpoint = construct_url(BaseUrl, Path),
+        {Url, Body} = route_kwargs(Method, Endpoint, KWArgs2),
+
+        BaseHeaders = [
+            {<<"Content-Type">>, <<"application/json">>},
+            {<<"Accept">>, <<"application/json">>}
+            | CustomHeaders
+        ],
+
+        Token = acquire_token(ServiceName, AuthMod, AuthConf),
+        {FinalUrl, FinalHeaders} =
+            AuthMod:apply_auth(Token, Url, BaseHeaders, AuthConf),
+
+        ?LOG_DEBUG(#{
+            description => <<"WAMP→HTTP forwarding">>,
+            service => ServiceName,
+            method => Method,
+            url => FinalUrl
+        }),
+
+        MethodAtom = method_to_atom(Method),
+        Response = request_with_retry(
+            ServiceName,
+            ProcUri,
+            MethodAtom,
+            FinalUrl,
+            FinalHeaders,
+            Body,
+            Retry,
+            Deadline,
+            Pool
+        ),
+
+        case Response of
+            {ok, Status0, _RH0, _RespBody0} when
+                Status0 =:= 401; Status0 =:= 403
+            ->
+                ?LOG_WARNING(#{
+                    description =>
+                        <<"Auth rejection, retrying with fresh token">>,
+                    service => ServiceName,
+                    status => Status0
+                }),
+                retry_with_fresh_token(
+                    ServiceName,
+                    ProcUri,
+                    AuthMod,
+                    AuthConf,
+                    Url,
+                    BaseHeaders,
+                    MethodAtom,
+                    Body,
+                    Retry,
+                    Deadline,
+                    Pool
+                );
+            {ok, Status1, _RH1, RespBody1} ->
+                http_to_wamp(Status1, RespBody1);
+            {error, HttpErr} ->
+                ?LOG_ERROR(#{
+                    description => <<"HTTP request failed">>,
+                    service => ServiceName,
+                    reason => HttpErr
+                }),
+                request_error(HttpErr)
+        end
+    catch
+        throw:{path_var_missing, Var} ->
+            wamp_error(
+                <<"wamp.error.invalid_argument">>,
+                400,
+                <<"Missing required path variable: ", Var/binary>>
+            );
+        throw:{auth_error, AuthErr} ->
+            ?LOG_ERROR(#{
+                description => <<"Auth failed for WAMP procedure">>,
+                service => ServiceName,
+                reason => AuthErr
+            }),
+            wamp_error(
+                bondy_connect_error:uri(unavailable),
+                503,
+                <<"Authentication unavailable">>
+            )
+    end.
+
+%% ===================================================================
+%% Path interpolation
+%% ===================================================================
+
+-doc false.
+-spec interpolate_path(binary(), map()) -> {binary(), map()}.
+interpolate_path(Template, KWArgs) ->
+    interpolate_path(Template, KWArgs, extract_path_vars(Template)).
+
+-doc false.
+-spec interpolate_path(binary(), map(), [binary()]) -> {binary(), map()}.
+interpolate_path(Template, KWArgs, Vars) ->
+    lists:foldl(
+        fun(Var, {TplAcc, KWAcc}) ->
+            case maps:take(Var, KWAcc) of
+                {Val, KWAcc1} ->
+                    Pattern = <<"{{", Var/binary, "}}">>,
+                    TplAcc1 = binary:replace(
+                        TplAcc, Pattern, to_binary(Val)
+                    ),
+                    {TplAcc1, KWAcc1};
+                error ->
+                    throw({path_var_missing, Var})
+            end
+        end,
+        {Template, KWArgs},
+        Vars
+    ).
+
+-doc false.
+-spec extract_path_vars(binary()) -> [binary()].
+extract_path_vars(Template) ->
+    case
+        re:run(
+            Template,
+            <<"\\{\\{([^}]+)\\}\\}">>,
+            [global, {capture, all_but_first, binary}]
+        )
+    of
+        {match, Matches} ->
+            [Var || [Var] <- Matches];
+        nomatch ->
+            []
+    end.
+
+%% ===================================================================
+%% URL construction
+%% ===================================================================
+
+-spec construct_url(binary(), binary()) -> binary().
+construct_url(BaseUrl, RequestPath) ->
+    Base =
+        case binary:last(BaseUrl) of
+            $/ -> binary:part(BaseUrl, 0, byte_size(BaseUrl) - 1);
+            _ -> BaseUrl
+        end,
+    Path =
+        case RequestPath of
+            <<"/", _/binary>> -> RequestPath;
+            _ -> <<"/", RequestPath/binary>>
+        end,
+    <<Base/binary, Path/binary>>.
+
+%% ===================================================================
+%% Custom headers extraction
+%% ===================================================================
+
+extract_custom_headers(KWArgs) ->
+    case maps:take(<<"_headers">>, KWArgs) of
+        {HeadersMap, KWArgs1} when is_map(HeadersMap) ->
+            Headers = maps:fold(
+                fun(K, V, Acc) ->
+                    [{to_binary(K), to_binary(V)} | Acc]
+                end,
+                [],
+                HeadersMap
+            ),
+            {Headers, KWArgs1};
+        _ ->
+            {[], KWArgs}
+    end.
+
+%% ===================================================================
+%% Kwargs routing by HTTP method
+%% ===================================================================
+
+route_kwargs(Method, Endpoint, KWArgs) when
+    Method =:= get; Method =:= delete; Method =:= head
+->
+    case map_size(KWArgs) of
+        0 ->
+            {Endpoint, <<>>};
+        _ ->
+            Params = maps:fold(
+                fun(K, V, Acc) ->
+                    [{to_binary(K), to_binary(V)} | Acc]
+                end,
+                [],
+                KWArgs
+            ),
+            QS = uri_string:compose_query(Params),
+            {<<Endpoint/binary, "?", QS/binary>>, <<>>}
+    end;
+route_kwargs(_Method, Endpoint, KWArgs) ->
+    case map_size(KWArgs) of
+        0 -> {Endpoint, <<>>};
+        _ -> {Endpoint, bondy_wamp_json:encode(KWArgs)}
+    end.
+
+%% ===================================================================
+%% Token acquisition
+%% ===================================================================
+
+acquire_token(ServiceName, AuthMod, AuthConf) ->
+    case
+        bondy_http_connector_token_cache:get(
+            ServiceName, AuthMod, AuthConf
+        )
+    of
+        {ok, Token} ->
+            Token;
+        {error, Reason} ->
+            throw({auth_error, Reason})
+    end.
+
+%% ===================================================================
+%% HTTP request with retry
+%% ===================================================================
+
+request_with_retry(
+    ServiceName,
+    ProcUri,
+    Method,
+    Url,
+    Headers,
+    Body,
+    Retry0,
+    Deadline,
+    Pool
+) ->
+    case Deadline - erlang:monotonic_time(millisecond) of
+        Remaining when Remaining > 0 ->
+            Overrides = [
+                {connect_timeout, Remaining},
+                {recv_timeout, Remaining}
+            ],
+            Result = bondy_http_connector_http_pool:request(
+                Pool, Method, Url, Headers, Body, Overrides
+            ),
+            Left = Deadline - erlang:monotonic_time(millisecond),
+            case Result of
+                {ok, S, RH, RB} ->
+                    {ok, S, RH, RB};
+                {error, pool_down} = E ->
+                    %% No point sleeping and re-asking the same
+                    %% persistent_term — the pool's status only flips when the
+                    %% pool's own health retry succeeds. Fail fast so the
+                    %% dealer can move on.
+                    E;
+                {error, Reason} ->
+                    case bondy_connect_retry:fail(Retry0) of
+                        {Delay, Retry} when is_integer(Delay), Delay < Left ->
+                            Attempt = bondy_connect_retry:count(Retry),
+                            ?LOG_WARNING(#{
+                                description => <<"Retrying HTTP request">>,
+                                attempt => Attempt,
+                                backoff_ms => Delay
+                            }),
+                            ok = bondy_http_connector_telemetry:retry(
+                                ServiceName, ProcUri, Attempt
+                            ),
+                            receive
+                            after Delay -> ok
+                            end,
+                            request_with_retry(
+                                ServiceName,
+                                ProcUri,
+                                Method,
+                                Url,
+                                Headers,
+                                Body,
+                                Retry,
+                                Deadline,
+                                Pool
+                            );
+                        {Delay, _} when is_integer(Delay) ->
+                            {error, Reason};
+                        {max_retries, _} ->
+                            {error, Reason}
+                    end
+            end;
+        Remaining when Remaining =< 0 ->
+            {error, timeout}
+    end.
+
+%% ===================================================================
+%% Auth retry on 401/403
+%% ===================================================================
+
+retry_with_fresh_token(
+    ServiceName,
+    ProcUri,
+    AuthMod,
+    AuthConf,
+    Url,
+    BaseHeaders,
+    MethodAtom,
+    Body,
+    Retry,
+    Deadline,
+    Pool
+) ->
+    bondy_http_connector_token_cache:invalidate(ServiceName),
+    case
+        bondy_http_connector_token_cache:get(
+            ServiceName, AuthMod, AuthConf
+        )
+    of
+        {ok, NewToken} ->
+            {RetryUrl, RetryHeaders} =
+                AuthMod:apply_auth(
+                    NewToken, Url, BaseHeaders, AuthConf
+                ),
+            case
+                request_with_retry(
+                    ServiceName,
+                    ProcUri,
+                    MethodAtom,
+                    RetryUrl,
+                    RetryHeaders,
+                    Body,
+                    Retry,
+                    Deadline,
+                    Pool
+                )
+            of
+                {ok, Status, _RH, RespBody} ->
+                    http_to_wamp(Status, RespBody);
+                {error, Reason} ->
+                    ?LOG_ERROR(#{
+                        description => <<"Retry HTTP request failed">>,
+                        service => ServiceName,
+                        reason => Reason
+                    }),
+                    request_error(Reason)
+            end;
+        {error, Reason} ->
+            throw({auth_error, Reason})
+    end.
+
+%% ===================================================================
+%% HTTP status → WAMP result/error mapping
+%% ===================================================================
+
+http_to_wamp(Status, RespBody) when Status >= 200, Status < 300 ->
+    DecodedBody = decode_body(RespBody),
+    {ok, #{}, [], #{<<"status">> => Status, <<"body">> => DecodedBody}};
+http_to_wamp(Status, RespBody) ->
+    ErrorUri = status_to_error_uri(Status),
+    DecodedBody = decode_body(RespBody),
+    {error, ErrorUri, #{}, [], #{
+        <<"status">> => Status, <<"body">> => DecodedBody
+    }}.
+
+%% @private
+%% A body that is not JSON is passed through as received. `json:decode/1`
+%% raises `unexpected_end`, `{invalid_byte, _}` or `{unexpected_sequence, _}`
+%% on such a body (OTP `json.erl`).
+decode_body(RespBody) ->
+    try
+        json:decode(RespBody)
+    catch
+        error:unexpected_end -> RespBody;
+        error:{invalid_byte, _} -> RespBody;
+        error:{unexpected_sequence, _} -> RespBody
+    end.
+
+%% @private
+%% Resolved through the catalogue rather than written out, so that an upstream
+%% status maps onto a URI Bondy actually defines. Two of the literals this
+%% replaced - `wamp.error.not_found' and `bondy.error.invalid_argument' - were
+%% neither WAMP nor Bondy URIs.
+status_to_error_uri(Status) ->
+    bondy_connect_error:uri(status_to_error_type(Status)).
+
+%% @private
+status_to_error_type(400) -> invalid_argument;
+status_to_error_type(422) -> invalid_argument;
+status_to_error_type(401) -> not_authorized;
+status_to_error_type(403) -> not_authorized;
+status_to_error_type(404) -> not_found;
+status_to_error_type(408) -> timeout;
+status_to_error_type(504) -> timeout;
+status_to_error_type(429) -> too_many_requests;
+status_to_error_type(502) -> bad_gateway;
+status_to_error_type(503) -> bad_gateway;
+status_to_error_type(S) when S >= 400, S < 500 -> invalid_argument;
+status_to_error_type(S) when S >= 500 -> bad_gateway;
+status_to_error_type(_) -> bad_gateway.
+
+%% ===================================================================
+%% Helpers
+%% ===================================================================
+
+%% hackney reports a connect or pool checkout that outlived the procedure's
+%% timeout as `connect_timeout` or `timeout` (`hackney_connect`, `hackney_pool`),
+%% and a late response as `timeout`
+%% (`bondy_http_connector_request_telemetry_SUITE`).
+request_error(Reason) when Reason =:= timeout; Reason =:= connect_timeout ->
+    wamp_error(
+        <<"bondy.error.gateway_timeout">>,
+        504,
+        <<"Upstream did not respond in time">>
+    );
+request_error(pool_down) ->
+    wamp_error(
+        bondy_connect_error:uri(service_unavailable),
+        503,
+        ~"Upstream service is unavailable"
+    );
+request_error(_Reason) ->
+    wamp_error(
+        <<"bondy.error.bad_gateway">>,
+        502,
+        <<"Upstream connection failed">>
+    ).
+
+wamp_error(Uri, Status, Message) ->
+    {error, Uri, #{}, [], #{<<"status">> => Status, <<"message">> => Message}}.
+
+method_to_atom(get) ->
+    get;
+method_to_atom(post) ->
+    post;
+method_to_atom(put) ->
+    put;
+method_to_atom(patch) ->
+    patch;
+method_to_atom(delete) ->
+    delete;
+method_to_atom(head) ->
+    head;
+method_to_atom(B) when is_binary(B) ->
+    method_to_atom(binary_to_existing_atom(string:lowercase(B), utf8)).
+
+to_binary(B) when is_binary(B) -> B;
+to_binary(A) when is_atom(A) -> atom_to_binary(A);
+to_binary(I) when is_integer(I) -> integer_to_binary(I);
+to_binary(F) when is_float(F) -> float_to_binary(F, [{decimals, 10}, compact]);
+to_binary(L) when is_list(L) -> list_to_binary(L).

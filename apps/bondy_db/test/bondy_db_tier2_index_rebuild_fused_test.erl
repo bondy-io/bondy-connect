@@ -1,0 +1,90 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+%% Secondary-index rebuild (`bondy_db:rebuild_index/2`) on a **fused** table
+%% — the fused mirror of `bondy_db_tier2_index_rebuild_test.erl`.
+%% `bondy_oplog_index_rebuild:refold_primary/1` must run the re-derive
+%% in-process through `bondy_oplog_cell_reindex:reindex/3` rather than
+%% dispatching to the applier: a fused instance has no applier by design, so
+%% an applier-only dispatch takes the "applier restarting, will self-resolve"
+%% branch — permanent here, not transient — and the rebuild no-ops silently,
+%% leaving the index shard the orchestrator wiped first empty forever.
+-module(bondy_db_tier2_index_rebuild_fused_test).
+
+-include_lib("eunit/include/eunit.hrl").
+
+-define(AW, bondy_oplog_crdt_aw_map).
+
+tier2_index_rebuild_fused_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun(_) ->
+        [
+            {"rebuild on a fused table re-derives the index (was a silent no-op)",
+                {timeout, 30, fun rebuild_repopulates_index/0}}
+        ]
+    end}.
+
+setup() ->
+    {ok, _} = application:ensure_all_started(bondy_db),
+    bondy_oplog_sync_scheduler:set_dispatch(undefined),
+    bondy_oplog_gc_scheduler:set_trigger(undefined),
+    ok.
+
+cleanup(_) ->
+    [bondy_oplog:stop_instance(I) || I <- bondy_oplog:list_instances()],
+    ok.
+
+rebuild_repopulates_index() ->
+    {Db, _O} = open_fused_db(t2idx_fused),
+    {ok, T} = open_indexed(Db),
+    R = <<"r1">>,
+    K = <<"u1">>,
+    ok = bondy_db:apply(T, R, K, {put, <<"status">>, <<"active">>}),
+    ok = bondy_db:apply(T, R, K, {put, <<"name">>, <<"n1">>}),
+
+    {ok, {V, _}} = bondy_db:read(T, R, K),
+    ?assertEqual(
+        #{<<"status">> => [<<"active">>], <<"name">> => [<<"n1">>]}, V
+    ),
+
+    ok = bondy_db:rebuild_index(T, by_status),
+    ?assertEqual([<<"n1">>], name_col(T, R)),
+    ok = bondy_db:close_table(T),
+    ok = bondy_db:close(Db).
+
+%% =============================================================================
+%% Helpers
+%% =============================================================================
+
+open_fused_db(Name) ->
+    Origin = bondy_oplog_origin:new(),
+    {ok, Db} = bondy_db:open(Name, #{
+        topology => bondy_db_topology_memory,
+        shard_count => 1,
+        fold_module => lww_register,
+        crdt_module => ?AW,
+        fused => true,
+        oplog_instance_opts => #{origin => Origin}
+    }),
+    {Db, Origin}.
+
+open_indexed(Db) ->
+    bondy_db:open_table(Db, items, #{
+        fold_module => lww_register,
+        crdt_module => ?AW,
+        indexes => [
+            #{
+                name => by_status,
+                extract => [<<"status">>],
+                projects => [[<<"name">>]]
+            }
+        ]
+    }).
+
+name_col(Table, Realm) ->
+    {ok, [{<<"u1">>, Cols}]} =
+        bondy_db:index_get(Table, Realm, by_status, <<"active">>, #{
+            max_lag => 60000
+        }),
+    maps:get([<<"name">>], Cols).

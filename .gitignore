@@ -1,5 +1,6 @@
 *.LOG
 *.beam
+*.coverdata
 *.d
 *.iml
 *.o
@@ -18,6 +19,8 @@
 /.vscode/launch.json
 /erlang_ls.config
 _*
+!_plans/
+!jepsen/bondy_mst_jepsen/_checkouts/
 _build
 _rel
 app-deps.dot
@@ -32,6 +35,7 @@ log/index
 logs
 rebar3.crashdump
 relx
+tmp
 apps/*/doc/**
 examples/st
 examples/custom_config/etc/bondy.conf
@@ -39,3 +43,11 @@ examples/custom_config/etc/disabled/
 examples/custom_config/etc/generated/
 apps/bondy_cbor/bench/output/*
 /.vscode/settings.json
+/.env
+/etc
+/harness/fleet-scale/out
+/harness/fleet-scale/report.py
+/next.md
+
+## Local agent instructions; never shipped.
+CLAUDE.md

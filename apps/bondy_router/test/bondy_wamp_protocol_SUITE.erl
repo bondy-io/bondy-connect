@@ -1,0 +1,925 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_wamp_protocol_SUITE).
+-include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("bondy_security.hrl").
+
+-compile([export_all]).
+
+all() ->
+    [
+        format_status,
+        validate_subprotocol,
+        abort_message_preauth_is_generic,
+        init_error,
+        init_ok,
+        terminate,
+        handle_inbound,
+        a_term_outside_the_wamp_data_model_is_a_protocol_violation,
+        a_malformed_payload_is_a_decoding_error,
+        invalid_json_is_a_decoding_error,
+        a_frame_that_is_not_an_array_is_an_invalid_message,
+        an_invalid_id_is_an_invalid_message,
+        a_field_of_the_wrong_type_is_an_invalid_message,
+        a_partially_decoded_message_is_validated,
+        invalid_hello_roles_are_a_protocol_violation,
+        invalid_cbor_is_a_decoding_error,
+        throttle_disabled_by_default,
+        throttle_when_enabled,
+        throttle_message_class,
+        hello_admission_when_busy,
+        hello_admission_disabled,
+        hello_admission_under_memory_pressure,
+        router_abort_close_logs_the_reason,
+        tcp_handler_status_redacts_the_protocol_state,
+        unknown_authid_gets_a_challenge_like_a_known_one,
+        an_error_for_anything_but_an_invocation_is_a_protocol_violation,
+        the_configured_json_float_format_reaches_the_encoder,
+        a_batched_offer_falls_through_to_the_next,
+        a_batched_only_offer_is_refused
+    ].
+
+init_per_suite(Config) ->
+    bondy_ct:start_bondy(),
+    [{realm_uri, <<"com.example.test.wamp_protocol">>} | Config].
+
+end_per_suite(Config) ->
+    {save_config, Config}.
+
+%% -----------------------------------------------------------------------------
+%% bondy_wamp_protocol:format_status
+%% -----------------------------------------------------------------------------
+
+format_status(_Config) ->
+    lists:foreach(
+        fun(State) ->
+            ?assertError(
+                function_clause, bondy_wamp_protocol:format_status(State)
+            )
+        end,
+        [S || S <- [{}, {wamp_state}]]
+    ),
+
+    %% No sensitive info at wamp_state level, the reformatting is delegated to
+    %% other modules.
+    lists:foreach(
+        fun(
+            {SubProtocol, AuthMethod, AuthClaims, AuthContext, AuthTime, Name,
+                Context, MsgLimiter, Listener}
+        ) ->
+            State =
+                {wamp_state, SubProtocol, AuthMethod, AuthClaims, AuthContext,
+                    AuthTime, Name, Context, MsgLimiter, Listener},
+            NewState = bondy_wamp_protocol:format_status(State),
+            ?assertEqual(State, NewState)
+        end,
+        [
+            {SP, AM, ACl, AC, AT, SN, Co, ML, LS}
+         || SP <- [undefined, {raw, binary, json}],
+            AM <- [undefined, cryptosign],
+            ACl <- [undefined, #{}],
+            AC <- [undefined, #{}],
+            AT <- [undefined, 123],
+            SN <- [closed, establishing],
+            Co <- [undefined, #{}],
+            ML <- [undefined],
+            LS <- [undefined, admin_api]
+        ]
+    ).
+
+%% -----------------------------------------------------------------------------
+%% bondy_wamp_protocol:validate_subprotocol
+%% -----------------------------------------------------------------------------
+
+-define(PROTOCOLS, [raw, ws]).
+-define(FRAMES, [binary, text]).
+-define(ENCODINGS, [
+    bert,
+    bert_batched,
+    erl,
+    erl_batched,
+    json,
+    json_batched,
+    msgpack,
+    msgpack_batched,
+    cbor,
+    cbor_batched
+]).
+%% NOTE: bert / bert_batched are intentionally absent — de-listed as a pre-auth
+%% DoS (bert:decode/1 => binary_to_term/1 without [safe]).
+-define(SUPPORTED_SUB_PROTOCOLS, [
+    {raw, binary, erl},
+    {raw, binary, json},
+    {raw, binary, cbor},
+    {raw, binary, msgpack},
+    {ws, binary, msgpack},
+    {ws, binary, cbor},
+    {ws, text, json}
+]).
+%% Includes ?WAMP2_BERT and ?WAMP2_BERT_BATCHED, which
+%% `bondy_wamp_subprotocol:from_binary/1' refuses.
+-define(WAMP2_ENCODINGS, [
+    ?WAMP2_JSON,
+    ?WAMP2_MSGPACK,
+    ?WAMP2_CBOR,
+    ?WAMP2_BERT,
+    ?WAMP2_ERL,
+    ?WAMP2_CBOR_BATCHED,
+    ?WAMP2_MSGPACK_BATCHED,
+    ?WAMP2_JSON_BATCHED,
+    ?WAMP2_BERT_BATCHED,
+    ?WAMP2_ERL_BATCHED
+]).
+
+validate_subprotocol(_Config) ->
+    lists:foreach(
+        fun(SubProtocol) ->
+            ValidateResult = bondy_wamp_protocol:validate_subprotocol(
+                SubProtocol
+            ),
+            case lists:member(SubProtocol, ?SUPPORTED_SUB_PROTOCOLS) of
+                true ->
+                    ?assertEqual({ok, SubProtocol}, ValidateResult);
+                false ->
+                    ?assertEqual({error, invalid_subprotocol}, ValidateResult)
+            end
+        end,
+        [{P, F, E} || P <- ?PROTOCOLS, F <- ?FRAMES, E <- ?ENCODINGS]
+    ),
+
+    lists:foreach(
+        fun(SubProtocolBinary) ->
+            SubProtocol = bondy_wamp_subprotocol:from_binary(SubProtocolBinary),
+            ValidateResult = bondy_wamp_protocol:validate_subprotocol(
+                SubProtocolBinary
+            ),
+            case lists:member(SubProtocol, ?SUPPORTED_SUB_PROTOCOLS) of
+                true ->
+                    ?assertEqual({ok, SubProtocol}, ValidateResult);
+                false ->
+                    ?assertEqual({error, invalid_subprotocol}, ValidateResult)
+            end
+        end,
+        ?WAMP2_ENCODINGS
+    ),
+
+    Error = {error, whatever},
+    ?assertEqual(Error, bondy_wamp_protocol:validate_subprotocol(Error)),
+
+    ?assertEqual(
+        {error, invalid_subprotocol},
+        bondy_wamp_protocol:validate_subprotocol(<<"wamp.2.not.supported">>)
+    ),
+
+    ?assertEqual(
+        {error, invalid_subprotocol},
+        bondy_wamp_subprotocol:from_binary(?WAMP2_BERT)
+    ),
+    ?assertEqual(
+        {error, invalid_subprotocol},
+        bondy_wamp_subprotocol:from_binary(?WAMP2_BERT_BATCHED)
+    ),
+    ?assertEqual(
+        {error, invalid_subprotocol},
+        bondy_wamp_protocol:validate_subprotocol({ws, binary, bert})
+    ),
+    ?assertEqual(
+        {error, invalid_subprotocol},
+        bondy_wamp_protocol:validate_subprotocol({raw, binary, bert})
+    ),
+    ?assertEqual(
+        {error, invalid_subprotocol},
+        bondy_wamp_protocol:validate_subprotocol({ws, binary, bert_batched})
+    ).
+
+%% -----------------------------------------------------------------------------
+%% pre-auth ABORT must not be a user-enumeration oracle
+%% -----------------------------------------------------------------------------
+
+abort_message_preauth_is_generic(_Config) ->
+    %% Every pre-authentication credential/identity failure must produce a
+    %% identical client-facing ABORT (same reason_uri AND details), so a
+    %% client cannot distinguish "no such user" / "disabled" from "bad password".
+    Reasons = [
+        {no_such_user, <<"ghost">>},
+        {authentication_failed, {no_such_user, <<"ghost">>}},
+        {authentication_failed, user_disabled},
+        {authentication_failed, missing_signature},
+        {authentication_failed, bad_signature}
+    ],
+    Aborts = [bondy_wamp_protocol:abort_message(R) || R <- Reasons],
+    Uris = lists:usort([U || #abort{reason_uri = U} <- Aborts]),
+    Details = lists:usort([D || #abort{details = D} <- Aborts]),
+    ?assertEqual([?WAMP_AUTHENTICATION_FAILED], Uris),
+    ?assertEqual(1, length(Details)),
+
+    %% no_such_realm stays distinct — realm existence is not a user-enumeration
+    %% oracle and is needed for routing.
+    #abort{reason_uri = RealmReason} =
+        bondy_wamp_protocol:abort_message(no_such_realm),
+    ?assertNotEqual(?WAMP_AUTHENTICATION_FAILED, RealmReason).
+
+%% -----------------------------------------------------------------------------
+%% bondy_wamp_protocol:init
+%% -----------------------------------------------------------------------------
+
+init_error(_Config) ->
+    UnsupportedSubProtocol = {ws, binary, erl},
+    Peer = {{127, 0, 0, 1}, 7},
+    Options = #{},
+    Result = bondy_wamp_protocol:init(UnsupportedSubProtocol, Peer, Options),
+    ?assertEqual({error, invalid_subprotocol, undefined}, Result).
+
+init_ok(_Config) ->
+    SubProtocol = {raw, binary, erl},
+    Peer = {{127, 0, 0, 1}, 7},
+    Options = #{},
+    {ok, State} = bondy_wamp_protocol:init(SubProtocol, Peer, Options),
+
+    Context = bondy_wamp_protocol:context(State),
+    SessionId = bondy_context:session_id(Context),
+    ?assertEqual(SessionId, bondy_wamp_protocol:session_id(State)),
+    ?assertEqual(Peer, bondy_wamp_protocol:peer(State)),
+    ?assertEqual(undefined, bondy_wamp_protocol:agent(State)),
+    ?assertEqual(undefined, bondy_wamp_protocol:realm_uri(State)),
+    ?assertError(function_clause, bondy_wamp_protocol:ref(State)).
+
+%% -----------------------------------------------------------------------------
+%% bondy_wamp_protocol:throttle
+%% -----------------------------------------------------------------------------
+
+throttle_disabled_by_default(_Config) ->
+    %% With the feature off (the default), the throttle is always `ok`.
+    ok = bondy_config:set([security, rate_limit], undefined),
+    {ok, State} = bondy_wamp_protocol:init(
+        {raw, binary, erl}, {{10, 9, 9, 9}, 5000}, #{}
+    ),
+    [
+        ?assertEqual(ok, bondy_wamp_protocol:throttle(auth, State))
+     || _ <- lists:seq(1, 50)
+    ].
+
+throttle_when_enabled(_Config) ->
+    %% Enable with a tiny capacity so the bucket exhausts deterministically.
+    ok = bondy_config:set([security, rate_limit], #{
+        enabled => true,
+        auth => #{rate => 1, capacity => 3}
+    }),
+    try
+        %% A distinct source IP => its own bucket (no interference).
+        {ok, State} = bondy_wamp_protocol:init(
+            {raw, binary, erl}, {{10, 7, 7, 7}, 5000}, #{}
+        ),
+        ?assertEqual(ok, bondy_wamp_protocol:throttle(auth, State)),
+        ?assertEqual(ok, bondy_wamp_protocol:throttle(auth, State)),
+        ?assertEqual(ok, bondy_wamp_protocol:throttle(auth, State)),
+        ?assertEqual(throttled, bondy_wamp_protocol:throttle(auth, State)),
+
+        %% A different class (handshake) has its own independent bucket.
+        ?assertEqual(ok, bondy_wamp_protocol:throttle(handshake, State))
+    after
+        ok = bondy_config:set([security, rate_limit], undefined)
+    end.
+
+%% A busy node refuses a new HELLO with a retryable
+%% wamp.error.unavailable ABORT before doing any realm or auth work.
+hello_admission_when_busy(_Config) ->
+    Ref = persistent_term:get({bondy_regulator_load, status}),
+    %% Suspend the sampler so the forced busy state cannot be reverted
+    %% by a tick mid-test (the test node is idle).
+    ok = sys:suspend(bondy_regulator_load),
+    ok = atomics:put(Ref, 1, 1),
+    try
+        ?assert(bondy_regulator_load:busy()),
+
+        {ok, St} = bondy_wamp_protocol:init(
+            {raw, binary, erl}, {{10, 8, 8, 8}, 5000}, #{}
+        ),
+        Hello = bondy_wamp_message:hello(
+            <<"com.example.test.wamp_protocol">>,
+            #{roles => #{caller => #{}}}
+        ),
+        Data = bondy_wamp_encoding:encode(Hello, erl),
+
+        ?assertMatch(
+            {stop, ?WAMP_UNAVAILABLE, [_Abort], _},
+            bondy_wamp_protocol:handle_inbound(Data, St)
+        )
+    after
+        ok = atomics:put(Ref, 1, 0),
+        ok = sys:resume(bondy_regulator_load)
+    end.
+
+%% With the gate disabled a busy node still processes the HELLO (here it
+%% fails later on the unknown realm — proving it got past admission).
+hello_admission_disabled(_Config) ->
+    Ref = persistent_term:get({bondy_regulator_load, status}),
+    ok = sys:suspend(bondy_regulator_load),
+    ok = atomics:put(Ref, 1, 1),
+    ok = bondy_config:set([load_regulation, hello, enabled], false),
+    try
+        {ok, St} = bondy_wamp_protocol:init(
+            {raw, binary, erl}, {{10, 8, 8, 9}, 5000}, #{}
+        ),
+        Hello = bondy_wamp_message:hello(
+            <<"com.example.test.wamp_protocol.does_not_exist">>,
+            #{roles => #{caller => #{}}}
+        ),
+        Data = bondy_wamp_encoding:encode(Hello, erl),
+
+        Result = bondy_wamp_protocol:handle_inbound(Data, St),
+        ?assertMatch({stop, _, _, _}, Result),
+        {stop, Uri, _, _} = Result,
+        ?assertNotEqual(?WAMP_UNAVAILABLE, Uri)
+    after
+        ok = bondy_config:set([load_regulation, hello, enabled], true),
+        ok = atomics:put(Ref, 1, 0),
+        ok = sys:resume(bondy_regulator_load)
+    end.
+
+%% A node whose memory use is above its high watermark refuses a new
+%% HELLO with the same retryable wamp.error.unavailable ABORT as a busy
+%% one, and before any realm or auth work: the realm here does not exist,
+%% and the refusal comes first. The state is the real sampler's (see
+%% `bondy_ct:with_memory_high/1'), not a forced status, so this covers
+%% the sensor-to-gate path; once memory is back to normal the same HELLO
+%% gets past admission and fails on the realm instead.
+hello_admission_under_memory_pressure(_Config) ->
+    Hello = bondy_wamp_message:hello(
+        <<"com.example.test.wamp_protocol.does_not_exist">>,
+        #{roles => #{caller => #{}}}
+    ),
+    Data = bondy_wamp_encoding:encode(Hello, erl),
+    Subprotocol = {raw, binary, erl},
+    NewState = fun() ->
+        {ok, St} = bondy_wamp_protocol:init(
+            Subprotocol, {{10, 8, 8, 10}, 5000}, #{}
+        ),
+        St
+    end,
+
+    bondy_ct:with_memory_high(fun() ->
+        %% Not the load gate: the node is idle.
+        ?assertNot(bondy_regulator_load:busy()),
+        {stop, Uri, [Bin], _} =
+            bondy_wamp_protocol:handle_inbound(Data, NewState()),
+        ?assertEqual(?WAMP_UNAVAILABLE, Uri),
+        %% The message names the condition, so a client's logs tell it
+        %% from an overloaded node.
+        {[#abort{details = Details}], <<>>} =
+            bondy_wamp_encoding:decode(Subprotocol, Bin),
+        ?assertMatch(
+            #{
+                <<"nature">> := <<"transient">>,
+                <<"message">> :=
+                    <<"The router is under memory pressure", _/binary>>
+            },
+            Details
+        )
+    end),
+
+    {stop, Uri2, _, _} = bondy_wamp_protocol:handle_inbound(Data, NewState()),
+    ?assertNotEqual(?WAMP_UNAVAILABLE, Uri2).
+
+throttle_message_class(_Config) ->
+    %% The per-message class needs BOTH the master flag AND its own opt-in flag.
+    %% Master on but message off => message class disabled.
+    ok = bondy_config:set([security, rate_limit], #{
+        enabled => true, message => #{enabled => false}
+    }),
+    ?assertNot(bondy_rate_limit:enabled(message)),
+    ?assertEqual(ok, bondy_rate_limit:throttle(message, sess_key())),
+
+    %% Both on => throttles after capacity.
+    ok = bondy_config:set([security, rate_limit], #{
+        enabled => true,
+        message => #{enabled => true, rate => 1, capacity => 2}
+    }),
+    try
+        ?assert(bondy_rate_limit:enabled(message)),
+        K = sess_key(),
+        ?assertEqual(ok, bondy_rate_limit:throttle(message, K)),
+        ?assertEqual(ok, bondy_rate_limit:throttle(message, K)),
+        ?assertEqual(throttled, bondy_rate_limit:throttle(message, K))
+    after
+        ok = bondy_config:set([security, rate_limit], undefined)
+    end.
+
+sess_key() ->
+    {session, erlang:unique_integer([positive])}.
+
+%% -----------------------------------------------------------------------------
+%% bondy_wamp_protocol:terminate
+%% -----------------------------------------------------------------------------
+
+terminate(_Config) ->
+    SubProtocol = {raw, binary, erl},
+
+    %% undefined context
+    StateNoContext =
+        {wamp_state, SubProtocol, cryptosign, undefined, #{}, 123, failed,
+            undefined, undefined, undefined},
+    ?assertEqual(undefined, bondy_wamp_protocol:context(StateNoContext)),
+    ?assertEqual(ok, bondy_wamp_protocol:terminate(StateNoContext)),
+
+    %% no session
+    Peer = {{127, 0, 0, 1}, 7},
+    {ok, State} = bondy_wamp_protocol:init(SubProtocol, Peer, #{}),
+    Context = bondy_wamp_protocol:context(State),
+    ?assertNot(bondy_context:has_session(Context)),
+    ?assertEqual(ok, bondy_wamp_protocol:terminate(State)).
+
+%% -----------------------------------------------------------------------------
+%% bondy_wamp_protocol:handle_inbound
+%% -----------------------------------------------------------------------------
+
+handle_inbound(_Config) ->
+    EncodingUnsupported = unsupported,
+    SubProtocolInvalid = {ws, text, EncodingUnsupported},
+    StateInvalidSP =
+        {wamp_state, SubProtocolInvalid, wampcra, undefined, #{}, 123,
+            establishing, undefined, undefined, undefined},
+    Error = {unsupported_encoding, EncodingUnsupported},
+    ?assertError(
+        Error, bondy_wamp_protocol:handle_inbound(<<>>, StateInvalidSP)
+    ).
+
+%% An `erl` peer can send any term `binary_to_term/2` accepts. A list with an
+%% improper tail or a tuple below the message level has no WAMP value, so the
+%% frame is refused as malformed, as a JSON frame that does not parse is.
+a_term_outside_the_wamp_data_model_is_a_protocol_violation(_Config) ->
+    Realm = ~"com.example.test.wamp_protocol",
+    lists:foreach(
+        fun(Value) ->
+            {ok, St} = bondy_wamp_protocol:init(
+                {raw, binary, erl}, {{127, 0, 0, 1}, 5000}, #{}
+            ),
+            Data = term_to_binary([
+                ?HELLO, Realm, #{~"roles" => #{~"caller" => #{}}, ~"x" => Value}
+            ]),
+            ?assertMatch(
+                {stop, ?WAMP_PROTOCOL_VIOLATION, [_], _},
+                bondy_wamp_protocol:handle_inbound(Data, St),
+                Value
+            )
+        end,
+        [[1 | 2], [[~"a", 1 | ~"b"]], {1, 2}]
+    ).
+
+invalid_json_is_a_decoding_error(_Config) ->
+    assert_abort(
+        {ws, text, json},
+        ~"An error occurred while deserealising a message.",
+        [
+            ~"[",
+            ~"[1,\"com.x\",{}]x",
+            ~"[1,\"com.x\",{]",
+            ~"[48,1,{}]",
+            ~"[48,1,{]"
+        ]
+    ).
+
+a_frame_that_is_not_an_array_is_an_invalid_message(_Config) ->
+    Text = ~"An invalid message was received.",
+    assert_abort({ws, text, json}, Text, [~"{}", ~"\"x\"", ~"1", ~"null"]),
+    assert_abort(
+        {ws, binary, cbor},
+        Text,
+        [iolist_to_binary(bondy_cbor:encode(V)) || V <- [#{}, ~"x", 1, null]]
+    ).
+
+an_invalid_id_is_an_invalid_message(_Config) ->
+    Text = ~"An invalid message was received.",
+    assert_abort(
+        {ws, text, json},
+        Text,
+        [
+            ~"[48,\"a\",{},\"com.p\"]",
+            ~"[48,-1,{},\"com.p\"]",
+            ~"[48,9007199254740993,{},\"com.p\"]",
+            ~"[48,1.5,{},\"com.p\",[1]]"
+        ]
+    ),
+    assert_abort(
+        {ws, binary, cbor},
+        Text,
+        [iolist_to_binary(bondy_cbor:encode([48, ~"a", #{}, ~"com.p"]))]
+    ).
+
+a_field_of_the_wrong_type_is_an_invalid_message(_Config) ->
+    Text = ~"An invalid message was received.",
+    assert_abort(
+        {ws, text, json},
+        Text,
+        [
+            ~"[1,10,{\"roles\":{\"caller\":{}}}]",
+            ~"[1,\"com.x\",10]",
+            ~"[2,1,10]",
+            ~"[3,10,\"wamp.close.x\"]",
+            ~"[4,\"ticket\",10]",
+            ~"[5,\"signature\",10]",
+            ~"[6,1,\"x\"]",
+            ~"[8,\"x\",1,{},\"wamp.error.x\"]",
+            ~"[8,48,1,10,\"wamp.error.x\"]",
+            ~"[32,1,10,\"com.p\"]",
+            ~"[48,1,10,\"com.p\"]",
+            ~"[48,1,{},10]",
+            ~"[50,1,10]",
+            ~"[67,1,10]"
+        ]
+    ),
+    assert_abort(
+        {ws, binary, cbor},
+        Text,
+        [iolist_to_binary(bondy_cbor:encode([48, 1, 10, ~"com.p"]))]
+    ).
+
+a_partially_decoded_message_is_validated(_Config) ->
+    Enc = fun(L) -> iolist_to_binary(bondy_cbor:encode(L)) end,
+    Invalid = [
+        {{ws, text, json}, ~"[16,1,{\"exclude_me\":1},\"com.p\",[1]]"},
+        {
+            {ws, binary, cbor},
+            Enc([16, 1, #{~"exclude_me" => 1}, ~"com.p", [1]])
+        },
+        {{ws, text, json}, ~"[48,1,{\"timeout\":\"x\"},\"com.p\",[1]]"}
+    ],
+    lists:foreach(
+        fun({Subprotocol, Frame}) ->
+            {ok, St} = bondy_wamp_protocol:init(
+                Subprotocol, {{127, 0, 0, 1}, 5000}, #{}
+            ),
+            ?assertMatch(
+                {stop, ?WAMP_PROTOCOL_VIOLATION, [_], _},
+                bondy_wamp_protocol:handle_inbound(Frame, St),
+                Frame
+            )
+        end,
+        Invalid
+    ),
+    {ok, St} = bondy_wamp_protocol:init(
+        {ws, text, json}, {{127, 0, 0, 1}, 5000}, #{}
+    ),
+    {reply, [Error], _} = bondy_wamp_protocol:handle_inbound(
+        ~"[16,1,{},\"com..p\",[1]]", St
+    ),
+    ?assertNotEqual(
+        nomatch,
+        binary:match(iolist_to_binary(Error), ~"is not a valid WAMP URI")
+    ).
+
+invalid_hello_roles_are_a_protocol_violation(_Config) ->
+    {ok, St} = bondy_wamp_protocol:init(
+        {ws, text, json}, {{127, 0, 0, 1}, 5000}, #{}
+    ),
+    ?assertMatch(
+        {stop, ?WAMP_PROTOCOL_VIOLATION, [_], _},
+        bondy_wamp_protocol:handle_inbound(~"[1,\"com.x\",{\"roles\":{}}]", St)
+    ).
+
+invalid_cbor_is_a_decoding_error(_Config) ->
+    Enc = fun(L) -> iolist_to_binary(bondy_cbor:encode(L)) end,
+    Hello = Enc([1, ~"com.x", #{}]),
+    Call = Enc([48, 1, #{}, ~"com.p", [1]]),
+    assert_abort(
+        {ws, binary, cbor},
+        ~"An error occurred while deserealising a message.",
+        [
+            <<>>,
+            <<16#85, 16#18, 48, 16#1A, 0>>,
+            <<16#84, 16#18, 48, 1, 16#A0>>,
+            binary:part(Hello, 0, byte_size(Hello) - 1),
+            <<Hello/binary, 0>>,
+            <<16#83, 1, 16#1F, 16#A0>>,
+            <<16#83, 1, 16#F8, 0, 16#A0>>,
+            binary:part(Call, 0, byte_size(Call) - 1),
+            <<Call/binary, 0>>,
+            Enc([48, 1, #{}, ~"com.p", #{~"a" => 1}])
+        ]
+    ).
+
+%% The router passes a payload on as received, so one that does not complete
+%% the frame as a WAMP message aborts the sender before anything is routed.
+a_malformed_payload_is_a_decoding_error(_Config) ->
+    assert_abort(
+        {ws, text, json},
+        ~"An error occurred while deserealising a message.",
+        [
+            ~"[48,1,{},\"com.p\",[1]]x",
+            ~"[48,1,{},\"com.p\",[1",
+            ~"[48,1,{},\"com.p\",[1],{},\"extra\"]",
+            ~"[16,1,{},\"com.t\",[1]]x"
+        ]
+    ).
+
+assert_abort(Subprotocol, Text, Frames) ->
+    lists:foreach(
+        fun(Frame) ->
+            {ok, St} = bondy_wamp_protocol:init(
+                Subprotocol, {{127, 0, 0, 1}, 5000}, #{}
+            ),
+            {stop, ?WAMP_PROTOCOL_VIOLATION, [Abort], _} =
+                bondy_wamp_protocol:handle_inbound(Frame, St),
+            ?assertNotEqual(
+                nomatch, binary:match(iolist_to_binary(Abort), Text), Frame
+            )
+        end,
+        Frames
+    ).
+
+%% -----------------------------------------------------------------------------
+%% HELLO must not reveal whether a user exists
+%% -----------------------------------------------------------------------------
+
+%% A wamp-scram HELLO for an unknown authid, or for a real user naming a role
+%% it does not hold, gets a CHALLENGE with the same keys as a real user's, and
+%% an unknown authid gets the same salt every time, as a real user does. A
+%% wrong proof is then refused with the same ABORT in every case.
+unknown_authid_gets_a_challenge_like_a_known_one(_Config) ->
+    Uri = ~"com.example.test.wamp_protocol.enumeration",
+    _ = bondy_realm:create(#{
+        uri => Uri,
+        description => ~"user enumeration test realm",
+        authmethods => [~"wamp-scram"],
+        security_enabled => true,
+        users => [#{username => ~"alice", password => ~"aWe11KeptSecret"}],
+        sources => [
+            #{
+                usernames => [~"alice"],
+                authmethod => ~"wamp-scram",
+                cidr => ~"0.0.0.0/0"
+            }
+        ]
+    }),
+    {#challenge{auth_method = ~"wamp-scram", extra = Known}, KnownSt} =
+        scram_hello(Uri, ~"alice", #{}),
+    {#challenge{auth_method = ~"wamp-scram", extra = Ghost1}, GhostSt} =
+        scram_hello(Uri, ~"ghost", #{}),
+    {#challenge{extra = Ghost2}, _} = scram_hello(Uri, ~"Ghost", #{}),
+    {#challenge{extra = NoRole}, NoRoleSt} =
+        scram_hello(Uri, ~"alice", #{authrole => ~"not_a_member"}),
+
+    Keys = lists:sort(maps:keys(Known)),
+    ?assertEqual(Keys, lists:sort(maps:keys(Ghost1))),
+    ?assertEqual(Keys, lists:sort(maps:keys(NoRole))),
+    ?assertEqual(maps:get(~"salt", Ghost1), maps:get(~"salt", Ghost2)),
+    ?assertNotEqual(maps:get(~"salt", Known), maps:get(~"salt", Ghost1)),
+
+    Refusal = wrong_proof(KnownSt),
+    ?assertMatch({stop, ?WAMP_AUTHENTICATION_FAILED, [_], _}, Refusal),
+    ?assertEqual(element(3, Refusal), element(3, wrong_proof(GhostSt))),
+    ?assertEqual(element(3, Refusal), element(3, wrong_proof(NoRoleSt))).
+
+scram_hello(RealmUri, Authid, Extra) ->
+    {ok, St} = bondy_wamp_protocol:init(
+        {raw, binary, erl}, {{127, 0, 0, 1}, 5000}, #{}
+    ),
+    Hello = bondy_wamp_message:hello(RealmUri, Extra#{
+        roles => #{caller => #{}},
+        authid => Authid,
+        authmethods => [~"wamp-scram"],
+        authextra => #{
+            ~"nonce" => base64:encode(crypto:strong_rand_bytes(16))
+        }
+    }),
+    Data = bondy_wamp_encoding:encode(Hello, erl),
+    {reply, [Reply], St1} = bondy_wamp_protocol:handle_inbound(Data, St),
+    {[Msg], <<>>} = bondy_wamp_encoding:decode({raw, binary, erl}, Reply),
+    {Msg, St1}.
+
+wrong_proof(St) ->
+    Authenticate = bondy_wamp_message:authenticate(
+        base64:encode(crypto:strong_rand_bytes(32)), #{}
+    ),
+    bondy_wamp_protocol:handle_inbound(
+        bondy_wamp_encoding:encode(Authenticate, erl), St
+    ).
+
+%% -----------------------------------------------------------------------------
+%% A client may send ERROR only for an INVOCATION
+%% -----------------------------------------------------------------------------
+
+%% WAMP defines no ERROR for an INTERRUPT, an EVENT or a RESULT, and a client
+%% never receives a CALL, SUBSCRIBE or PUBLISH it could answer; a callee answers
+%% a `kill` cancel with ERROR for the INVOCATION. Any other ERROR request type
+%% is a protocol incompatible message, which the spec ("Protocol Violations")
+%% makes an ABORT. Each type gets its own session, since the ABORT ends it.
+an_error_for_anything_but_an_invocation_is_a_protocol_violation(_Config) ->
+    Uri = ~"com.example.test.wamp_protocol.error_types",
+    _ = bondy_realm:create(#{
+        uri => Uri,
+        description => ~"inbound ERROR request type test realm",
+        authmethods => [?WAMP_ANON_AUTH],
+        security_enabled => true,
+        sources => [
+            #{
+                usernames => [~"anonymous"],
+                authmethod => ?WAMP_ANON_AUTH,
+                cidr => ~"0.0.0.0/0"
+            }
+        ]
+    }),
+    Hello = bondy_wamp_message:hello(Uri, #{
+        roles => #{callee => #{features => #{call_canceling => true}}},
+        authmethods => [?WAMP_ANON_AUTH]
+    }),
+    Outcomes = [
+        {Type, error_outcome(Hello, Type)}
+     || Type <- [?INTERRUPT, ?EVENT, ?RESULT, ?CALL, ?SUBSCRIBE, ?PUBLISH]
+    ],
+    ?assertEqual(
+        [{Type, protocol_violation} || {Type, _} <- Outcomes], Outcomes
+    ).
+
+error_outcome(Hello, Type) ->
+    {ok, St0} = bondy_wamp_protocol:init(
+        {raw, binary, erl}, {{127, 0, 0, 1}, 5000}, #{}
+    ),
+    {reply, [Welcome], St1} = bondy_wamp_protocol:handle_inbound(
+        bondy_wamp_encoding:encode(Hello, erl), St0
+    ),
+    {[#welcome{}], <<>>} = bondy_wamp_encoding:decode(
+        {raw, binary, erl}, Welcome
+    ),
+    Error = bondy_wamp_message:error(Type, 1, #{}, ?WAMP_CANCELLED),
+    case
+        bondy_wamp_protocol:handle_inbound(
+            bondy_wamp_encoding:encode(Error, erl), St1
+        )
+    of
+        {stop, ?WAMP_PROTOCOL_VIOLATION, [_], _} -> protocol_violation;
+        Other -> Other
+    end.
+
+%% -----------------------------------------------------------------------------
+%% bondy_wamp_tcp_connection_handler: format_status
+%% -----------------------------------------------------------------------------
+
+%% `sys:get_status/1` on an established RawSocket connection shows the
+%% handler's state with only its protocol state replaced, by
+%% `bondy_wamp_protocol:format_status/1`.
+tcp_handler_status_redacts_the_protocol_state(_Config) ->
+    Realm = bondy_realm:create(~"com.example.test.wamp_protocol.status"),
+    ok = bondy_realm:disable_security(Realm),
+    Port = ranch:get_port(wamp_tcp),
+    {ok, Sock} = gen_tcp:connect(
+        {127, 0, 0, 1}, Port, [binary, {active, false}], 5000
+    ),
+    try
+        ok = gen_tcp:send(Sock, <<16#7F, 15:4, 1:4, 0:8, 0:8>>),
+        {ok, <<16#7F, _:4, 1:4, 0:8, 0:8>>} = gen_tcp:recv(Sock, 4, 5000),
+        Hello = iolist_to_binary(
+            json:encode([
+                1, bondy_realm:uri(Realm), #{roles => #{caller => #{}}}
+            ])
+        ),
+        ok = gen_tcp:send(
+            Sock, <<0:5, 0:3, (byte_size(Hello)):24, Hello/binary>>
+        ),
+        {ok, <<0:5, 0:3, Len:24>>} = gen_tcp:recv(Sock, 4, 5000),
+        {ok, WelcomeBin} = gen_tcp:recv(Sock, Len, 5000),
+        ?assertMatch([2, _, #{}], json:decode(WelcomeBin)),
+        Checked = [
+            check_redacted_status(Pid)
+         || Pid <- ranch:procs(wamp_tcp, connections),
+            protocol_state_index(sys:get_state(Pid)) =/= undefined
+        ],
+        ?assertNotEqual([], Checked)
+    after
+        gen_tcp:close(Sock)
+    end.
+
+%% @private
+check_redacted_status(Pid) ->
+    Raw = sys:get_state(Pid),
+    I = protocol_state_index(Raw),
+    {status, Pid, _, [_, _, _, _, Misc]} = sys:get_status(Pid),
+    [Shown] = [St || {data, L} <- Misc, {"State", St} <- L],
+    Expected = setelement(
+        I, Raw, bondy_wamp_protocol:format_status(element(I, Raw))
+    ),
+    ?assertEqual(Expected, Shown).
+
+%% @private
+protocol_state_index(State) ->
+    Is = [
+        I
+     || {I, E} <- lists:enumerate(tuple_to_list(State)),
+        is_tuple(E),
+        tuple_size(E) > 0,
+        element(1, E) =:= wamp_state
+    ],
+    case Is of
+        [I] -> I;
+        [] -> undefined
+    end.
+
+%% -----------------------------------------------------------------------------
+%% bondy_wamp_tcp_connection_handler: a router-initiated close names its reason
+%% -----------------------------------------------------------------------------
+
+%% A HELLO for a realm that does not exist makes the router send an ABORT and
+%% close the connection. The handler stops with `shutdown' and its `terminate/2'
+%% logged `reason => shutdown' — every router-initiated close looked the same,
+%% which is how 218 of them in a customer's logs went unexplained. The ABORT's
+%% reason URI is in the handler state (`shutdown_reason'); the log line must
+%% carry it. The wire half (an ABORT with that URI) is asserted too, so the
+%% case cannot pass by logging some other close.
+router_abort_close_logs_the_reason(_Config) ->
+    #{level := Primary} = logger:get_primary_config(),
+    ok = logger:set_primary_config(level, all),
+    ok = logger:add_handler(?MODULE, ?MODULE, #{config => #{pid => self()}}),
+    try
+        Port = ranch:get_port(wamp_tcp),
+        {ok, Sock} = gen_tcp:connect(
+            {127, 0, 0, 1}, Port, [binary, {active, false}], 5000
+        ),
+        %% RawSocket handshake: max length nibble 15, serializer 1 (JSON).
+        ok = gen_tcp:send(Sock, <<16#7F, 15:4, 1:4, 0:8, 0:8>>),
+        {ok, <<16#7F, _:4, 1:4, 0:8, 0:8>>} = gen_tcp:recv(Sock, 4, 5000),
+
+        Hello = iolist_to_binary(
+            json:encode([
+                1,
+                ~"com.example.no.such.realm",
+                #{roles => #{caller => #{}}}
+            ])
+        ),
+        ok = gen_tcp:send(
+            Sock, <<0:5, 0:3, (byte_size(Hello)):24, Hello/binary>>
+        ),
+        {ok, <<0:5, 0:3, Len:24>>} = gen_tcp:recv(Sock, 4, 5000),
+        {ok, AbortBin} = gen_tcp:recv(Sock, Len, 5000),
+        ?assertMatch(
+            [3, #{}, ?WAMP_NO_SUCH_REALM], json:decode(AbortBin)
+        ),
+
+        receive
+            {closed_by_router, Reason} ->
+                ?assertEqual(?WAMP_NO_SUCH_REALM, Reason)
+        after 5000 ->
+            ct:fail(no_close_log_event)
+        end,
+        ok = gen_tcp:close(Sock)
+    after
+        ok = logger:remove_handler(?MODULE),
+        ok = logger:set_primary_config(level, Primary)
+    end.
+
+%% `bondy_ct` configures `json.float_format` as `[short]`; the encoder's own
+%% default prints `0.1` as `0.1000000000000000`.
+the_configured_json_float_format_reaches_the_encoder(_Config) ->
+    M = bondy_wamp_message:result(1, #{}, [0.1]),
+    ?assertEqual(
+        ~"[50,1,{},[0.1]]",
+        iolist_to_binary(bondy_wamp_encoding:encode(M, json))
+    ).
+
+%% Through the WebSocket listener `bondy_ct` starts on port 18080.
+a_batched_offer_falls_through_to_the_next(_Config) ->
+    ?assertEqual(
+        {upgrade, ~"wamp.2.json"},
+        ws_handshake([~"wamp.2.json.batched", ~"wamp.2.json"])
+    ).
+
+a_batched_only_offer_is_refused(_Config) ->
+    ?assertMatch(
+        {response, Status} when Status >= 400,
+        ws_handshake([~"wamp.2.json.batched", ~"wamp.2.msgpack.batched"])
+    ).
+
+ws_handshake(Offered) ->
+    {ok, Conn} = gun:open("127.0.0.1", 18080, #{protocols => [http]}),
+    try
+        {ok, http} = gun:await_up(Conn, 5000),
+        Ref = gun:ws_upgrade(
+            Conn, "/ws", [], #{protocols => [{P, gun_ws_h} || P <- Offered]}
+        ),
+        case gun:await(Conn, Ref, 5000) of
+            {upgrade, [~"websocket"], Headers} ->
+                {_, Chosen} = lists:keyfind(
+                    ~"sec-websocket-protocol", 1, Headers
+                ),
+                {upgrade, Chosen};
+            {response, _IsFin, Status, _Headers} ->
+                {response, Status}
+        end
+    after
+        ok = gun:close(Conn)
+    end.
+
+%% logger handler callback for the case above: forwards the handler's close
+%% line, and nothing else, to the test process.
+log(
+    #{msg := {report, #{description := "Connection closed by router"} = R}},
+    #{config := #{pid := Pid}}
+) ->
+    Pid ! {closed_by_router, maps:get(reason, R)},
+    ok;
+log(_Event, _Config) ->
+    ok.

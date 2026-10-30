@@ -1,0 +1,279 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+%%
+%% The list-mode GC's unservable-root guard.
+%%
+%% `prune_unreachable/2` marks by walking the keep-roots through PRESENT pages
+%% (`fold_pages/4` silently skips a missing one), so a hole under the current
+%% root under-marks everything below the hole and the sweep then deletes live,
+%% reachable pages — amplifying a small anomaly (Fly s16: two absent pages)
+%% into a large permanent loss. `bondy_mst:gc/2` therefore refuses to sweep
+%% while the current root is unservable, keeps the garbage for the cycle, and
+%% emits `[bondy_mst, gc, aborted]`.
+%% =============================================================================
+
+-module(bondy_mst_gc_guard_test).
+
+-include_lib("eunit/include/eunit.hrl").
+
+-define(N, 300).
+
+%% The abort's evidence must survive the log. A field occurrence is rare and
+%% its log line ages out of the platform's buffer long before anyone looks
+%% (Fly s25: the missing hashes were lost exactly this way), so the report is
+%% retained in-node and recoverable later via `gc_aborts/0`. The
+%% classification is the payload that matters: it names WHICH layer lost the
+%% page, which a bare hash list does not.
+gc_abort_retains_classified_report_test() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    ok = bondy_mst:forget_gc_aborts(),
+    T0 = new_tree(),
+    T = lists:foldl(
+        fun(K, Acc) -> bondy_mst:put(Acc, K, K) end, T0, lists:seq(1, ?N)
+    ),
+    Tab = page_tab(bondy_mst:root(T)),
+    {Hash, Row} = drop_root_referenced_page(Tab),
+
+    try
+        _ = bondy_mst:gc(T, []),
+
+        [Report | _] = bondy_mst:gc_aborts(),
+        #{
+            name := <<"gc_guard">>,
+            root := Root,
+            missing_count := 1,
+            immediate := Immediate,
+            delayed := Delayed,
+            classification := Classification
+        } = Report,
+
+        ?assertEqual(bondy_mst:root(T), Root),
+        %% A genuinely deleted row is `absent` at both probes, and the
+        %% verdict must be `deleted` — the store-layer signal.
+        ?assertEqual([{Hash, absent}], Immediate),
+        ?assertEqual([{Hash, absent}], Delayed),
+        ?assertEqual(deleted, Classification),
+
+        %% A page that is merely TOMBSTONED reads back as such, so the same
+        %% tripwire distinguishes "freed but readable" from "gone" — the
+        %% distinction that separates a consumer/read-path fault from a
+        %% store-layer one.
+        true = ets:insert(Tab, Row),
+        ok = bondy_mst:forget_gc_aborts(),
+        Store = bondy_mst:store(T),
+        ?assertEqual(live, bondy_mst_store:page_state(Store, Hash)),
+        [{_, Page, _}] = ets:lookup(Tab, Hash),
+        _ = bondy_mst_store:free(Store, Hash, Page),
+        ?assertMatch({tombstoned, _}, bondy_mst_store:page_state(Store, Hash)),
+
+        %% A plain `free/3` records no GC abort.
+        ?assertEqual([], bondy_mst:gc_aborts())
+    after
+        try
+            bondy_mst:forget_gc_aborts()
+        catch
+            _:_ -> ok
+        end,
+        try
+            bondy_mst:destroy(T)
+        catch
+            _:_ -> ok
+        end
+    end.
+
+gc_aborts_on_unservable_root_test() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    T0 = new_tree(),
+    T = lists:foldl(
+        fun(K, Acc) -> bondy_mst:put(Acc, K, K) end,
+        T0,
+        lists:seq(1, ?N)
+    ),
+    Tab = page_tab(bondy_mst:root(T)),
+    {Hash, Row} = drop_root_referenced_page(Tab),
+
+    SizeBefore = ets:info(Tab, size),
+    Self = self(),
+    Ref = make_ref(),
+    HandlerId = {?MODULE, Ref},
+    ok = telemetry:attach(
+        HandlerId,
+        [bondy_mst, gc, aborted],
+        fun(_E, Meas, Meta, _) -> Self ! {Ref, Meas, Meta} end,
+        undefined
+    ),
+
+    try
+        T1 = bondy_mst:gc(T, []),
+
+        %% The guard fired, attributed to the store's name (the instance id
+        %% in production — what makes the dashboard counter actionable).
+        receive
+            {Ref, #{missing_count := 1}, #{
+                reason := unservable_root, name := <<"gc_guard">>
+            }} ->
+                ok
+        after 1000 ->
+            error(gc_abort_event_not_emitted)
+        end,
+
+        %% ...and nothing was swept: without the guard the sweep would have
+        %% deleted every page below the hole (the amplification).
+        ?assertEqual(SizeBefore, ets:info(Tab, size)),
+
+        %% Restoring the page heals the tree, and the next gc runs normally
+        %% and leaves it fully servable.
+        true = ets:insert(Tab, Row),
+        T2 = bondy_mst:gc(T1, []),
+        ?assertEqual([], bondy_mst:missing_set(T2, bondy_mst:root(T2))),
+        ?assertEqual(?N, length(bondy_mst:to_list(T2))),
+
+        receive
+            {Ref, _, _} -> error(unexpected_second_abort)
+        after 100 -> ok
+        end,
+
+        %% Silence unused-variable warnings by asserting identity: the guard
+        %% returns the tree unchanged.
+        ?assertEqual(bondy_mst:root(T), bondy_mst:root(T1)),
+        _ = Hash,
+        ok
+    after
+        telemetry:detach(HandlerId),
+        try
+            bondy_mst:destroy(T)
+        catch
+            _:_ -> ok
+        end
+    end.
+
+%% The reachability sweep's candidate snapshot precedes the mark walk —
+%% `prune_unreachable/2`'s order is load-bearing. A page inserted after the
+%% snapshot must survive the cycle regardless of reachability; with the
+%% inverse order (mark, then select) it is swept ON ARRIVAL, and the writer
+%% that then publishes a root referencing it holds an unservable root.
+%% `bloomfi:new/1` is called exactly once per collection, at the start of the
+%% mark walk, so an insert injected there lands after the snapshot under the
+%% correct order and inside the mark-before-select window under the inverse.
+sweep_spares_pages_inserted_after_snapshot_test() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    T0 = new_tree(),
+    T = lists:foldl(
+        fun(K, Acc) -> bondy_mst:put(Acc, K, K) end,
+        T0,
+        lists:seq(1, ?N)
+    ),
+
+    %% A page that is NOT reachable from T's root, built in a private
+    %% store — the shape of a sync-session page arriving mid-pull.
+    Foreign0 = bondy_mst:new(#{
+        store => bondy_mst_ets_store,
+        store_opts => #{name => <<"gc_guard_foreign">>},
+        merger => fun(_K, V, V) -> V end
+    }),
+    Foreign = bondy_mst:put(bondy_mst:put(Foreign0, -1, 1), -2, 1),
+    ForeignRoot = bondy_mst:root(Foreign),
+    ForeignPage = bondy_mst_store:get(bondy_mst:store(Foreign), ForeignRoot),
+
+    Key = {?MODULE, injected},
+    meck:new(bloomfi, [passthrough]),
+    meck:expect(bloomfi, new, fun(Size) ->
+        %% Runs inside gc/2's mark phase, in the collecting process.
+        {H, _} = bondy_mst:put_page(T, ForeignPage),
+        undefined = erlang:put(Key, H),
+        meck:passthrough([Size])
+    end),
+
+    try
+        T1 = bondy_mst:gc(T, []),
+        H = erlang:erase(Key),
+        ?assertEqual(ForeignRoot, H),
+        Store = bondy_mst:store(T1),
+        %% The injected page postdates the snapshot: it must be live,
+        %% not swept — it survives to the NEXT cycle, which may then
+        %% legitimately collect it as garbage.
+        ?assertEqual(live, bondy_mst_store:page_state(Store, H))
+    after
+        meck:unload(bloomfi),
+        _ = erlang:erase(Key),
+        try
+            bondy_mst:destroy(Foreign)
+        catch
+            _:_ -> ok
+        end,
+        try
+            bondy_mst:destroy(T)
+        catch
+            _:_ -> ok
+        end
+    end.
+
+%% `gc/2` collects by reachability only: an integer "epoch" argument is
+%% not a mode. A reachability-blind sweep is unsound under structural
+%% sharing (see the doc on `bondy_mst:gc/2`), so the call must be
+%% refused outright — never accepted by some backend as a
+%% tombstone-stamp prune.
+gc_refuses_non_list_argument_test() ->
+    T0 = new_tree(),
+    T = bondy_mst:put(T0, 1, 1),
+    try
+        ?assertError(
+            function_clause, bondy_mst:gc(T, erlang:monotonic_time())
+        )
+    after
+        try
+            bondy_mst:destroy(T)
+        catch
+            _:_ -> ok
+        end
+    end.
+
+%% =============================================================================
+%% HELPERS
+%% =============================================================================
+
+new_tree() ->
+    bondy_mst:new(#{
+        store => bondy_mst_ets_store,
+        store_opts => #{name => <<"gc_guard">>},
+        merger => fun(_K, V, V) -> V end
+    }).
+
+%% The store's page table is owned by this (the test) process; identified by
+%% its `<<"$root">>` row carrying THIS tree's root hash, so tables leaked by
+%% sibling tests in the same runner process cannot be confused with it.
+page_tab(RootHash) ->
+    Self = self(),
+    [Tab | _] = [
+        T
+     || T <- ets:all(),
+        ets:info(T, owner) =:= Self,
+        ets:info(T, type) =:= set,
+        try
+            ets:lookup(T, <<"$root">>) =:= [{<<"$root">>, RootHash}]
+        catch
+            _:_ -> false
+        end
+    ],
+    Tab.
+
+%% Deletes the first page the root references, returning the row so the test
+%% can restore it. The s16 fault, minimally.
+drop_root_referenced_page(Tab) ->
+    [{<<"$root">>, RootHash}] = ets:lookup(Tab, <<"$root">>),
+    [{RootHash, RootPage, _}] = ets:lookup(Tab, RootHash),
+    [Ref | _] = bondy_mst_page:refs(RootPage),
+    [Row] = ets:lookup(Tab, Ref),
+    true = ets:delete(Tab, Ref),
+    {Ref, Row}.
+
+%% The publication/collection post-conditions (`verify_published_root/2`,
+%% `verify_post_sweep/2`) are the only check in the tree that catches a merge
+%% publishing a root whose pages were never copied into the receiver's store;
+%% they ride along on every test run, armed by `{d, BONDY_MST_VERIFY}` in this
+%% app's test profile. If that define is dropped the checks compile out
+%% silently, so assert the net is up.
+post_conditions_are_armed_in_test_builds_test() ->
+    ?assert(bondy_mst:verify_default()).

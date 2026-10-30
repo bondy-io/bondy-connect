@@ -3,19 +3,14 @@
 %% SPDX-License-Identifier: Apache-2.0
 %% =============================================================================
 
-%% -----------------------------------------------------------------------------
-%% @doc An implementation of app_config behaviour.
-%% @end
-%% -----------------------------------------------------------------------------
 -module(bondy_wamp_config).
+-moduledoc """
+An implementation of `app_config` behaviour.
+""".
 -behaviour(app_config).
 
 -define(APP, wamp).
--define(JSON_ENCODE_OPTS, [
-]).
-
--define(JSON_DECODE_OPTS, [
-]).
+-define(JSON_ENCODE_OPTS, []).
 
 -export([get/1]).
 -export([get/2]).
@@ -24,50 +19,26 @@
 
 -compile({no_auto_import, [get/1]}).
 
-
-
 %% =============================================================================
 %% API
 %% =============================================================================
 
-
-
-%% -----------------------------------------------------------------------------
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
 init() ->
     ok = app_config:init(?APP, #{callback_mod => ?MODULE}),
     ok = init_json_serialization_opts(),
     ok = init_defaults(),
     ok.
 
-
-
-%% -----------------------------------------------------------------------------
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
 -spec get(Key :: list() | atom() | tuple()) -> term().
 
 get(Key) ->
     app_config:get(?APP, Key).
 
-
-%% -----------------------------------------------------------------------------
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
 -spec get(Key :: list() | atom() | tuple(), Default :: term()) -> term().
 
 get(Key, Default) ->
     app_config:get(?APP, Key, Default).
 
-
-%% -----------------------------------------------------------------------------
-%% @doc
-%% @end
-%% -----------------------------------------------------------------------------
 -spec set(Key :: key_value:key() | tuple(), Value :: term()) -> ok.
 
 set(status, Value) ->
@@ -75,17 +46,12 @@ set(status, Value) ->
     %% lifecycle so to avoid a loop (resulting in timeout) we avoid
     %% calling application:set_env/3.
     persistent_term:put({?APP, status}, Value);
-
 set(Key, Value) ->
     app_config:set(?APP, Key, Value).
-
-
-
 
 %% =============================================================================
 %% PRIVATE
 %% =============================================================================
-
 
 init_defaults() ->
     case get(uri_strictness, undefined) of
@@ -94,7 +60,6 @@ init_defaults() ->
         _ ->
             ok
     end.
-
 
 init_json_serialization_opts() ->
     case get([serialization, json, encode], undefined) of
@@ -105,22 +70,10 @@ init_json_serialization_opts() ->
             set([serialization, json, encode], EncodeOpts)
     end,
 
-    case get([serialization, json, decode], undefined) of
-        undefined ->
-            set([serialization, json, decode], ?JSON_DECODE_OPTS);
-        DecodeOpts0 ->
-            DecodeOpts = validate_json_opts(DecodeOpts0, ?JSON_DECODE_OPTS),
-            set([serialization, json, decode], DecodeOpts)
-    end,
-
     ok.
-
-
-
 
 validate_json_opts(Opts, Default) when is_list(Opts) ->
     validate_json_opts(maps:from_list(proplists:unfold(Opts)), Default);
-
 validate_json_opts(Opts, Default0) when is_map(Opts) ->
     Default1 = maps:from_list(proplists:unfold(Default0)),
     proplists:compact(maps:to_list(maps:merge(Default1, Opts))).

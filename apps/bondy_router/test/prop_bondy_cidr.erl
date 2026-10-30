@@ -1,0 +1,297 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+%% @doc Property-based tests for bondy_cidr (CIDR notation parsing and matching).
+%%
+%% Tests IPv4 and IPv6 CIDR notation parsing, mask operations, and matching.
+%% @end
+-module(prop_bondy_cidr).
+
+-include_lib("proper/include/proper.hrl").
+
+-export([
+    prop_parse_valid_ipv4_cidr/0,
+    prop_parse_valid_ipv6_cidr/0,
+    prop_is_type_accepts_valid/0,
+    prop_is_type_rejects_invalid/0,
+    prop_mask_ipv4_bounds/0,
+    prop_mask_ipv6_bounds/0,
+    prop_anchor_mask_idempotent/0,
+    prop_match_reflexive/0,
+    prop_match_same_maskbits_required/0,
+    prop_anchor_mask_preserves_maskbits/0
+]).
+
+%% =============================================================================
+%% Generators
+%% =============================================================================
+
+ipv4_octet() ->
+    range(0, 255).
+
+ipv4_address() ->
+    ?LET(
+        {A, B, C, D},
+        {ipv4_octet(), ipv4_octet(), ipv4_octet(), ipv4_octet()},
+        {A, B, C, D}
+    ).
+
+ipv4_maskbits() ->
+    range(0, 32).
+
+ipv4_cidr() ->
+    ?LET(
+        {Addr, Maskbits},
+        {ipv4_address(), ipv4_maskbits()},
+        {Addr, Maskbits}
+    ).
+
+ipv4_cidr_binary() ->
+    ?LET(
+        {{A, B, C, D}, Maskbits},
+        ipv4_cidr(),
+        list_to_binary(
+            io_lib:format("~B.~B.~B.~B/~B", [A, B, C, D, Maskbits])
+        )
+    ).
+
+malformed_cidr_binary() ->
+    ?LET(
+        {{A, B, C, D}, Mask},
+        {
+            ipv4_address(),
+            oneof([
+                ?LET(N, range(33, 999), integer_to_list(N)),
+                "x",
+                "",
+                "+8",
+                "-0",
+                " 8",
+                "8 ",
+                "8\n",
+                "8/9",
+                "8junk"
+            ])
+        },
+        list_to_binary(io_lib:format("~B.~B.~B.~B/~s", [A, B, C, D, Mask]))
+    ).
+
+ipv6_segment() ->
+    range(0, 65535).
+
+ipv6_address() ->
+    ?LET(
+        {A, B, C, D, E, F, G, H},
+        {
+            ipv6_segment(),
+            ipv6_segment(),
+            ipv6_segment(),
+            ipv6_segment(),
+            ipv6_segment(),
+            ipv6_segment(),
+            ipv6_segment(),
+            ipv6_segment()
+        },
+        {A, B, C, D, E, F, G, H}
+    ).
+
+ipv6_maskbits() ->
+    range(0, 128).
+
+ipv6_cidr() ->
+    ?LET(
+        {Addr, Maskbits},
+        {ipv6_address(), ipv6_maskbits()},
+        {Addr, Maskbits}
+    ).
+
+ipv6_cidr_binary() ->
+    ?LET(
+        {{A, B, C, D, E, F, G, H}, Maskbits},
+        ipv6_cidr(),
+        list_to_binary(
+            io_lib:format(
+                "~.16B:~.16B:~.16B:~.16B:~.16B:~.16B:~.16B:~.16B/~B",
+                [A, B, C, D, E, F, G, H, Maskbits]
+            )
+        )
+    ).
+
+any_cidr() ->
+    oneof([ipv4_cidr(), ipv6_cidr()]).
+
+invalid_cidr_term() ->
+    oneof([
+        ?LET(Addr, ipv4_address(), {Addr, 33}),
+        ?LET(Addr, ipv4_address(), {Addr, -1}),
+        ?LET(Addr, ipv6_address(), {Addr, 129}),
+        ?LET(Addr, ipv6_address(), {Addr, -1}),
+        {invalid, 16},
+        {{256, 0, 0, 0}, 8},
+        {{-1, 0, 0, 0}, 8},
+        <<"192.168.1.0/24">>,
+        "192.168.1.0/24",
+        42
+    ]).
+
+%% =============================================================================
+%% Properties: Parsing
+%% =============================================================================
+
+prop_parse_valid_ipv4_cidr() ->
+    ?FORALL(
+        CIDRBin,
+        ipv4_cidr_binary(),
+        begin
+            Result = bondy_cidr:parse(CIDRBin),
+            {Addr, Maskbits} = Result,
+            tuple_size(Addr) =:= 4 andalso
+                Maskbits >= 0 andalso Maskbits =< 32
+        end
+    ).
+
+prop_parse_valid_ipv6_cidr() ->
+    ?FORALL(
+        CIDRBin,
+        ipv6_cidr_binary(),
+        begin
+            Result = bondy_cidr:parse(CIDRBin),
+            {Addr, Maskbits} = Result,
+            tuple_size(Addr) =:= 8 andalso
+                Maskbits >= 0 andalso Maskbits =< 128
+        end
+    ).
+
+%% A valid address with a malformed mask is refused: out of the family's
+%% range, not decimal digits, signed, followed by anything, or empty.
+prop_parse_rejects_malformed_maskbits() ->
+    ?FORALL(
+        Bin,
+        malformed_cidr_binary(),
+        try bondy_cidr:parse(Bin) of
+            Parsed -> {accepted, Bin, Parsed} =:= refused
+        catch
+            error:badarg -> true
+        end
+    ).
+
+%% An address the strict parser refuses is refused whatever the mask. These
+%% shorthands are exactly what `inet:parse_address/1` silently widens.
+prop_parse_rejects_address_shorthand() ->
+    ?FORALL(
+        {Prefix, Maskbits},
+        {oneof(["10", "10.1", "127.1", "1.2.3.4.5", ""]), ipv4_maskbits()},
+        try
+            bondy_cidr:parse(
+                list_to_binary(io_lib:format("~s/~B", [Prefix, Maskbits]))
+            )
+        of
+            Parsed -> {accepted, Prefix, Parsed} =:= refused
+        catch
+            error:badarg -> true
+        end
+    ).
+
+%% =============================================================================
+%% Properties: Type Checking
+%% =============================================================================
+
+prop_is_type_accepts_valid() ->
+    ?FORALL(
+        CIDR,
+        any_cidr(),
+        bondy_cidr:is_type(CIDR)
+    ).
+
+prop_is_type_rejects_invalid() ->
+    ?FORALL(
+        Invalid,
+        invalid_cidr_term(),
+        not bondy_cidr:is_type(Invalid)
+    ).
+
+%% =============================================================================
+%% Properties: Mask Operations
+%% =============================================================================
+
+prop_mask_ipv4_bounds() ->
+    ?FORALL(
+        CIDR,
+        ipv4_cidr(),
+        begin
+            {_Addr, Maskbits} = CIDR,
+            Mask = bondy_cidr:mask(CIDR),
+            Mask >= 0 andalso Mask < (1 bsl Maskbits)
+        end
+    ).
+
+prop_mask_ipv6_bounds() ->
+    ?FORALL(
+        CIDR,
+        ipv6_cidr(),
+        begin
+            {_Addr, Maskbits} = CIDR,
+            Mask = bondy_cidr:mask(CIDR),
+            Mask >= 0 andalso Mask < (1 bsl Maskbits)
+        end
+    ).
+
+prop_anchor_mask_idempotent() ->
+    ?FORALL(
+        CIDR,
+        any_cidr(),
+        begin
+            Anchored = bondy_cidr:anchor_mask(CIDR),
+            DoubleAnchored = bondy_cidr:anchor_mask(Anchored),
+            Anchored =:= DoubleAnchored
+        end
+    ).
+
+prop_anchor_mask_preserves_maskbits() ->
+    ?FORALL(
+        CIDR,
+        any_cidr(),
+        begin
+            {_Addr, Maskbits} = CIDR,
+            {_AnchoredAddr, AnchoredMaskbits} = bondy_cidr:anchor_mask(CIDR),
+            Maskbits =:= AnchoredMaskbits
+        end
+    ).
+
+%% =============================================================================
+%% Properties: Matching
+%% =============================================================================
+
+prop_match_reflexive() ->
+    ?FORALL(
+        CIDR,
+        any_cidr(),
+        begin
+            Anchored = bondy_cidr:anchor_mask(CIDR),
+            bondy_cidr:match(Anchored, Anchored)
+        end
+    ).
+
+prop_match_same_maskbits_required() ->
+    ?FORALL(
+        {CIDR1, CIDR2},
+        {ipv4_cidr(), ipv4_cidr()},
+        begin
+            {Addr1, Maskbits1} = CIDR1,
+            {Addr2, Maskbits2} = CIDR2,
+            case Maskbits1 =:= Maskbits2 of
+                true ->
+                    bondy_cidr:match(CIDR1, CIDR2) =:=
+                        (prefix(Addr1, Maskbits1) =:= prefix(Addr2, Maskbits2));
+                false ->
+                    not bondy_cidr:match(CIDR1, CIDR2)
+            end
+        end
+    ).
+
+%% The network prefix by integer arithmetic, independent of `bondy_cidr`'s
+%% bitstring match.
+prefix({A, B, C, D}, Maskbits) ->
+    ((A bsl 24) bor (B bsl 16) bor (C bsl 8) bor D) bsr (32 - Maskbits).

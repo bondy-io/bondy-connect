@@ -1,0 +1,613 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_registry_partition).
+-behaviour(gen_server).
+
+-include_lib("kernel/include/logger.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("bondy.hrl").
+-include("bondy_registry.hrl").
+
+-moduledoc """
+A registry partition: one `gen_server` per slot of the registry's `hash`
+`gproc_pool`, and the `bondy_registry_store` it creates in `init/1`.
+
+`pick/1` chooses a partition by hashing a realm URI, so all the entries of a
+realm live in one partition.
+
+The read and write functions run in the caller's process. Each one fetches
+the partition's store from `persistent_term`, where `init/1` publishes it
+under the partition's pid, and works on the store directly. The server
+process runs the `execute` and `async_execute` functions one at a time, and
+keeps one ptrie janitor per ptrie handle in the store, restarting a janitor
+that exits against the same handle.
+""".
+
+-define(IS_TYPE(X), (X == registration orelse X == subscription)).
+-define(SERVER_NAME(Index), {?MODULE, Index}).
+-define(REGISTRY_STORE_KEY(Index), {?SERVER_NAME(Index), store}).
+
+-record(state, {
+    index :: integer(),
+    store :: bondy_registry_store:t(),
+    %% One janitor per ptrie handle in the store. The map is keyed by pid
+    %% so an `{'EXIT', Pid, _}` lookup tells us which handle to respawn
+    %% against. The handle survives janitor crashes — its ETS tables are
+    %% owned by this partition gen_server.
+    janitors :: #{pid() => bondy_registry_ptrie:handle()},
+    start_ts :: pos_integer()
+}).
+
+-type execute_fun() ::
+    fun((bondy_registry_store:t()) -> execute_ret())
+    | fun((...) -> execute_ret()).
+-type execute_ret() :: any().
+
+%% Aliases
+-type entry() :: bondy_registry_entry:t().
+-type entry_type() :: bondy_registry_entry:entry_type().
+-type entry_key() :: bondy_registry_entry:key().
+-type continuation() :: bondy_registry_store:continuation().
+-type wildcard(T) :: bondy_registry_store:wildcard(T).
+-type eot() :: bondy_registry_store:eot().
+-type store() :: bondy_registry_store:t().
+-type find_result() :: bondy_registry_store:find_result().
+-type match_result() :: bondy_registry_store:match_result().
+-type reg_match() :: bondy_registry_store:reg_match().
+
+-export_type([continuation/0]).
+-export_type([eot/0]).
+-export_type([store/0]).
+-export_type([find_result/0]).
+-export_type([match_result/0]).
+-export_type([reg_match/0]).
+
+%% SERVER API
+-export([async_execute/2]).
+-export([async_execute/3]).
+-export([execute_after/4]).
+-export([execute/2]).
+-export([execute/3]).
+-export([execute/4]).
+-export([info/1]).
+-export([pick/1]).
+-export([start_link/1]).
+-export([store/1]).
+
+%% CRUD APIs
+-export([add/2]).
+-export([add_indices/2]).
+-export([continuation_info/1]).
+-export([find/1]).
+-export([find/3]).
+-export([find/4]).
+-export([find_session_entry/6]).
+-export([list_local/5]).
+-export([fold/6]).
+-export([lookup/3]).
+-export([lookup/4]).
+-export([remove/2]).
+-export([take/2]).
+
+%% INDEX-BASED APIS
+-export([match/1]).
+-export([match/5]).
+-export([find_matches/1]).
+-export([find_matches/5]).
+
+%% GEN_SERVER CALLBACKS
+-export([code_change/3]).
+-export([handle_call/3]).
+-export([handle_cast/2]).
+-export([handle_info/2]).
+-export([init/1]).
+-export([terminate/2]).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-doc "Starts the registry partition server".
+start_link(Index) ->
+    Opts = [{spawn_opt, bondy_config:get([registry, partition_spawn_opts])}],
+    ServerName = {via, gproc, bondy_gproc:local_name(?SERVER_NAME(Index))},
+    gen_server:start_link(ServerName, ?MODULE, [Index], Opts).
+
+-doc "Returns the pid of the server in based on hashing `Arg`.".
+-spec pick(Arg :: binary() | entry()) -> pid().
+
+pick(Arg) when is_binary(Arg) ->
+    gproc_pool:pick_worker(?REGISTRY_POOL, Arg);
+pick(Arg) ->
+    bondy_registry_entry:is_entry(Arg) orelse
+        bondy_registry_entry:is_key(Arg) orelse
+        error(badarg),
+
+    pick(bondy_registry_entry:realm_uri(Arg)).
+
+-doc """
+Returns the underlying store the partition if `Arg` is a pid. Otherwise hashes
+`Arg` to determine the partition pid and then returns its underlying store
+""".
+-spec store(Arg :: pid() | binary() | entry()) ->
+    bondy_registry_store:t() | undefined.
+
+store(Pid) when is_pid(Pid) ->
+    persistent_term:get(?REGISTRY_STORE_KEY(Pid), undefined);
+store(Arg) when is_binary(Arg) orelse is_tuple(Arg) ->
+    store(pick(Arg)).
+
+-doc """
+Returns statistical information about the partition.
+""".
+-spec info(Partition :: pid()) -> #{size => integer(), memory => integer()}.
+
+info(Partition) when is_pid(Partition) ->
+    bondy_registry_store:info(store(Partition)).
+
+-spec execute(Partition :: pid(), Fun :: execute_fun()) ->
+    execute_ret() | {error, timeout}.
+
+execute(Partition, Fun) ->
+    execute(Partition, Fun, []).
+
+-spec execute(Partition :: pid(), Fun :: execute_fun(), Args :: [any()]) ->
+    {ok, execute_ret()} | {error, timeout}.
+
+execute(Partition, Fun, Args) ->
+    execute(Partition, Fun, Args, 5_000).
+
+-spec execute(
+    Partition :: pid(),
+    Fun :: execute_fun(),
+    Args :: [any()],
+    Timeout :: timeout()
+) -> {ok, execute_ret()} | {error, timeout}.
+
+execute(Partition, Fun, Args, Timeout) when
+    is_pid(Partition), is_list(Args), is_function(Fun, length(Args))
+->
+    try
+        gen_server:call(Partition, {execute, Fun, Args}, Timeout)
+    catch
+        exit:{timeout, _} ->
+            {error, timeout}
+    end.
+
+-spec async_execute(Partition :: pid(), Fun :: execute_fun()) -> ok.
+
+async_execute(Partition, Fun) ->
+    async_execute(Partition, Fun, []).
+
+-spec async_execute(Partition :: pid(), Fun :: execute_fun(), Args :: [any()]) ->
+    ok.
+
+async_execute(Partition, Fun, Args) when
+    is_pid(Partition), is_list(Args), is_function(Fun, length(Args))
+->
+    gen_server:cast(Partition, {execute, Fun, Args}).
+
+-doc """
+As `async_execute/3` but the execution is deferred by `Delay` milliseconds.
+Runs in the partition server like every other execute, so it serialises
+with them.
+""".
+-spec execute_after(
+    Delay :: non_neg_integer(),
+    Partition :: pid(),
+    Fun :: execute_fun(),
+    Args :: [any()]
+) -> ok.
+
+execute_after(Delay, Partition, Fun, Args) when
+    is_integer(Delay) andalso Delay >= 0 andalso
+        is_pid(Partition) andalso is_list(Args) andalso
+        is_function(Fun, length(Args))
+->
+    _ = erlang:send_after(Delay, Partition, {execute, Fun, Args}),
+    ok.
+
+%% =============================================================================
+%% CRUD API
+%% =============================================================================
+
+-doc """
+Used for adding proxy entries only as it skips all checks.
+Fails with `badarg` if  `Entry` is not a proxy entry.
+""".
+-spec add(Partition :: pid(), entry()) -> {ok, entry()} | {error, any()}.
+
+add(Partition, Entry) when is_pid(Partition) ->
+    Store = store(Partition),
+    Result = bondy_registry_store:add(Store, Entry),
+    resulto:then(Result, fun(Value) ->
+        ok = bondy_registry_rib:on_entry_added(
+            Partition, bondy_registry_store:rib_members_tab(Store), Entry
+        ),
+        {ok, Value}
+    end).
+
+-doc """
+The function inserts the indices for an entry.
+
+Indices are inserted concurrently for ALL matching policies, in the
+caller's process: `exact` via ETS, `prefix`/`wildcard` via the persistent
+ptrie's path-copy + root CAS (concurrent writers retry on CAS loss — see
+`bondy_registry_ptrie`; retry pressure is observable as
+`bondy_registry_ptrie_cas_retries_total`).
+
+> #### {.warning}
+> This function is used when we received an entry via AAE sync exchange. You
+> MUST only use it when you know the entry has been stored in PlumDB.
+
+> #### {.info}
+> This is an interim design that will be replaced by a more concurrent one in
+> the next releases.
+""".
+-spec add_indices(Partition :: pid(), Entry :: entry()) ->
+    ok | {error, Reason :: any()} | no_return().
+
+add_indices(Partition, Entry) when is_pid(Partition) ->
+    Result = bondy_registry_store:add_indices(store(Partition), Entry),
+    resulto:then(Result, fun(undefined) ->
+        ok
+    end).
+
+-doc """
+Removes a registration or subscription entry (`bondy_registry_entry:t()`) from
+the registry and its indices.
+
+The function first deletes the indices, then deletes the entry from the
+node-local entry table — see `bondy_registry_store:remove/2` for why this
+order matters.
+
+Indices are deleted concurrently for ALL matching policies, in the
+caller's process: `exact` via ETS, `prefix`/`wildcard` via the persistent
+ptrie's path-copy + root CAS (concurrent writers retry on CAS loss).
+
+> #### {.info}
+> This is an interim design that will be replaced by a more concurrent one in
+> next releases.
+""".
+-spec remove(Partition :: pid(), Entry :: entry()) -> ok.
+
+remove(Partition, Entry) when is_pid(Partition) ->
+    Store = store(Partition),
+    Result = bondy_registry_store:remove(Store, Entry),
+    resulto:then(Result, fun(undefined) ->
+        ok = bondy_registry_rib:on_entry_removed(
+            Partition, bondy_registry_store:rib_members_tab(Store), Entry
+        )
+    end).
+
+-doc "Removes an entry (and its indices) from the store returning it.".
+-spec take(Partition :: pid(), Entry :: entry()) ->
+    {ok, StoredEntry :: entry()} | {error, not_found}.
+
+take(Partition, Entry) when is_pid(Partition) ->
+    Store = store(Partition),
+    Result = bondy_registry_store:take(Store, Entry),
+    resulto:then(Result, fun(Value) ->
+        ok = bondy_registry_rib:on_entry_removed(
+            Partition, bondy_registry_store:rib_members_tab(Store), Value
+        ),
+        {ok, Value}
+    end).
+
+-doc "Returns the entry of `Type` stored under `EntryKey`; see `bondy_registry_store:lookup/3`.".
+-spec lookup(
+    Partition :: pid(), Type :: entry_type(), EntryKey :: entry_key()
+) ->
+    {ok, Entry :: entry()} | {error, not_found}.
+
+lookup(Partition, Type, EntryKey) when is_pid(Partition) ->
+    bondy_registry_store:lookup(store(Partition), Type, EntryKey).
+
+-doc "Returns the entry of `Type` with id `EntryId` in `RealmUri`; see `bondy_registry_store:lookup/5`.".
+-spec lookup(
+    Partition :: pid(),
+    Type :: entry_type(),
+    RealmUri :: uri(),
+    EntryId :: id()
+) ->
+    {ok, Entry :: entry()} | {error, not_found}.
+
+lookup(Partition, Type, RealmUri, EntryId) when is_pid(Partition) ->
+    Store = store(Partition),
+    bondy_registry_store:lookup(Store, Type, RealmUri, EntryId, []).
+
+-doc "Continues a `find/4` call; see `bondy_registry_store:find/1`.".
+-spec find(continuation()) -> find_result().
+
+find(Cont) ->
+    bondy_registry_store:find(Cont).
+
+-doc """
+Finds the entries of `Type` that match the key pattern `Pattern`; see
+`bondy_registry_store:find/3`.
+""".
+-spec find(pid(), entry_type(), entry_key()) -> [entry()].
+
+find(Partition, Type, Pattern) when ?IS_TYPE(Type) ->
+    bondy_registry_store:find(store(Partition), Type, Pattern).
+
+-doc """
+Finds the entries of `Type` that match the key pattern `Pattern`; see
+`bondy_registry_store:find/4`.
+""".
+-spec find(pid(), entry_type(), entry_key(), bondy_registry_store:store_opts()) ->
+    bondy_registry_store:find_result().
+
+find(Partition, Type, Pattern, Opts) when ?IS_TYPE(Type) ->
+    bondy_registry_store:find(store(Partition), Type, Pattern, Opts).
+
+-doc """
+The session's entry for `(Uri, MatchPolicy)`, when one exists — the
+idempotent-SUBSCRIBE duplicate check, answered by a bounded session-index
+select whose cost is independent of how many entries the session holds
+(see `bondy_registry_store:find_session_entry/6`).
+""".
+-spec find_session_entry(
+    Partition :: pid(),
+    Type :: entry_type(),
+    RealmUri :: uri(),
+    SessionId :: bondy_session_id:t(),
+    Uri :: uri(),
+    MatchPolicy :: binary()
+) -> {ok, entry()} | {error, not_found}.
+
+find_session_entry(Partition, Type, RealmUri, SessionId, Uri, MatchPolicy) ->
+    bondy_registry_store:find_session_entry(
+        store(Partition), Type, RealmUri, SessionId, Uri, MatchPolicy
+    ).
+
+-doc """
+A keyset page of node-local entries of `Type` in `RealmUri` — see
+`bondy_registry_store:list_local/5`. The node-local leg of the distributed
+meta introspection walk.
+""".
+-spec list_local(
+    Partition :: pid(),
+    Type :: entry_type(),
+    RealmUri :: uri(),
+    AfterId :: id() | undefined,
+    Limit :: pos_integer()
+) -> [entry()].
+
+list_local(Partition, Type, RealmUri, AfterId, Limit) when ?IS_TYPE(Type) ->
+    bondy_registry_store:list_local(
+        store(Partition), Type, RealmUri, AfterId, Limit
+    ).
+
+-doc "Folds `Fun` over the entries of `Type` in `RealmUri`; see `bondy_registry_store:fold/6`.".
+-spec fold(
+    Partition :: pid(),
+    Type :: entry_type(),
+    RealmUri :: wildcard(uri()),
+    Fun :: bondy_registry_store:store_fold_fun(),
+    Acc :: any(),
+    Opts :: bondy_registry_store:store_opts()
+) ->
+    any() | {any(), continuation() | eot()}.
+
+fold(Partition, Type, RealmUri, Fun, Acc, Opts) ->
+    bondy_registry_store:fold(store(Partition), Type, RealmUri, Fun, Acc, Opts).
+
+-doc "Returns the entry type and realm URI that `Cont` was created for.".
+-spec continuation_info(continuation()) ->
+    #{type := entry_type(), realm_uri := uri()}.
+
+continuation_info(Cont) ->
+    bondy_registry_store:continuation_info(Cont).
+
+%% =============================================================================
+%% INDEX-BASED APIS
+%% =============================================================================
+
+-doc """
+Continues a match started with `match/5'. The next chunk of the size
+specified in the initial `match/5' call is returned together with a new
+`Continuation', which can be used in subsequent calls to this function.
+When there are no more objects in the table, '$end_of_table' is returned.
+""".
+-spec match(Continuation :: continuation() | eot()) ->
+    bondy_registry_store:match_result().
+
+match(Cont) ->
+    bondy_registry_store:match(Cont).
+
+-doc """
+Finds entries matching `Type`, `RealmUri` and `Uri`.
+
+This call executes concurrently in the caller's process for ALL matching
+policies — `exact` via ETS reads, `prefix`/`wildcard` by traversing an
+immutable ptrie snapshot (lock-free, QSBR-reclaimed); nothing routes
+through the partition gen_server.
+""".
+-spec match(
+    Partition :: pid(),
+    Type :: entry_type(),
+    RealmUri :: uri(),
+    Uri :: uri(),
+    Opts :: map()
+) -> match_result().
+
+match(Partition, Type, RealmUri, Uri, Opts) when is_pid(Partition) ->
+    bondy_registry_store:match(store(Partition), Type, RealmUri, Uri, Opts).
+
+-doc """
+Continues a find started with `find_matches/5'. The next chunk of the size
+specified in the initial `find_matches/5' call is returned together with a new
+`Continuation', which can be used in subsequent calls to this function.
+When there are no more objects in the table, '$end_of_table' is returned.
+""".
+-spec find_matches(Continuation :: continuation() | eot()) ->
+    bondy_registry_store:match_result().
+
+find_matches(Cont) ->
+    bondy_registry_store:find_matches(Cont).
+
+-doc """
+Finds entries matching `Type`, `RealmUri` and `Uri`.
+
+This call executes concurrently in the caller's process for ALL matching
+policies — `exact` via ETS reads, `prefix`/`wildcard` by traversing an
+immutable ptrie snapshot (lock-free, QSBR-reclaimed); nothing routes
+through the partition gen_server.
+""".
+-spec find_matches(
+    Partition :: pid(),
+    Type :: entry_type(),
+    RealmUri :: uri(),
+    Uri :: uri(),
+    Opts :: map()
+) -> match_result().
+
+find_matches(Partition, Type, RealmUri, Uri, Opts) when is_pid(Partition) ->
+    bondy_registry_store:find_matches(
+        store(Partition), Type, RealmUri, Uri, Opts
+    ).
+
+%% =============================================================================
+%% GEN_SERVER CALLBACKS
+%% =============================================================================
+
+init([Index]) ->
+    %% Trap exits otherwise terminate/2 won't be called when shutdown by
+    %% supervisor, and we wouldn't observe janitor crashes for restart.
+    erlang:process_flag(trap_exit, true),
+
+    PoolName = ?REGISTRY_POOL,
+    WorkerName = ?SERVER_NAME(Index),
+    true = gproc_pool:connect_worker(PoolName, WorkerName),
+
+    Store = bondy_registry_store:new(Index),
+    _ = persistent_term:put(?REGISTRY_STORE_KEY(self()), Store),
+
+    Janitors = start_janitors(bondy_registry_store:ptrie_handles(Store)),
+
+    State = #state{
+        index = Index,
+        store = Store,
+        janitors = Janitors,
+        start_ts = erlang:system_time()
+    },
+    {ok, State}.
+
+handle_call({execute, Fun, Args}, _From, State) ->
+    Result = do_execute(State, Fun, Args),
+    {reply, Result, State};
+handle_call(Event, From, State) ->
+    ?LOG_WARNING(#{
+        reason => unsupported_event,
+        event => Event,
+        from => From
+    }),
+    {reply, {error, {unsupported_call, Event}}, State}.
+
+handle_cast({execute, Fun, Args}, State) ->
+    _ = do_execute(State, Fun, Args),
+    {noreply, State};
+handle_cast(Event, State) ->
+    ?LOG_WARNING(#{
+        reason => unsupported_event,
+        event => Event
+    }),
+    {noreply, State}.
+
+handle_info({'ETS-TRANSFER', _, _, _}, State) ->
+    %% The store ets tables use bondy_connect_table_manager.
+    %% We ignore as tables are named.
+    {noreply, State};
+handle_info({execute, Fun, Args}, State) ->
+    %% A deferred execute (`execute_after/4`) coming due.
+    _ = do_execute(State, Fun, Args),
+    {noreply, State};
+handle_info({'EXIT', Pid, Reason}, #state{janitors = Js} = State) ->
+    case maps:take(Pid, Js) of
+        {Handle, Js1} ->
+            %% A ptrie janitor crashed. The ptrie's ETS tables are owned
+            %% by this partition, not the janitor — the handle is still
+            %% valid, so just spawn a fresh janitor against it.
+            ?LOG_WARNING(#{
+                description => "ptrie janitor exited; restarting",
+                pid => Pid,
+                reason => Reason
+            }),
+            NewPid = start_janitor(Handle),
+            {noreply, State#state{janitors = Js1#{NewPid => Handle}}};
+        error ->
+            %% Some other linked process exited. Currently there are
+            %% none, but be tolerant.
+            ?LOG_DEBUG(#{
+                description => "unexpected linked process exited",
+                pid => Pid,
+                reason => Reason
+            }),
+            {noreply, State}
+    end;
+handle_info(Info, State) ->
+    ?LOG_DEBUG(#{
+        reason => unexpected_event,
+        event => Info
+    }),
+    {noreply, State}.
+
+terminate(normal, State) ->
+    cleanup(State);
+terminate(shutdown, State) ->
+    cleanup(State);
+terminate({shutdown, _}, State) ->
+    cleanup(State);
+terminate(_Reason, State) ->
+    cleanup(State).
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+cleanup(#state{janitors = Js}) ->
+    _ = persistent_term:erase(?REGISTRY_STORE_KEY(self())),
+    %% Stop janitors before our ETS tables die so any in-flight sweep
+    %% finishes against valid tables. `gen_server:stop/3` returns once the
+    %% janitor has exited; the link signal we receive after is harmless
+    %% because we are already inside terminate/2.
+    maps:foreach(
+        fun(Pid, _Handle) ->
+            %% `proc_lib:stop/3` exits `noproc` for a janitor that already
+            %% exited.
+            try
+                bondy_registry_ptrie_janitor:stop(Pid)
+            catch
+                exit:noproc -> ok
+            end
+        end,
+        Js
+    ),
+    ok.
+
+%% @private
+start_janitors(Handles) ->
+    lists:foldl(
+        fun(Handle, Acc) ->
+            Acc#{start_janitor(Handle) => Handle}
+        end,
+        #{},
+        Handles
+    ).
+
+%% @private
+start_janitor(Handle) ->
+    {ok, Pid} = bondy_registry_ptrie_janitor:start_link(Handle, #{}),
+    Pid.
+
+do_execute(_State, Fun, []) ->
+    resulto:flatten(resulto:result(Fun()));
+do_execute(_State, Fun, Args) ->
+    resulto:flatten(resulto:result(erlang:apply(Fun, Args))).

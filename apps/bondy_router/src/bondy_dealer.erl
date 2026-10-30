@@ -1,0 +1,3629 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_dealer).
+-moduledoc """
+This module implements the capabilities of a Dealer. It is used by
+`bondy_router`.
+
+A Dealer is one of the two roles a Router plays. In particular a Dealer is
+the middleman between an Caller and a Callee in an Routed RPC interaction,
+i.e. it works as a generic router for remote procedure calls
+decoupling Callers and Callees.
+
+Callees register the procedures they provide with Dealers.  Callers
+initiate procedure calls first to Dealers.  Dealers route calls
+incoming from Callers to Callees implementing the procedure called,
+and route call results back from Callees to Callers.
+
+A Caller issues calls to remote procedures by providing the procedure
+URI and any arguments for the call. The Callee will execute the
+procedure using the supplied arguments to the call and return the
+result of the call to the Caller.
+
+The Caller and Callee will usually implement all business logic, while the
+Dealer works as a generic router for remote procedure calls
+decoupling Callers and Callees.
+
+Bondy does not provide message transformations to ensure stability and
+safety.
+As such, any required transformations should be handled by Callers and
+Callees directly (notice that a Callee can act as a middleman implementing
+the required transformations).
+
+The message flow between *Callees* and a *Dealer* for registering and
+unregistering endpoints to be called over RPC involves the following
+messages:
+
+- `REGISTER`
+- `REGISTERED`
+- `UNREGISTER`
+- `UNREGISTERED`
+- `ERROR`
+
+```mermaid
+       ,------.          ,------.               ,------.
+       |Caller|          |Dealer|               |Callee|
+       `--+---'          `--+---'               `--+---'
+          |                 |                      |
+          |                 |                      |
+          |                 |       REGISTER       |
+          |                 | <---------------------
+          |                 |                      |
+          |                 |  REGISTERED or ERROR |
+          |                 | --------------------->
+          |                 |                      |
+          |                 |                      |
+          |                 |                      |
+          |                 |                      |
+          |                 |                      |
+          |                 |      UNREGISTER      |
+          |                 | <---------------------
+          |                 |                      |
+          |                 | UNREGISTERED or ERROR|
+          |                 | --------------------->
+       ,--+---.          ,--+---.               ,--+---.
+       |Caller|          |Dealer|               |Callee|
+       `------'          `------'               `------'
+```
+
+## Calling and Invocations
+
+The message flow between *Callers*, a *Dealer* and *Callees* for
+calling procedures and invoking endpoints involves the following
+messages:
+
+1. "CALL"
+2. "RESULT"
+3. "INVOCATION"
+4. "YIELD"
+5. "ERROR"
+
+```mermaid
+   sequenceDiagram
+    %%{init: {'theme': 'neutral'} }%%
+    Caller->>+Dealer: CALL
+    Dealer->>Callee: INVOCATION
+    Callee->>Dealer: YIELD | ERROR
+    Dealer->>Caller: RESULT | ERROR
+```
+
+The execution of remote procedure calls is asynchronous, and there
+may be more than one call outstanding.  A call is called outstanding
+(from the point of view of the *Caller*), when a (final) result or
+error has not yet been received by the *Caller*.
+
+## Routing
+
+The following sections describes how RPC routing is performed for all the
+generic use cases involving clustering and bridge relay connections.
+The following diagram shows the the example used in all the use cases, which
+involves a single Caller making calls to four different Callees that are
+local or remote to the caller.
+
+Notice that the erlang code included in the diagram notes are to be
+considered pseudo-code as they do not necessarily match the actual function
+signatures.
+
+```mermaid
+  flowchart TB
+    %%{init: {'theme': 'neutral'} }%%
+    subgraph Bondy Cluster
+    Node1
+    Node2
+    end
+    subgraph Clients
+    CALLER --> Node1
+    CALLEE1 --> Node1
+    CALLEE2 --> Node2
+    end
+    subgraph Bondy Edge Cluster
+    EdgeNode1
+    EdgeNode2
+    end
+    Node1 -.Bridge Relay Connection...- EdgeNode1
+    subgraph Edge Clients
+    CALLEE3 --> EdgeNode1
+    CALLEE4 --> EdgeNode2
+    end
+```
+
+### Call to a local Callee
+
+```mermaid
+    sequenceDiagram
+    %%{init: {'theme': 'neutral'} }%%
+    	autonumber
+      participant CALLER
+      participant node1 as DEALER<br/><br/>@node1
+      participant CALLEE1
+    	note over node1: CALLEE1 seq = 99
+    	CALLER ->> node1:CALL.1
+    	note over node1: CALLEE1 seq = 100
+    	node1 -->> node1: promise:add({100, 1})
+    	node1 ->> CALLEE1: INVOCATION.100
+    	CALLEE1 ->> node1: YIELD.100
+    	node1 -->> node1: bondy_rpc_promise:take({100, 1})
+    	node1 ->> CALLER: RESULT.1
+```
+
+### Call to a Remote Callee
+
+```mermaid
+   sequenceDiagram
+    %%{init: {'theme': 'neutral'} }%%
+     autonumber
+    	participant CALLER
+    	participant Node1
+    	participant Node2
+    	participant CALLEE2
+    	note over Node2: CALLEE2 seq = 99
+    	CALLER ->> Node1:CALL.2
+    	Node1 -->> Node1: bondy_rpc_promise:new_call(2)
+    	rect RGB(230, 230, 230)
+    	note over Node1,Node2: CLUSTER CONNECTION
+    	Node1 -->> Node2: CALL.2
+     end
+    	Node2 -->> Node2: bondy_rpc_promise:new_invocation(100, 2)
+    	note over Node2: CALLEE2 seq = 100
+    	Node2 ->> CALLEE2: INVOCATION.100
+    	CALLEE2 ->> Node2: YIELD.100
+    	Node2 -->> Node2: bondy_rpc_promise:take({invocation, 100, '_'})
+    	Node2 -->> Node1: RESULT.2
+    	Node1 -->> Node1: bondy_rpc_promise:take({call, 2})
+    	Node1 ->> CALLER: RESULT.2
+```
+
+### Call to Bridged Callee
+
+```mermaid
+  sequenceDiagram
+    %%{init: {'theme': 'neutral'} }%%
+    autonumber
+    	participant CALLER
+    	participant Node1
+    	participant Node2
+    	participant CALLEE2
+    	note over Node2: CALLEE2 seq = 99
+    	CALLER ->> Node1:CALL.2
+    	Node1 -->> Node1: bondy_rpc_promise:new_call(2)
+    	rect RGB(230, 230, 230)
+    	note over Node1,Node2: CLUSTER CONNECTION
+    	Node1 -->> Node2: CALL.2
+     end
+    	Node2 -->> Node2: bondy_rpc_promise:new_invocation(100, 2)
+    	note over Node2: CALLEE2 seq = 100
+    	Node2 ->> CALLEE2: INVOCATION.100
+    	CALLEE2 ->> Node2: YIELD.100
+    	Node2 -->> Node2: bondy_rpc_promise:take(invocation, 100, '_')
+    	Node2 -->> Node1: RESULT.2
+    	Node1 -->> Node1: bondy_rpc_promise:take({call, 2})
+    	Node1 ->> CALLER: RESULT.2
+```
+
+### Call to remote Bridged Callee
+
+```mermaid
+   sequenceDiagram
+    %%{init: {'theme': 'neutral'} }%%
+    	participant CALLER
+    	participant Node1
+    	participant Node2
+    	participant Bridged_Node1
+    	participant Bridged_Node2
+    	note over Bridged_Node2: CALLEE seq = 99
+    	participant CALLEE4
+    	CALLER ->> Node1:CALL.5
+    	Node1 -->> Node1: promise:add({5, 5})
+    	Node1 -->> Node2: Call.5
+    	Node2 -->> Node2: bondy_rpc_promise:add({call, 5})
+    	rect RGB(230, 230, 230)
+    	note over Node2,Bridged_Node1: BRIDGE RELAY CONNECTION
+      Node2 -->> Bridged_Node1:CALL.5
+    	end
+    	Bridged_Node1 -->> Bridged_Node2: CALL.5
+    	note over Bridged_Node2: CALLEE4 seq = 100
+    	Bridged_Node2 ->> CALLEE4: INVOCATION.100
+    	CALLEE4 ->> Bridged_Node2: YIELD.100
+    	Bridged_Node2 -->> Bridged_Node2: bondy_rpc_promise:take({invocation, 100, 5})
+    	Bridged_Node2 -->> Bridged_Node1: RESULT.5
+    	Bridged_Node1 -->> Node2: RESULT.5
+    	Node2 -->> Node2: bondy_rpc_promise:take({call, 5})
+    	Node2 -->> Node1: RESULT.5
+    	Node1 ->> Node1: bondy_rpc_promise:take({call, 5})
+    	Node1 ->> CALLER: RESULT.5
+```
+
+## Remote Procedure Call Ordering
+
+Regarding **Remote Procedure Calls**, the ordering guarantees are as
+follows:
+
+If *Callee A* has registered endpoints for both **Procedure 1** and
+**Procedure 2**, and *Caller B* first issues a **Call 1** to **Procedure
+1** and then a **Call 2** to **Procedure 2**, and both calls are routed to
+*Callee A*, then *Callee A* will first receive an invocation
+corresponding to **Call 1** and then **Call 2**. This also holds if
+**Procedure 1** and **Procedure 2** are identical.
+
+In other words, WAMP guarantees ordering of invocations between any
+given *pair* of *Caller* and *Callee*. The implementation preserves this
+by handling CALL synchronously in the caller's transport process (Erlang
+guarantees signal order between a pair of processes) and, when the callee
+is on another node, by pinning the caller/callee pair to one relay
+channel connection on egress and to one flow pool worker on ingress (see
+`bondy_relay:routing_opts/2` and `bondy_router_worker:cast/3`), so the
+pair's messages form a single FIFO pipeline end to end.
+
+There are no guarantees on the order of call results and errors in
+relation to *different* calls, since the execution of calls upon
+different invocations of endpoints in *Callees* are running
+independently.  A first call might require an expensive, long-running
+computation, whereas a second, subsequent call might finish
+immediately.
+
+Further, if *Callee A* registers for **Procedure 1**, the "REGISTERED"
+message will be sent by *Dealer* to *Callee A* before any
+"INVOCATION" message for **Procedure 1**.
+
+There is no guarantee regarding the order of return for multiple
+subsequent register requests.  A register request might require the
+*Dealer* to do a time-consuming lookup in some database, whereas
+another register request second might be permissible immediately.
+""".
+
+-include_lib("kernel/include/logger.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("bondy.hrl").
+-include("bondy_db_tables.hrl").
+-include("bondy_uris.hrl").
+
+-define(MATCH_LIMIT, 100).
+-define(REQUEST_WATERMARK, {?MODULE, request_watermark}).
+
+-define(RESERVED_NS(NS),
+    <<"Use of reserved namespace '", NS/binary, "'.">>
+).
+
+-define(GET_REALM_URI(Map),
+    case maps:find(realm_uri, Map) of
+        {ok, Val} -> Val;
+        error -> error(no_realm)
+    end
+).
+
+-type invoke_opts() :: #{
+    error_formatter :=
+        optional(fun((Reason :: any()) -> optional(wamp_error()))),
+    call_opts := map()
+}.
+
+-type call_fun() :: fun(
+    (entry() | {error, any()}, bondy_context:t()) -> {ok, bondy_context:t()}
+).
+%% Aliases
+-type entry() :: bondy_registry_entry:t().
+-type trie_continuation() :: bondy_registry_store:continuation().
+-type eot() :: bondy_registry_store:eot().
+
+%% API
+-export([features/0]).
+-export([flush/2]).
+-export([flush_callee_promises/2]).
+-export([retry/1]).
+-export([check_request_id/2]).
+-export([forward/2]).
+-export([forward/3]).
+-export([forward_continuation/2]).
+-export([settle_relayed/3]).
+-export([is_feature_implemented/1]).
+-export([register/3]).
+-export([register/4]).
+-export([unregister/2]).
+
+-ifdef(TEST).
+%% The node-stage liveness policy, with the environment probe injected so the
+%% never-empty and self-always invariants are testable without a cluster.
+-export([prefer_reachable/2]).
+-export([is_reachable/1]).
+-export([with_callback_args/2]).
+-endif.
+
+-compile({no_auto_import, [register/2]}).
+
+%% =============================================================================
+%% API
+%% =============================================================================
+
+-spec features() -> map().
+
+features() ->
+    maps:from_list(bondy_config:get([wamp, dealer, features])).
+
+-doc """
+Returns `true` if this build implements WAMP feature `F` for the dealer.
+
+This is a CAPABILITY, not a session flag. It answers "can Bondy do this at all",
+which is what `bondy_router:roles/0` announces in WELCOME and what
+`bondy_config:setup_wamp/0` seats from `?DEALER_FEATURES`. What a given peer may
+actually use is the intersection of its `HELLO` request with these values, and
+that lives on the session — see `bondy_context:is_feature_enabled/3`.
+""".
+-spec is_feature_implemented(binary() | atom()) -> boolean().
+
+is_feature_implemented(F) when is_binary(F) ->
+    try binary_to_existing_atom(F) of
+        Feature ->
+            is_feature_implemented(Feature)
+    catch
+        error:badarg ->
+            false
+    end;
+is_feature_implemented(F) when is_atom(F) ->
+    bondy_config:get([wamp, dealer, features, F], false).
+
+-doc """
+Removes all registrations and all the pending items in the RPC promise
+queue that are associated for reference `Ref` in realm `RealmUri`.
+""".
+-spec flush(RealmUri :: uri(), Ref :: bondy_ref:t()) -> ok.
+
+flush(RealmUri, Ref) ->
+    try
+        %% Cleanup all registrations for the ref's session.
+        %% We do this before flushing promises so that any concurrent CALL
+        %% cannot pick this ref as a callee after we start the flush.
+        SessionId = bondy_ref:session_id(Ref),
+        bondy_registry:remove_all(
+            registration, RealmUri, SessionId, fun on_unregister/1
+        ),
+
+        %% Cleanup all RPC queued invocations for Ref. For invocation
+        %% promises where Ref is the callee, cancel the call (see
+        %% `send_callee_left/1`) instead of letting it wait for its
+        %% timeout. For invocation promises where Ref is the
+        %% caller, INTERRUPT the callee so it stops working — possibly on
+        %% a progressive-results stream — for a caller that will never
+        %% consume the response.
+        ok = bondy_rpc_promise:flush(
+            RealmUri, Ref, #{
+                on_callee_flush => fun send_callee_left/1,
+                on_caller_flush => caller_flush_fun(Ref)
+            }
+        )
+    catch
+        error:{badmatch, {error, _}} = Reason ->
+            ?LOG_WARNING(#{
+                description =>
+                    "Error while flushing registration and RPC promise "
+                    "queue items",
+                reason => Reason,
+                realm_uri => RealmUri,
+                ref => Ref
+            }),
+            ok
+    end.
+
+-doc """
+Flushes any in-flight invocation promises where `Ref` is the callee,
+replying to each caller with a `wamp.error.canceled` ERROR routed back
+through the promise's `via` queue.
+
+Used by the registry to fast-fail callers when a remote node goes down
+and its callees are being pruned, so they don't wait for the call
+timeout. Unlike `flush/2`, this does not touch registrations — the
+caller is expected to have already removed them.
+""".
+-spec flush_callee_promises(RealmUri :: uri(), Ref :: bondy_ref:t()) -> ok.
+
+flush_callee_promises(RealmUri, Ref) ->
+    bondy_rpc_promise:flush(
+        RealmUri, Ref, #{on_callee_flush => fun send_callee_left/1}
+    ).
+
+-doc """
+Routes the call behind `Promise` again, as a new attempt with a new invocation.
+Returns `true` when it did, and `false` when the caller is owed the failure that
+settled `Promise`.
+
+The call set `CALL.Options._retries` above zero and is not progressive, since
+the caller may already hold some of its results. `Promise` is one of:
+
+- the invocation promise of a call to a registration that set
+  `REGISTER.Options._idempotent` to `true`, after a timeout or the loss of the
+  callee;
+- the call promise of a call that found no registration, which waits for one.
+  No callee ran it, so the procedure need not be idempotent. The waits back
+  off exponentially with jitter (`bondy_connect_retry`), from about a second.
+
+The attempt counts against `_retries` and runs on what is left of the call's
+`_deadline`, so no attempt starts after it. Without a `_deadline` the call
+gets `_retries + 1` call timeouts.
+
+A local caller's attempt routes like the first one, so it reaches any
+registration made since. On the node that owns the callee of a forwarded call,
+the attempt goes to one of that node's registrations. When none is left,
+the caller's node routes it to another node, as for any call that found no
+callee there. `bondy_rpc_retry_SUITE` covers each case, and
+`bondy_rpc_retry_cluster_SUITE` covers forwarded calls on a two-node cluster.
+""".
+-spec retry(bondy_rpc_promise:t()) -> boolean().
+
+retry(Promise) ->
+    case bondy_rpc_promise:get(retry, Promise, undefined) of
+        #{call := #call{options = #{'_retries' := N} = O} = Call0} = Retry ->
+            Deadline = bondy_rpc_promise:get(deadline, Promise),
+            Left = Deadline - erlang:system_time(millisecond),
+            Call = Call0#call{
+                options = O#{'_retries' => N - 1, '_deadline' => Left}
+            },
+            case {Left > 0, Retry} of
+                {true, #{uri := Uri, opts := Opts, ctxt := Ctxt}} ->
+                    ok = handle_call(Call, Ctxt, Uri, Opts),
+                    true;
+                {true, #{opts := Opts}} ->
+                    #{'$private' := P} = O,
+                    ok = forward(
+                        Call#call{
+                            options = (Call#call.options)#{
+                                '$private' := P#{registration_id := undefined}
+                            }
+                        },
+                        undefined,
+                        Opts#{rib_completion => true}
+                    ),
+                    true;
+                {false, _} ->
+                    false
+            end;
+        undefined ->
+            false
+    end.
+
+-doc """
+Creates a local registration.
+
+The registration is announced like one made by a WAMP REGISTER: registry
+counters, the `wamp.registration.on_register` meta event and the bridge relay
+(`bondy_meta_events_SUITE:internal_registration_is_announced`).
+
+If the registration is done using a callback module, only the invoke single
+strategy can be used (i.e. `shared_registration` and `sharded_registration`
+are also disabled). Also the callback module needs to conform to the
+`wamp_api_callback` behaviour, otherwise the call fails with a `badarg`
+exception.
+""".
+-spec register(Procedure :: uri(), Opts :: map(), Ref :: bondy_context:t()) ->
+    {ok, id()}
+    | {error, already_exists | any()}
+    | no_return().
+
+register(Procedure, Opts, Ctxt) when is_map(Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    Ref = bondy_context:ref(Ctxt),
+
+    register(Procedure, Opts, RealmUri, Ref).
+
+-spec register(
+    Procedure :: uri(),
+    Opts :: map(),
+    RealmUri :: uri(),
+    Ref :: bondy_ref:t() | bondy_context:t()
+) ->
+    {ok, id()}
+    | {error, already_exists | any()}
+    | no_return().
+
+register(Procedure, Opts0, RealmUri, Ref) ->
+    Opts =
+        case bondy_ref:target_type(Ref) of
+            pid ->
+                Opts0#{shared_registration => true};
+            name ->
+                Opts0#{shared_registration => true};
+            callback ->
+                Opts0#{shared_registration => false}
+        end,
+
+    case bondy_registry:add(registration, RealmUri, Procedure, Opts, Ref) of
+        {ok, Entry} ->
+            ok = on_register(Entry),
+            {ok, bondy_registry_entry:id(Entry)};
+        {error, {already_exists, _}} ->
+            {error, already_exists};
+        {error, _} = Error ->
+            Error
+    end.
+
+-spec unregister(RegId :: id(), bondy_context:t() | uri()) ->
+    ok | {error, not_found}.
+
+unregister(RegId, Ctxt) when is_map(Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    unregister(RegId, RealmUri);
+unregister(RegId, RealmUri) when is_binary(RealmUri) ->
+    case bondy_registry:lookup(registration, RealmUri, RegId) of
+        {error, not_found} = Error ->
+            Error;
+        {ok, Entry} ->
+            case bondy_registry:remove(Entry) of
+                ok ->
+                    on_unregister(Entry);
+                {error, _} = Error ->
+                    Error
+            end
+    end.
+
+-doc """
+Checks the request id of an inbound message against the session's watermark,
+the highest request id the session has sent, and advances it.
+
+The WAMP specification gives a session one request id sequence, shared by
+SUBSCRIBE, UNSUBSCRIBE, PUBLISH, REGISTER, UNREGISTER and CALL, and lets a
+progressive CALL reuse the id of the call it continues. Only a session whose
+caller and dealer both announced `progressive_call_invocations` is held to the
+sequence, and only its CALLs are checked:
+
+- `route` for a CALL with the next id, which starts a call;
+- `continuation` for a CALL with an id at or below the watermark, which only
+  `forward_continuation/2` may handle;
+- `{stop, Abort}` for a CALL whose id skips ahead.
+
+Any other message, or a session that is not held to the sequence, gets
+`route`. The watermark lives in the process dictionary, so the process that
+serialises the session's inbound messages must call this, in order
+(`bondy_connect_progressive_call_invocations_SUITE`).
+""".
+-spec check_request_id(wamp_message(), bondy_context:t()) ->
+    route | continuation | {stop, wamp_abort()}.
+
+check_request_id(#call{request_id = Id}, Ctxt) ->
+    case request_watermark(Ctxt) of
+        undefined ->
+            route;
+        W ->
+            case classify_call_id(Id, W) of
+                next ->
+                    ok = put_request_watermark(Ctxt, Id),
+                    route;
+                continuation ->
+                    continuation;
+                gap ->
+                    {stop,
+                        protocol_violation_abort(
+                            ~"The CALL request id skips ahead of the session's request id sequence."
+                        )}
+            end
+    end;
+check_request_id(#publish{request_id = Id}, Ctxt) ->
+    advance_request_watermark(Ctxt, Id);
+check_request_id(#subscribe{request_id = Id}, Ctxt) ->
+    advance_request_watermark(Ctxt, Id);
+check_request_id(#unsubscribe{request_id = Id}, Ctxt) ->
+    advance_request_watermark(Ctxt, Id);
+check_request_id(#register{request_id = Id}, Ctxt) ->
+    advance_request_watermark(Ctxt, Id);
+check_request_id(#unregister{request_id = Id}, Ctxt) ->
+    advance_request_watermark(Ctxt, Id);
+check_request_id(M, _) when
+    is_record(M, yield); is_record(M, cancel); is_record(M, error)
+->
+    route.
+
+-doc """
+This function is called by `bondy_router` to handle inbound messages
+sent by WAMP peers connected to this Bondy node.
+
+It returns `{stop, Abort}` for a message that ends the session, each of which
+the WAMP specification makes a protocol error:
+
+- a CALL with `progress` set when the caller or the dealer did not announce
+  `progressive_call_invocations`
+  (`bondy_connect_progressive_call_invocations_SUITE`);
+- an ERROR for anything other than an INVOCATION, the only request a router
+  sends a client that the client answers with ERROR
+  (`bondy_wamp_protocol_SUITE:an_error_for_anything_but_an_invocation_is_a_protocol_violation`).
+
+A CANCEL that fails, such as one the caller may not make, gets no reply: WAMP
+defines no ERROR for a CANCEL. The failure is logged and the call continues
+(`bondy_connect_cancel_SUITE:a_refused_cancel_leaves_the_call_running`).
+""".
+-spec forward(M :: wamp_message(), Ctxt :: map()) ->
+    ok | {stop, wamp_abort()}.
+
+forward(M, Ctxt) ->
+    try
+        do_forward(M, Ctxt)
+    catch
+        Class:Reason:Stacktrace ->
+            forward_failed(Class, Reason, Stacktrace, M, Ctxt)
+    end.
+
+-doc """
+Handles a CALL that `check_request_id/2` classified as a continuation. A chunk
+of a live progressive stream goes to the callee that holds the stream. A reused
+id of a live call to the same procedure that is not a stream ends the session
+with `{stop, Abort}`. Any other CALL, including one that names a procedure
+other than the live call's, or one that follows the stream's final chunk, is
+discarded without a reply, as the WAMP specification requires
+(`bondy_connect_progressive_call_invocations_SUITE`).
+
+The chunk is not authorized: the first chunk authorized the whole stream, so a
+permission revoked mid-stream refuses the caller's next call, not the open one
+(`bondy_connect_progressive_call_invocations_SUITE:a_stream_is_authorized_once`).
+""".
+-spec forward_continuation(wamp_call(), bondy_context:t()) ->
+    ok | {stop, wamp_abort()}.
+
+forward_continuation(#call{} = M, Ctxt) ->
+    try
+        do_forward_continuation(M, Ctxt)
+    catch
+        Class:Reason:Stacktrace ->
+            forward_failed(Class, Reason, Stacktrace, M, Ctxt)
+    end.
+
+-doc """
+Handles inbound messages received from a relay i.e. a cluster peer node
+or `bridge_relay` i.e. edge client or server.
+
+A CALL that raises while it is dispatched, for example in a callback callee,
+is answered with an `internal_error` ERROR carrying the `trace_id` of the
+logged error, as `forward/2` answers a local caller
+(`bondy_registry_SUITE:forwarded_call_to_a_crashing_callback_is_answered`).
+""".
+-spec forward(wamp_message(), To :: bondy_ref:t(), Opts :: map()) ->
+    ok | no_return().
+
+forward(#call{} = Msg, To, #{from := Caller} = Opts) ->
+    try
+        forward_call(Msg, To, Opts)
+    catch
+        Class:Reason:Stacktrace ->
+            Error = bondy_connect_error:internal(Class, Reason, Stacktrace),
+            ?LOG_ERROR((bondy_connect_error:to_log_map(Error))#{
+                description =>
+                    ~"Error while evaluating a forwarded CALL. Returning ERROR",
+                data => Msg
+            }),
+            Reply = bondy_wamp_error:to_wamp(Error, Msg),
+            {Dest, SendOpts} = bondy_router_peer:prepare_send(Caller, Opts),
+            bondy_router_peer:send(?GET_REALM_URI(Opts), Dest, Reply, SendOpts)
+    end;
+forward(#cancel{} = M, _Addressed, #{from := Caller} = Opts) ->
+    %% A remote Caller (or its node, after the caller died) cancels a CALL to
+    %% a local Callee. The CANCEL may be node-addressed when routing ran on the
+    %% RIB, so the invocation id and the local callee come from the invocation
+    %% promise, keyed by CALL request id plus Caller. `kill` keeps the promise
+    %% (the callee's ERROR settles the call); `killnowait` and `skip` take it;
+    %% `skip` sends no INTERRUPT. A callee without call_canceling is `skip`.
+    %% A call this node sent on to a bridged callee has a call promise instead,
+    %% and the CANCEL follows it to the callee's node.
+
+    RealmUri = ?GET_REALM_URI(Opts),
+
+    CallId = M#cancel.request_id,
+    Mode = cancel_mode(maps:get(mode, M#cancel.options, skip)),
+
+    Key = bondy_rpc_promise:invocation_key_pattern(
+        RealmUri,
+        Caller,
+        CallId,
+        '_',
+        '_'
+    ),
+
+    case find_canceled(Key, Mode) of
+        {ok, _Promise} when Mode == skip ->
+            ok;
+        {ok, Promise} ->
+            Callee = bondy_rpc_promise:callee(Promise),
+
+            case interruptible(Callee) of
+                true ->
+                    InvocationId =
+                        bondy_rpc_promise:invocation_id(Promise),
+                    Interrupt = bondy_wamp_message:interrupt(
+                        InvocationId, maps:with([mode], M#cancel.options)
+                    ),
+                    {To, SendOpts} = bondy_router_peer:prepare_send(
+                        Callee, #{from => Caller}
+                    ),
+                    bondy_router_peer:send(RealmUri, To, Interrupt, SendOpts);
+                false when Mode == kill ->
+                    %% `skip`: the caller's node is waiting for this node to
+                    %% settle the call, so the ERROR goes back the way a
+                    %% callee's ERROR does.
+                    _ = bondy_rpc_promise:take(bondy_rpc_promise:key(Promise)),
+                    Via = bondy_rpc_promise:via(Promise),
+                    {To, SendOpts} = bondy_router_peer:prepare_send(
+                        Caller, #{from => Callee, via => Via}
+                    ),
+                    Error = cancelled_error(CallId),
+                    bondy_router_peer:send(RealmUri, To, Error, SendOpts);
+                false ->
+                    ok
+            end;
+        error ->
+            CallKey = bondy_rpc_promise:call_key_pattern(
+                RealmUri, Caller, CallId
+            ),
+            case find_canceled(CallKey, Mode) of
+                {ok, CallPromise} ->
+                    send_to_callee(CallPromise, M, #{from => Caller});
+                error ->
+                    %% The promise already expired; the Caller would have
+                    %% already received a TIMEOUT error as a response for the
+                    %% original CALL.
+                    no_matching_promise(M)
+            end
+    end;
+forward(#result{} = M, Caller, #{from := _Callee} = Opts) ->
+    %% A remote Callee is returning a RESULT to CALL done on behalf of a
+    %% local Caller.
+
+    RealmUri = ?GET_REALM_URI(Opts),
+
+    CallId = M#result.request_id,
+
+    Key = bondy_rpc_promise:call_key_pattern(RealmUri, Caller, CallId),
+
+    case maps:get(progress, M#result.details, false) of
+        true ->
+            %% A progressive RESULT settles nothing: the promise stays to match
+            %% further RESULTs and its expiry slides (capped by any
+            %% CALL.Options._deadline). A progressive RESULT for a promise not
+            %% marked receive_progress can only come from a peer node without
+            %% progressive support; a peer cannot be aborted, so demote it to
+            %% the final result (flag removed, promise taken).
+            case bondy_rpc_promise:find(Key) of
+                {ok, Promise} ->
+                    case
+                        bondy_rpc_promise:get(
+                            receive_progress, Promise, false
+                        )
+                    of
+                        true ->
+                            _ = bondy_rpc_promise:refresh(Promise),
+                            bondy_router_peer:send(RealmUri, Caller, M);
+                        false ->
+                            ?LOG_WARNING(#{
+                                description =>
+                                    "Received a progressive RESULT for a "
+                                    "call that did not request progressive "
+                                    "results. Demoting it to the final "
+                                    "result.",
+                                realm_uri => RealmUri,
+                                call_id => CallId
+                            }),
+                            M1 = M#result{
+                                details =
+                                    maps:remove(progress, M#result.details)
+                            },
+                            case bondy_rpc_promise:take(Key) of
+                                {ok, P} ->
+                                    ok = notify_call_latency(P, success),
+                                    bondy_router_peer:send(
+                                        RealmUri, Caller, M1
+                                    );
+                                error ->
+                                    no_matching_promise(M1)
+                            end
+                    end;
+                error ->
+                    no_matching_promise(M)
+            end;
+        false ->
+            case bondy_rpc_promise:take(Key) of
+                {ok, Promise} ->
+                    %% Even if promise has timeout but
+                    %% bondy_rpc_promise_manager has not evicted it yet.
+                    ok = notify_call_latency(Promise, success),
+                    bondy_router_peer:send(RealmUri, Caller, M);
+                error ->
+                    no_matching_promise(M)
+            end
+    end;
+forward(#error{request_type = ?CALL} = M, Caller, Opts) ->
+    %% A remote callee is returning an ERROR to an CALL done
+    %% on behalf of a local Caller.
+
+    RealmUri = ?GET_REALM_URI(Opts),
+
+    CallId = M#error.request_id,
+
+    Key = bondy_rpc_promise:call_key_pattern(RealmUri, Caller, CallId),
+
+    Status =
+        case M#error.error_uri of
+            ?WAMP_ERROR_TIMEOUT ->
+                %% The owner node's promise manager timed the invocation out.
+                %% The call promise here may have expired as well, and taking
+                %% it stops this node's promise manager sending a second
+                %% timeout. It may also still be active, waiting for retries.
+                all;
+            _ ->
+                active
+        end,
+
+    case bondy_rpc_promise:take(Key, Status) of
+        {ok, Promise} ->
+            ok = notify_call_latency(Promise, error),
+            case maybe_rib_retry(M, Promise, RealmUri, Caller) of
+                true ->
+                    %% Re-routed to another candidate node (or completed
+                    %% locally) — the caller keeps waiting on the same call.
+                    ok;
+                false ->
+                    bondy_router_peer:send(
+                        RealmUri, Caller, strip_rib_details(M), #{}
+                    )
+            end;
+        error ->
+            %% The promise timed out already and local promise manager evicted
+            %% it sending the timeout error message to caller
+            no_matching_promise(M)
+    end.
+
+-doc """
+Settles this node's call promise for a response that passes through it to a
+caller on another node.
+
+This node holds such a promise when it sent the call to a callee behind a
+bridge, so that later chunks and a CANCEL can follow the call. A progressive
+RESULT refreshes it; the final RESULT or ERROR takes it. The response still goes
+on to the caller's node, whose call promise answers the caller.
+""".
+-spec settle_relayed(
+    M :: wamp_result() | wamp_error(),
+    Caller :: bondy_ref:t(),
+    RealmUri :: uri()
+) -> ok.
+
+settle_relayed(
+    #result{request_id = CallId, details = #{progress := true}},
+    Caller,
+    RealmUri
+) ->
+    Key = bondy_rpc_promise:call_key_pattern(RealmUri, Caller, CallId),
+    case bondy_rpc_promise:find(Key) of
+        {ok, Promise} ->
+            _ = bondy_rpc_promise:refresh(Promise),
+            ok;
+        error ->
+            ok
+    end;
+settle_relayed(#result{request_id = CallId}, Caller, RealmUri) ->
+    Key = bondy_rpc_promise:call_key_pattern(RealmUri, Caller, CallId),
+    _ = bondy_rpc_promise:take(Key, all),
+    ok;
+settle_relayed(
+    #error{request_type = ?CALL, request_id = CallId}, Caller, RealmUri
+) ->
+    Key = bondy_rpc_promise:call_key_pattern(RealmUri, Caller, CallId),
+    _ = bondy_rpc_promise:take(Key, all),
+    ok.
+
+%% @private
+forward_call(#call{} = Msg, _Hint, #{rib_completion := true} = Opts0) ->
+    %% A node-addressed forwarded CALL: the caller node routed to this NODE,
+    %% and the entry it selected from its replica travelled only as a hint —
+    %% it may be stale. Re-select among the live LOCAL registrations for the
+    %% procedure and dispatch to the winner; with none, fail fast back to the
+    %% caller, whose call promise matches the ERROR. Local-only selection
+    %% also guarantees a forwarded call is never forwarded again.
+    Opts = maps:remove(rib_completion, Opts0),
+    RealmUri = ?GET_REALM_URI(Opts),
+    ProcUri = Msg#call.procedure_uri,
+    Caller = maps:get(from, Opts, undefined),
+    CallId = key_value:get(['$private', call_id], Msg#call.options, undefined),
+
+    case maps:get(input_continuation, Opts, false) of
+        true ->
+            %% A later chunk of a stream (`forward_call_chunk/4`). The stream
+            %% may have ended here before the chunk arrived; the WAMP
+            %% specification then requires it to be discarded, and a new call
+            %% must never start from it.
+            case find_input_stream(RealmUri, Caller, CallId, ProcUri) of
+                {invocation_chunk, Promise} ->
+                    forward_input_chunk(Msg, Promise, RealmUri, Caller);
+                {call_chunk, Promise} ->
+                    forward_call_chunk(Msg, Promise, Caller);
+                none ->
+                    ok;
+                violation ->
+                    ok
+            end;
+        false ->
+            case rib_local_callee(RealmUri, ProcUri, Msg, Opts) of
+                {ok, Entry} ->
+                    ok = rib_count(
+                        bondy_rpc_rib_completions_total, #{outcome => ok}
+                    ),
+                    forward_call(
+                        rib_rebind(Msg, Entry),
+                        bondy_registry_entry:ref(Entry),
+                        Opts#{entry => Entry}
+                    );
+                {error, _} ->
+                    ok = rib_count(
+                        bondy_rpc_rib_completions_total, #{outcome => miss}
+                    ),
+                    reply_no_eligible_callee(Msg, Opts)
+            end
+    end;
+forward_call(#call{} = Msg, Callee, #{from := Caller} = Opts0) ->
+    %% A remote Caller is making a CALL to a local Callee or local bridged
+    %% Callee. `entry` is the registration this node selected for a
+    %% node-addressed CALL; an entry-addressed CALL comes without one.
+    true == bondy_ref:is_local(Callee) orelse
+        error({forwarding_error, callback_no_local}),
+
+    Entry = maps:get(entry, Opts0, undefined),
+    Opts = maps:remove(entry, Opts0),
+
+    RealmUri = ?GET_REALM_URI(Opts),
+    CalleeType = bondy_ref:type(Callee),
+
+    %% Owner-node gate for a progressive-input first chunk: a CALL carrying
+    %% `progress` is admissible only if this (local) callee announced
+    %% `progressive_call_invocations`. Computed as a bound boolean so the
+    %% guarded clause below can reject before an invocation is ever built — the
+    %% mirror of the caller gate, closing the distributed no-silent-degrade
+    %% hole. Non-callee target types take their own clauses first and never
+    %% consult it.
+    Admissible = progressive_input_admissible(Msg, Callee),
+
+    case bondy_ref:target_type(Callee) of
+        callback ->
+            %% A callback implemented procedure e.g. WAMP Session APIs.
+            %% We apply here as we do not need invoke/5 to
+            %% enqueue a promise, we will call the module sequentially.
+
+            %% CALL already has the static arguments appended
+            %% to its positional args (see call_to_invocation/4) so we use
+            %% apply_dynamic_callback/3.
+            Response = apply_dynamic_callback(Msg, Callee),
+
+            {To, SendOpts0} = bondy_router_peer:prepare_send(Caller, Opts),
+            SendOpts = SendOpts0#{from => Callee},
+
+            bondy_router_peer:send(RealmUri, To, Response, SendOpts);
+        _ when CalleeType == bridge_relay ->
+            %% `Entry` is the proxy registration this node selected. The CALL
+            %% goes to its origin through the bridge relay, under a call promise
+            %% that later chunks and a CANCEL follow. The edge node gates a
+            %% progressive first chunk.
+            {To, SendOpts} = bondy_router_peer:prepare_send(
+                Callee, bondy_registry_entry:origin_ref(Entry), Opts
+            ),
+            Promise = forwarded_call_promise(
+                RealmUri,
+                Msg,
+                Caller,
+                key_value:get(['$private', call_id], Msg#call.options),
+                To,
+                SendOpts,
+                #{
+                    procedure_uri => Msg#call.procedure_uri,
+                    timeout => bondy_router_utils:timeout(Msg#call.options),
+                    deadline => promise_deadline(Msg#call.options),
+                    trace => promise_trace(Msg)
+                }
+            ),
+            ok = bondy_rpc_promise:add(Promise),
+            bondy_router_peer:send(RealmUri, To, Msg, SendOpts);
+        _ when
+            (CalleeType == client orelse CalleeType == internal) andalso
+                not Admissible
+        ->
+            %% Progressive-input first chunk to a callee that did not announce
+            %% `progressive_call_invocations`: reject (no silent degrade for a
+            %% started stream); the ERROR relays back to the caller's node.
+            reply_progressive_call_invocations_error(
+                Msg, {unsupported, callee}, Opts
+            );
+        _ when CalleeType == client orelse CalleeType == internal ->
+            %% A pid- or name-target callee. `internal` covers non-callback
+            %% refs admitted by register/4 (a callback target is handled by
+            %% the first clause); they receive INVOCATION like any client.
+            {To, SendOpts} = bondy_router_peer:prepare_send(Callee, Opts),
+
+            %% Internal refs may carry no session; fall back to a global
+            %% id rather than a session-scoped one.
+            InvocationId =
+                case bondy_ref:session_id(Callee) of
+                    undefined ->
+                        bondy_message_id:global();
+                    CalleeSessionId ->
+                        bondy_message_id:session(RealmUri, CalleeSessionId)
+                end,
+            Timeout = bondy_router_utils:timeout(Msg#call.options),
+
+            %% receive_progress reaches the callee only if it announced
+            %% progressive_call_results (the caller was already gated at
+            %% the origin node).
+            GatedMsg = gate_receive_progress(
+                Msg, bondy_ref:session_id(Callee)
+            ),
+            Invocation = call_to_invocation(GatedMsg, InvocationId),
+
+            %% If we are handling this here is because any remaining relays
+            %% in the 'via' stack are part of the route back to the Caller.
+            Via = maps:get(via, SendOpts, undefined),
+
+            %% A second promise for this CALL: the origin node's promise
+            %% times out the caller and matches the RESULT | ERROR; this one,
+            %% on the node connected to the Callee (or a Bridge Relay towards
+            %% it), matches the YIELD or ERROR and carries the via stack that
+            %% routes the response back to the Caller.
+            CallId = key_value:get(
+                ['$private', call_id], Msg#call.options, undefined
+            ),
+
+            PromiseOpts = maybe_mark_retry(
+                maybe_mark_progressive_input(
+                    maybe_mark_progress(
+                        #{
+                            procedure_uri => Msg#call.procedure_uri,
+                            via => Via,
+                            timeout => Timeout,
+                            deadline => promise_deadline(Msg#call.options),
+                            trace => promise_trace(Invocation)
+                        },
+                        maps:get(
+                            receive_progress,
+                            Invocation#invocation.details,
+                            false
+                        )
+                    ),
+                    Invocation
+                ),
+                Msg,
+                Entry,
+                #{call => Msg, opts => Opts}
+            ),
+
+            Promise = bondy_rpc_promise:new_invocation(
+                RealmUri,
+                Caller,
+                CallId,
+                Callee,
+                InvocationId,
+                PromiseOpts
+            ),
+
+            ok = bondy_rpc_promise:add(Promise),
+
+            %% We send the invocation to the local callee
+            %% (no use of via here)
+            bondy_router_peer:send(RealmUri, To, Invocation, SendOpts)
+    end.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+-doc "We handle messages from our local clients.".
+-spec do_forward(M :: wamp_message(), Ctxt :: map()) -> ok | no_return().
+
+forward_failed(Class, Reason, Stacktrace, #cancel{} = M, _) ->
+    Error = bondy_connect_error:internal(Class, Reason, Stacktrace),
+    ?LOG_WARNING((bondy_connect_error:to_log_map(Error))#{
+        description => ~"CANCEL failed; the call continues",
+        data => M
+    });
+forward_failed(_, {not_authorized, Reason}, _, M, Ctxt) ->
+    Reply = bondy_wamp_error:to_wamp(
+        bondy_connect_error:new(not_authorized, #{message => Reason}), M
+    ),
+    reply_to_caller(Reply, Ctxt);
+forward_failed(throw, not_found, _, M, Ctxt) ->
+    reply_to_caller(not_found_error(M, Ctxt), Ctxt);
+forward_failed(
+    throw, {progressive_call_invocations_unsupported, caller}, _, _, _
+) ->
+    {stop,
+        protocol_violation_abort(
+            ~"A progressive CALL requires that the caller and the dealer both announce progressive_call_invocations."
+        )};
+forward_failed(
+    throw, {progressive_call_invocations_unsupported, callee}, _, M, Ctxt
+) ->
+    reply_to_caller(
+        progressive_call_invocations_error(M, {unsupported, callee}), Ctxt
+    );
+forward_failed(throw, {progressive_call_invocations_violation, _}, _, _, _) ->
+    {stop,
+        protocol_violation_abort(
+            ~"The CALL reuses the request id of a live call that is not a progressive call."
+        )};
+forward_failed(Class, Reason, Stacktrace, M, Ctxt) ->
+    %% The log entry and the reply are projections of one error value,
+    %% so the trace_id the caller receives is the one an operator finds
+    %% in the log, next to the reason the caller must not be shown.
+    Error = bondy_connect_error:internal(Class, Reason, Stacktrace),
+    ?LOG_ERROR((bondy_connect_error:to_log_map(Error))#{
+        description =>
+            ~"Error while evaluating inbound message. Returning ERROR",
+        data => M
+    }),
+    reply_to_caller(bondy_wamp_error:to_wamp(Error, M), Ctxt).
+
+%% @private
+reply_to_caller(Reply, Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    bondy_router_peer:send(RealmUri, bondy_context:ref(Ctxt), Reply).
+
+%% @private
+protocol_violation_abort(Message) ->
+    bondy_wamp_error:to_abort(
+        bondy_connect_error:new(protocol_violation, #{message => Message})
+    ).
+
+%% @private
+do_forward_continuation(#call{procedure_uri = Uri, request_id = Id} = M, Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    Caller = bondy_context:ref(Ctxt),
+
+    case find_input_stream(RealmUri, Caller, Id, Uri) of
+        {invocation_chunk, Promise} ->
+            forward_input_chunk(M, Promise, RealmUri, Caller);
+        {call_chunk, Promise} ->
+            forward_call_chunk(
+                prepare_call_rib(M, Uri, Ctxt), Promise, Caller
+            );
+        violation ->
+            throw({progressive_call_invocations_violation, Id});
+        none ->
+            ok
+    end.
+
+%% @private
+%% `undefined' for a session not held to the request id sequence.
+request_watermark(Ctxt) ->
+    case caller_negotiated(Ctxt) of
+        true ->
+            SessionId = bondy_context:session_id(Ctxt),
+            case get(?REQUEST_WATERMARK) of
+                {SessionId, W} ->
+                    W;
+                undefined ->
+                    0;
+                {Other, _} when Other =/= SessionId ->
+                    0
+            end;
+        false ->
+            undefined
+    end.
+
+%% @private
+advance_request_watermark(Ctxt, Id) ->
+    ok =
+        case request_watermark(Ctxt) of
+            W when is_integer(W), Id > W ->
+                put_request_watermark(Ctxt, Id);
+            W when is_integer(W) ->
+                ok;
+            undefined ->
+                ok
+        end,
+    route.
+
+%% @private
+put_request_watermark(Ctxt, Id) ->
+    _ = put(?REQUEST_WATERMARK, {bondy_context:session_id(Ctxt), Id}),
+    ok.
+
+%% @private
+%% Session-scope ids wrap from `?MAX_ID' to 1, per the WAMP specification.
+classify_call_id(Id, W) when Id =:= W + 1; W =:= ?MAX_ID, Id =:= 1 ->
+    next;
+classify_call_id(Id, W) when Id =< W ->
+    continuation;
+classify_call_id(Id, W) when Id > W ->
+    gap.
+
+%% @private
+%% A caller session negotiates `progressive_call_invocations' against
+%% `?CALLER_FEATURES', not against the configured dealer value the WELCOME
+%% announced, so both are read.
+caller_negotiated(Ctxt) ->
+    is_feature_implemented(progressive_call_invocations) andalso
+        bondy_context:is_feature_enabled(
+            Ctxt, caller, progressive_call_invocations
+        ).
+
+do_forward(#register{} = M, Ctxt) ->
+    handle_register(M, Ctxt);
+do_forward(#unregister{} = M, Ctxt) ->
+    handle_unregister(M, Ctxt);
+do_forward(#call{procedure_uri = Uri} = M0, Ctxt) ->
+    ok = maybe_gate_progressive_caller(M0, Ctxt),
+    ok = bondy_rbac:authorize(<<"wamp.call">>, Uri, Ctxt),
+
+    %% Honour CALL.Options.receive_progress only when both the dealer and
+    %% the caller support progressive results; otherwise remove it here so
+    %% no downstream path can act on it.
+    M = maybe_strip_receive_progress(M0, Ctxt),
+
+    case Uri of
+        <<"bondy.", _/binary>> ->
+            apply_static_callback(M, Ctxt, bondy_wamp_api);
+        <<"com.bondy.", _/binary>> ->
+            %% Alias for "bondy"
+            apply_static_callback(M, Ctxt, bondy_wamp_api);
+        <<"com.leapsight.bondy.", _/binary>> ->
+            %% Deprecated API prefix. Now "bondy"
+            apply_static_callback(M, Ctxt, bondy_wamp_api);
+        <<"wamp.", _/binary>> ->
+            apply_static_callback(M, Ctxt, bondy_wamp_meta_api);
+        _ ->
+            %% The trace boundary: an untraced call from a local caller
+            %% gets a minted W3C context HERE (when `tracing.mint.enabled`
+            %% is on) — before the promise and invocation-details carry
+            %% seats read the options, so one injection point serves the
+            %% local, cross-node and MCP-upstream legs alike. Remote
+            %% callers' calls arrive through forward/3 with whatever their
+            %% ORIGIN node decided and are never re-minted here.
+            M1 = M#call{
+                options = bondy_telemetry:maybe_mint_trace(M#call.options)
+            },
+            Opts = #{error_formatter => undefined},
+            handle_call(M1, Ctxt, Uri, Opts)
+    end;
+do_forward(#cancel{} = M, Ctxt0) ->
+    %% A local Caller is cancelling a previous call.
+    %% A response will be send asynchronously by another router process
+    %% instance.
+
+    %% If the callee does not support call canceling, then behavior is 'skip'.
+    %% We should check callee but that means we need to broadcast sessions.
+    %% Another option is to pay the price and ask bondy to fail on the
+    %% remote node after checking the callee does not support it.
+    %% The caller is not affected, only in the kill case will receive an
+    %% error later in the case of a remote callee.
+    %% The mode arrives as a binary (validated CANCEL option); normalise it to
+    %% the atom the handle_cancel/3 clauses match on.
+    handle_cancel(
+        M, Ctxt0, cancel_mode(maps:get(mode, M#cancel.options, skip))
+    );
+do_forward(#yield{} = M, Ctxt0) ->
+    %% We match the YIELD with the original INVOCATION using the request_id,
+    %% and with that retrieve the CALL request_id to find the Caller.
+
+    RealmUri = bondy_context:realm_uri(Ctxt0),
+    Callee = bondy_context:ref(Ctxt0),
+    InvocationId = M#yield.request_id,
+    Key = bondy_rpc_promise:invocation_key_pattern(
+        RealmUri,
+        '_',
+        '_',
+        Callee,
+        InvocationId
+    ),
+
+    case maps:get(progress, M#yield.options, false) of
+        true ->
+            handle_progressive_yield(M, Key, RealmUri, Callee);
+        false ->
+            case bondy_rpc_promise:take(Key) of
+                {ok, Promise} ->
+                    %% Caller can be local or remote. When the Caller is local
+                    %% this resolves the whole call (only one promise exists),
+                    %% so it is the local-call latency observation point; for
+                    %% a remote Caller its own node observes latency on the
+                    %% call promise instead.
+                    ok = notify_call_latency(Promise, success),
+                    send_yield_result(M, Promise, RealmUri, Callee);
+                error ->
+                    no_matching_promise(M)
+            end
+    end,
+
+    ok;
+do_forward(#error{request_type = ?INVOCATION} = M, Ctxt0) ->
+    %% We match the ERROR with the original INVOCATION
+    %% using the request_id, and with that match the CALL request_id
+    %% to find the Caller.
+    RealmUri = bondy_context:realm_uri(Ctxt0),
+    Callee = bondy_context:ref(Ctxt0),
+    InvocationId = M#error.request_id,
+    Key = bondy_rpc_promise:invocation_key_pattern(
+        RealmUri,
+        '_',
+        '_',
+        Callee,
+        InvocationId
+    ),
+
+    case bondy_rpc_promise:take(Key) of
+        {ok, Promise} ->
+            ok = notify_call_latency(Promise, error),
+            CallId = bondy_rpc_promise:call_id(Promise),
+            Caller = bondy_rpc_promise:caller(Promise),
+            Via = bondy_rpc_promise:via(Promise),
+            SendOpts0 = #{from => Callee, via => Via},
+            {To, SendOpts} = bondy_router_peer:prepare_send(Caller, SendOpts0),
+
+            Error = M#error{request_id = CallId, request_type = ?CALL},
+            bondy_router_peer:send(RealmUri, To, Error, SendOpts);
+        error ->
+            no_matching_promise(M)
+    end;
+do_forward(#error{request_type = Type}, _Ctxt) when Type =/= ?INVOCATION ->
+    {stop,
+        protocol_violation_abort(
+            ~"A client may send ERROR only for an INVOCATION."
+        )}.
+
+%% @private
+-doc """
+If the callback module returns other than `ok` or `reply` we need to
+find the callee in the registry.
+""".
+apply_static_callback(#call{} = M0, Ctxt, Mod) ->
+    ok = maybe_reject_progressive_static(M0),
+    %% Caller is always local.
+    Caller = bondy_context:ref(Ctxt),
+    DefaultOpts = #{error_formatter => undefined},
+    RealmUri = bondy_context:realm_uri(Ctxt),
+
+    try Mod:handle_call(M0, Ctxt) of
+        ok ->
+            ok;
+        continue ->
+            handle_call(M0, Ctxt, M0#call.procedure_uri, DefaultOpts);
+        {continue, #call{} = M1} ->
+            handle_call(M1, Ctxt, M1#call.procedure_uri, DefaultOpts);
+        {continue, #call{} = M1, Fun} ->
+            Opts = DefaultOpts#{error_formatter => Fun},
+            handle_call(M1, Ctxt, M1#call.procedure_uri, Opts);
+        {continue, Uri} when is_binary(Uri) ->
+            handle_call(M0, Ctxt, Uri, DefaultOpts);
+        {continue, Uri, Fun} when is_binary(Uri) ->
+            Opts = DefaultOpts#{error_formatter => Fun},
+            handle_call(M0, Ctxt, Uri, Opts);
+        {reply, Reply} ->
+            bondy_router_peer:send(RealmUri, Caller, Reply)
+    catch
+        throw:no_such_procedure ->
+            Error = bondy_wamp_api_utils:no_such_procedure_error(M0),
+            bondy_router_peer:send(RealmUri, Caller, Error);
+        error:#error{} = Error ->
+            bondy_router_peer:send(RealmUri, Caller, Error);
+        Class:Reason:Stacktrace ->
+            ?LOG_WARNING(#{
+                description => <<"Error while handling WAMP call">>,
+                procedure => M0#call.procedure_uri,
+                caller => Caller,
+                class => Class,
+                reason => Reason,
+                stacktrace => Stacktrace
+            }),
+            Error = bondy_wamp_api_utils:maybe_error({error, Reason}, M0),
+            bondy_router_peer:send(RealmUri, Caller, Error)
+    end.
+
+%% @private
+-spec apply_dynamic_callback(wamp_call(), bondy_ref:t()) ->
+    wamp_result() | wamp_error().
+
+apply_dynamic_callback(#call{} = Msg, Callee) ->
+    apply_dynamic_callback(Msg, Callee, []).
+
+%% @private
+-spec apply_dynamic_callback(wamp_call(), bondy_ref:t(), [any()]) ->
+    wamp_result() | wamp_error().
+
+apply_dynamic_callback(#call{} = Msg0, Callee, CBArgs) ->
+    case bondy_wamp_api_utils:decode_call(Msg0) of
+        {ok, Msg} -> apply_decoded_callback(Msg, Callee, CBArgs);
+        {error, Reply} -> Reply
+    end.
+
+%% @private
+apply_decoded_callback(#call{} = Msg, Callee, CBArgs) ->
+    CallId = Msg#call.request_id,
+
+    A = lists:append([
+        args_to_list(CBArgs),
+        args_to_list(Msg#call.args),
+        args_to_list(Msg#call.kwargs),
+        args_to_list(Msg#call.options)
+    ]),
+
+    {M, F} = bondy_ref:callback(Callee),
+
+    try erlang:apply(M, F, A) of
+        {ok, Details, Args, KWArgs} ->
+            bondy_wamp_message:result(
+                CallId,
+                Details,
+                Args,
+                KWArgs
+            );
+        {error, Uri, Details, Args, KWArgs} ->
+            bondy_wamp_message:error(
+                ?CALL,
+                CallId,
+                Details,
+                Uri,
+                Args,
+                KWArgs
+            );
+        Other ->
+            error({invalid_return, Other})
+    catch
+        error:undef ->
+            badarity_error(CallId, ?CALL);
+        error:{badarg, _} ->
+            badarg_error(CallId, ?CALL)
+    end.
+
+%% @private
+args_to_list(undefined) ->
+    [];
+args_to_list(L) when is_list(L) ->
+    L;
+args_to_list(M) when is_map(M) ->
+    [M].
+
+%% @private
+-spec format_error(any(), map()) -> optional(wamp_error()).
+
+format_error(_, undefined) ->
+    undefined;
+format_error(_, #{error_formatter := undefined}) ->
+    undefined;
+format_error(Error, #{error_formatter := Fun}) ->
+    Fun(Error).
+
+%% @private
+-doc """
+A local Caller is cancelling a previous CALL.
+
+A call to a local callee is tracked by an invocation promise and handled
+by `handle_cancel_local/3`. A call to a remote or bridged callee is
+tracked by a call promise (the invocation promise lives on the callee's
+node), so the CANCEL is relayed to that node, which resolves the local
+invocation id and INTERRUPTs the callee (`forward/3`).
+""".
+handle_cancel(#cancel{} = M, Ctxt, Mode) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    Caller = bondy_context:ref(Ctxt),
+    CallId = M#cancel.request_id,
+    CallKey = bondy_rpc_promise:call_key_pattern(RealmUri, Caller, CallId),
+
+    case bondy_rpc_promise:find(CallKey) of
+        {ok, Promise} ->
+            handle_cancel_remote(M, Ctxt, Mode, CallKey, Promise);
+        error ->
+            handle_cancel_local(M, Ctxt, Mode)
+    end.
+
+%% @private
+%% Cancel a call whose callee is on another node or bridged cluster. For
+%% `killnowait` and `skip` the caller is answered immediately and the call
+%% promise settled here, so any late RESULT/ERROR relayed back is
+%% discarded; for `kill` the promise stays — the callee's ERROR is relayed
+%% back and settles the call. The CANCEL is forwarded in every mode (for
+%% `skip` only so the callee's node drops its invocation promise). A
+%% promise without a callee is a call waiting for a registration; there is
+%% nothing to forward the CANCEL to.
+handle_cancel_remote(M, Ctxt, Mode, CallKey, Promise) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    Caller = bondy_context:ref(Ctxt),
+    CallId = M#cancel.request_id,
+
+    Uri = bondy_rpc_promise:procedure_uri(Promise),
+    ok = bondy_rbac:authorize(<<"wamp.cancel">>, Uri, Ctxt),
+
+    %% `kill` waits for the callee's ERROR, which a call without a callee (one
+    %% waiting for a registration) never gets.
+    ok =
+        case {Mode, bondy_rpc_promise:callee(Promise)} of
+            {kill, undefined} ->
+                _ = bondy_rpc_promise:take(CallKey),
+                bondy_router_peer:send(
+                    RealmUri, Caller, cancelled_error(CallId), #{}
+                );
+            {kill, _} ->
+                ok;
+            {Settled, _} when Settled == killnowait; Settled == skip ->
+                _ = bondy_rpc_promise:take(CallKey),
+                Error = cancelled_error(CallId),
+                bondy_router_peer:send(RealmUri, Caller, Error, #{})
+        end,
+
+    case bondy_rpc_promise:callee(Promise) of
+        undefined ->
+            ok;
+        Callee when Callee =/= undefined ->
+            send_to_callee(Promise, M, #{from => Caller})
+    end.
+
+%% @private
+handle_cancel_local(#cancel{} = M, Ctxt0, kill) ->
+    %% INTERRUPT is sent to the callee, but ERROR is not returned
+    %% to the caller until the callee has answered the INVOCATION
+    %% with ERROR. In this case, the caller may receive RESULT or
+    %% another ERROR if the callee finishes processing the
+    %% INVOCATION first.
+    %% We thus read the promise instead of taking it.
+    RealmUri = bondy_context:realm_uri(Ctxt0),
+    CallId = M#cancel.request_id,
+    Caller = bondy_context:ref(Ctxt0),
+    Opts = M#cancel.options,
+
+    Fun = fun(Promise, Ctxt1) ->
+        Uri = bondy_rpc_promise:procedure_uri(Promise),
+        ok = bondy_rbac:authorize(<<"wamp.cancel">>, Uri, Ctxt1),
+
+        InvocationId = bondy_rpc_promise:invocation_id(Promise),
+        Callee = bondy_rpc_promise:callee(Promise),
+
+        case interruptible(Callee) of
+            true ->
+                Via = bondy_rpc_promise:via(Promise),
+                SendOpts0 = #{from => Caller, via => Via},
+                {To, SendOpts} = bondy_router_peer:prepare_send(
+                    Callee, SendOpts0
+                ),
+                R = bondy_wamp_message:interrupt(InvocationId, Opts),
+                ok = bondy_router_peer:send(RealmUri, To, R, SendOpts);
+            false ->
+                _ = bondy_rpc_promise:take(bondy_rpc_promise:key(Promise)),
+                Error = cancelled_error(CallId),
+                ok = bondy_router_peer:send(RealmUri, Caller, Error, #{})
+        end,
+
+        {ok, Ctxt1}
+    end,
+
+    _ = find_invocations(CallId, Fun, Ctxt0),
+    ok;
+handle_cancel_local(#cancel{} = M, Ctxt0, killnowait) ->
+    %% The pending call is canceled and ERROR is send immediately
+    %% back to the caller. INTERRUPT is sent to the callee and any
+    %% response to the invocation or interrupt from the callee is
+    %% discarded when received.
+    %% We take the invocation, that way the response will be
+    %% discarded.
+    RealmUri = bondy_context:realm_uri(Ctxt0),
+    CallId = M#cancel.request_id,
+    Caller = bondy_context:ref(Ctxt0),
+    Opts = M#cancel.options,
+
+    Fun = fun(Promise, Ctxt1) ->
+        Uri = bondy_rpc_promise:procedure_uri(Promise),
+        ok = bondy_rbac:authorize(<<"wamp.cancel">>, Uri, Ctxt1),
+
+        InvocationId = bondy_rpc_promise:invocation_id(Promise),
+        Callee = bondy_rpc_promise:callee(Promise),
+
+        Error = cancelled_error(CallId),
+
+        %% We know the caller is local
+        ok = bondy_router_peer:send(RealmUri, Caller, Error, #{}),
+
+        %% But Callee might be remote
+        case interruptible(Callee) of
+            true ->
+                Interrupt = bondy_wamp_message:interrupt(InvocationId, Opts),
+                Via = bondy_rpc_promise:via(Promise),
+                SendOpts0 = #{from => Caller, via => Via},
+                {To, SendOpts} = bondy_router_peer:prepare_send(
+                    Callee, SendOpts0
+                ),
+                ok = bondy_router_peer:send(RealmUri, To, Interrupt, SendOpts);
+            false ->
+                ok
+        end,
+
+        {ok, Ctxt1}
+    end,
+    _ = take_invocations(CallId, M, Fun, Ctxt0),
+    ok;
+handle_cancel_local(#cancel{} = M, Ctxt0, skip) ->
+    %% The pending call is canceled and ERROR is sent immediately
+    %% back to the caller. No INTERRUPT is sent to the callee and
+    %% the result is discarded when received.
+    %% We dequeue the invocation, that way the response will be
+    %% discarded.
+    %% TODO instead of dequeuing, update the entry to reflect it was
+    %% cancelled
+    CallId = M#cancel.request_id,
+    Caller = bondy_context:ref(Ctxt0),
+
+    Fun = fun(Promise, Ctxt1) ->
+        Uri = bondy_rpc_promise:procedure_uri(Promise),
+        ok = bondy_rbac:authorize(<<"wamp.cancel">>, Uri, Ctxt1),
+
+        %% The cancellation acknowledgement is an ERROR for the CALL (the
+        %% CANCEL message type has no ERROR counterpart in the spec).
+        Error = cancelled_error(CallId),
+
+        RealmUri = bondy_context:realm_uri(Ctxt1),
+        ok = bondy_router_peer:send(RealmUri, Caller, Error, #{}),
+
+        {ok, Ctxt1}
+    end,
+
+    _ = take_invocations(CallId, M, Fun, Ctxt0),
+
+    ok.
+
+%% @private
+%% `kill` keeps the promise: the callee's ERROR settles the call.
+find_canceled(Key, kill) ->
+    bondy_rpc_promise:find(Key);
+find_canceled(Key, Mode) when Mode == killnowait; Mode == skip ->
+    bondy_rpc_promise:take(Key).
+
+%% @private
+cancel_mode(<<"kill">>) -> kill;
+cancel_mode(<<"killnowait">>) -> killnowait;
+cancel_mode(<<"skip">>) -> skip;
+cancel_mode(Mode) when is_atom(Mode) -> Mode;
+cancel_mode(_) -> skip.
+
+-doc """
+Registers an RPC endpoint.
+If the registration already exists, it fails with a
+`{not_authorized | procedure_already_exists, binary()}` reason.
+""".
+handle_register(#register{procedure_uri = Uri} = M, Ctxt) ->
+    ok = maybe_reserved_ns(Uri),
+    ok = bondy_rbac:authorize(<<"wamp.register">>, Uri, Ctxt),
+
+    #register{options = Opts0, request_id = ReqId} = M,
+
+    %% We add an option used by bondy_registry
+    Val = bondy_context:is_feature_enabled(Ctxt, callee, shared_registration),
+    Opts = Opts0#{shared_registration => Val},
+
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    Ref = bondy_context:ref(Ctxt),
+
+    case bondy_registry:add(registration, RealmUri, Uri, Opts, Ref) of
+        {ok, Entry} ->
+            ok = on_register(Entry),
+            Id = bondy_registry_entry:id(Entry),
+            Reply = bondy_wamp_message:registered(ReqId, Id),
+            bondy_router_peer:send(RealmUri, Ref, Reply);
+        {error, {already_exists, Entry}} ->
+            EntrySessionId = bondy_registry_entry:session_id(Entry),
+            Who =
+                case bondy_router_peer:get_process_metadata() of
+                    #{session_id := Id} when Id == EntrySessionId ->
+                        <<"this session">>;
+                    _ ->
+                        <<"another session">>
+                end,
+            Policy = bondy_registry_entry:match_policy(Entry),
+            Msg = <<
+                "The procedure is already registered by ",
+                Who/binary,
+                " with policy ",
+                $',
+                Policy/binary,
+                $',
+                $.
+            >>,
+            Reply = bondy_wamp_message:error(
+                ?REGISTER,
+                ReqId,
+                #{},
+                ?WAMP_PROCEDURE_ALREADY_EXISTS,
+                [Msg]
+            ),
+            bondy_router_peer:send(RealmUri, Ref, Reply);
+        {error, Reason} when is_atom(Reason) ->
+            Msg = <<
+                "Failed to register procedure, reason:",
+                (atom_to_binary(Reason))/binary
+            >>,
+            Reply = bondy_wamp_message:error(
+                ?REGISTER,
+                ReqId,
+                #{},
+                ?BONDY_ERROR_INTERNAL,
+                [Msg]
+            ),
+            bondy_router_peer:send(RealmUri, Ref, Reply)
+    end.
+
+%% @private
+-doc """
+Unregisters an RPC endpoint.
+If the registration does not exist, it fails with a `no_such_registration` or
+`{not_authorized, binary()}` error.
+""".
+-spec handle_unregister(wamp_unregister(), bondy_context:t()) ->
+    ok | no_return().
+
+handle_unregister(#unregister{} = M, Ctxt) ->
+    RegId = M#unregister.registration_id,
+    RealmUri = bondy_context:realm_uri(Ctxt),
+
+    %% TODO Shouldn't we restrict this operation to the peer who registered it?
+    %% and/or a Bondy Admin for revoke registration?
+    case bondy_registry:lookup(registration, RealmUri, RegId) of
+        {error, not_found} ->
+            throw(not_found);
+        {ok, Entry} ->
+            Uri = bondy_registry_entry:uri(Entry),
+            ok = bondy_rbac:authorize(<<"wamp.unregister">>, Uri, Ctxt),
+            unregister(Uri, M, Ctxt)
+    end.
+
+%% @private
+unregister(Uri, M, Ctxt) ->
+    ok = maybe_reserved_ns(Uri),
+    RealmUri = bondy_context:realm_uri(Ctxt),
+
+    ok = bondy_rbac:authorize(<<"wamp.unregister">>, Uri, Ctxt),
+
+    ok = bondy_registry:remove(
+        registration, M#unregister.registration_id, Ctxt, fun on_unregister/1
+    ),
+
+    Reply = bondy_wamp_message:unregistered(M#unregister.request_id),
+
+    bondy_router_peer:send(RealmUri, bondy_context:ref(Ctxt), Reply).
+
+%% @private
+-spec reply_error(wamp_error(), bondy_context:t()) -> ok.
+
+reply_error(Error, Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    bondy_router_peer:send(RealmUri, bondy_context:ref(Ctxt), Error).
+
+%% @private
+-spec take_invocations(
+    id(), wamp_message(), function(), bondy_context:t()
+) ->
+    {ok, bondy_context:t()}.
+
+take_invocations(CallId, M, Fun, Ctxt) when is_function(Fun, 2) ->
+    Caller = bondy_context:ref(Ctxt),
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    Key = bondy_rpc_promise:invocation_key_pattern(
+        RealmUri,
+        Caller,
+        CallId,
+        '_',
+        '_'
+    ),
+
+    case bondy_rpc_promise:take(Key) of
+        {ok, Promise} ->
+            {ok, Ctxt1} = Fun(Promise, Ctxt),
+            take_invocations(CallId, M, Fun, Ctxt1);
+        error ->
+            %% Promises for this call were either interrupted by us,
+            %% fulfilled or timed out and evicted
+            ok = no_matching_promise(M),
+            {ok, Ctxt}
+    end.
+
+%% @private
+-spec find_invocations(
+    id(),
+    fun((bondy_rpc_promise:t(), bondy_context:t()) -> {ok, bondy_context:t()}),
+    bondy_context:t()
+) -> {ok, bondy_context:t()}.
+
+find_invocations(CallId, Fun, Ctxt) when is_function(Fun, 2) ->
+    Caller = bondy_context:ref(Ctxt),
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    Key = bondy_rpc_promise:invocation_key_pattern(
+        RealmUri,
+        Caller,
+        CallId,
+        '_',
+        '_'
+    ),
+
+    %% `Fun` READS the promises without consuming them (kill-mode CANCEL
+    %% leaves the promise for the callee's ERROR to settle), so
+    %% the matches MUST be collected in one pass: a find-apply-refind
+    %% loop keeps returning the same promise and never terminates —
+    %% observed as an unbounded INTERRUPT flood at the callee, racing the
+    %% very ERROR that would have ended it.
+    lists:foldl(
+        fun(Promise, {ok, Ctxt1}) -> Fun(Promise, Ctxt1) end,
+        {ok, Ctxt},
+        bondy_rpc_promise:find_all(Key)
+    ).
+
+%% @private
+no_matching_promise(M) ->
+    %% Promise was fulfilled or timed out and evicted. We do nothing.
+    ?LOG_DEBUG(#{
+        description => "Message ignored",
+        reason => no_matching_promise,
+        message => M
+    }),
+    ok.
+
+%% @private
+%% CALL.Options.receive_progress is honoured only when the dealer feature
+%% `progressive_call_results` is enabled and the caller announced it in
+%% HELLO. Otherwise the option is removed so that no downstream path
+%% — invocation details, promise marking or forwarded CALLs — can act on
+%% it.
+maybe_strip_receive_progress(
+    #call{options = #{receive_progress := true} = Opts} = M, Ctxt
+) ->
+    Supported =
+        is_feature_implemented(progressive_call_results) andalso
+            bondy_context:is_feature_enabled(
+                Ctxt, caller, progressive_call_results
+            ),
+
+    case Supported of
+        true ->
+            M;
+        false ->
+            M#call{options = maps:remove(receive_progress, Opts)}
+    end;
+maybe_strip_receive_progress(M, _) ->
+    M.
+
+%% @private
+%% A callee gets INVOCATION.Details.receive_progress only if it announced both
+%% `progressive_call_results` and `call_canceling` (WAMP §11.1): a callee the
+%% dealer cannot interrupt would stream on after its caller left. Otherwise the
+%% flag is removed and the callee settles the call with one final YIELD.
+gate_receive_progress(
+    #call{
+        options =
+            #{
+                '$private' :=
+                    #{
+                        invocation_details :=
+                            #{receive_progress := true} = Details
+                    } = Private
+            } = Opts
+    } = M,
+    CalleeSessionId
+) ->
+    case
+        session_feature(CalleeSessionId, callee, progressive_call_results) andalso
+            session_feature(CalleeSessionId, callee, call_canceling)
+    of
+        true ->
+            M;
+        false ->
+            M#call{
+                options = Opts#{
+                    '$private' := Private#{
+                        invocation_details :=
+                            maps:remove(receive_progress, Details)
+                    }
+                }
+            }
+    end;
+gate_receive_progress(M, _) ->
+    M.
+
+%% @private
+%% The feature a session announced for a role in HELLO. Sessions are
+%% looked up locally, so this must only be used for refs targeting a
+%% session on this node. Any failure (no session id, session gone) reads
+%% as the feature being unsupported.
+%% Only a callee that announced `call_canceling` may be sent an INTERRUPT; for
+%% any other, `kill` and `killnowait` act as `skip` (WAMP Advanced Profile,
+%% Call Canceling).
+interruptible(Callee) ->
+    session_feature(bondy_ref:session_id(Callee), callee, call_canceling).
+
+%% @private
+session_feature(SessionId, Role, Feature) when is_binary(SessionId) ->
+    try bondy_session:roles(SessionId) of
+        Roles when is_map(Roles) ->
+            key_value:get([Role, features, Feature], Roles, false);
+        undefined ->
+            false
+    catch
+        %% `ets:lookup_element/3` raises `badarg` when the session row is gone.
+        error:badarg ->
+            false
+    end;
+session_feature(_, _, _) ->
+    false.
+
+%% @private
+maybe_mark_progress(PromiseOpts, true) ->
+    PromiseOpts#{receive_progress => true};
+maybe_mark_progress(PromiseOpts, _) ->
+    PromiseOpts.
+
+%% @private
+%% `Retry` is what `retry/1` needs to route the call again; the retry deadline
+%% becomes the promise's own, so no attempt outlives the caller's wait.
+%% Extension options pass validation untyped, so only an integer `_retries` and
+%% a literal `true` `_idempotent` enable a retry.
+maybe_mark_retry(#{receive_progress := true} = PromiseOpts, _, _, _) ->
+    PromiseOpts;
+maybe_mark_retry(#{progressive_input := true} = PromiseOpts, _, _, _) ->
+    PromiseOpts;
+maybe_mark_retry(PromiseOpts, #call{}, undefined, _) ->
+    PromiseOpts;
+maybe_mark_retry(
+    PromiseOpts, #call{options = #{'_retries' := N} = O}, Entry, Retry
+) when is_integer(N), N > 0 ->
+    case
+        bondy_registry_entry:get_option('_idempotent', Entry, false) =:= true
+    of
+        true ->
+            PromiseOpts#{
+                deadline => bondy_wamp_api_utils:retry_deadline(O),
+                retry => Retry
+            };
+        false ->
+            PromiseOpts
+    end;
+maybe_mark_retry(PromiseOpts, #call{}, _, _) ->
+    PromiseOpts.
+
+%% @private
+%% Mark a promise as the target of a progressive INPUT stream (the mirror of
+%% `receive_progress` for the results side). While marked, a CALL reusing the
+%% caller's request id is treated as the next argument chunk (forwarded as another
+%% INVOCATION with the same invocation id) rather than a duplicate; the promise is
+%% NOT settled by the final input chunk — only by the eventual RESULT/ERROR. We
+%% stash the `registration_id` and the base `invocation_details` so a subsequent
+%% chunk can rebuild the INVOCATION without re-choosing a callee.
+maybe_mark_progressive_input(PromiseOpts, #invocation{} = Inv) ->
+    case maps:get(progress, Inv#invocation.details, false) of
+        true ->
+            PromiseOpts#{
+                progressive_input => true,
+                registration_id => Inv#invocation.registration_id,
+                invocation_details => Inv#invocation.details
+            };
+        false ->
+            PromiseOpts
+    end;
+maybe_mark_progressive_input(PromiseOpts, _) ->
+    PromiseOpts.
+
+%% @private
+%% Mark a CALL promise (the caller-node side of a remote call) as the target of
+%% a progressive INPUT stream. Unlike the invocation promise there is no
+%% registration_id / invocation_details to stash — the caller node never chose a
+%% callee; it only re-forwards subsequent chunks to the same owner node
+%% (`callee` on the promise is that node ref). The invocation promise is created
+%% and marked on the owner node.
+maybe_mark_progressive_call_input(PromiseOpts, #call{
+    options = #{progress := true}
+}) ->
+    PromiseOpts#{progressive_input => true};
+maybe_mark_progressive_call_input(PromiseOpts, _) ->
+    PromiseOpts.
+
+%% @private
+%% Classifies a CALL that reuses a request id of its caller. The invocation
+%% promise for `(Caller, CallId)` lives on the callee's node, a call promise on
+%% each node that forwarded the CALL towards a callee elsewhere. The WAMP
+%% specification matches a continuation on the request id and the procedure,
+%% so a promise for another procedure, like no promise, gives `none`.
+find_input_stream(RealmUri, Caller, CallId, Uri) ->
+    InvPattern = bondy_rpc_promise:invocation_key_pattern(
+        RealmUri, Caller, CallId, '_', '_'
+    ),
+    case bondy_rpc_promise:find(InvPattern) of
+        {ok, Promise} ->
+            %% Local callee (single node) or the owner node of a remote
+            %% callee: the open invocation promise is the stream target.
+            classify_input_stream(invocation_chunk, Promise, Uri);
+        error ->
+            CallPattern = bondy_rpc_promise:call_key_pattern(
+                RealmUri, Caller, CallId
+            ),
+            case bondy_rpc_promise:find(CallPattern) of
+                {ok, Promise} ->
+                    %% A node that forwarded the CALL: the open call promise
+                    %% re-forwards each chunk towards the callee.
+                    classify_input_stream(call_chunk, Promise, Uri);
+                error ->
+                    none
+            end
+    end.
+
+%% @private
+%% A promise for the CALL's procedure is a stream iff it was marked
+%% `progressive_input`; otherwise the id is live on a call that is not a
+%% stream, a protocol violation. A stream past its final chunk takes no more.
+classify_input_stream(Kind, Promise, Uri) ->
+    Stream = bondy_rpc_promise:get(progressive_input, Promise, false),
+    Ended = bondy_rpc_promise:get(input_ended, Promise, false),
+    case bondy_rpc_promise:procedure_uri(Promise) of
+        Uri when Stream, Ended ->
+            none;
+        Uri when Stream ->
+            {Kind, Promise};
+        Uri ->
+            violation;
+        Other when Other =/= Uri ->
+            none
+    end.
+
+%% @private
+%% Forward a subsequent argument chunk as another INVOCATION to the callee
+%% already handling the stream, reusing the invocation id and registration id
+%% stashed on the promise at the first chunk. `progress` marks a non-final chunk;
+%% the final CALL (no `progress`) yields an INVOCATION without it, so the callee
+%% learns the input is complete. The promise is refreshed (inter-chunk timeout)
+%% but NOT settled — the eventual RESULT/ERROR settles it.
+forward_input_chunk(Msg, Promise, RealmUri, Caller) ->
+    Callee = bondy_rpc_promise:callee(Promise),
+    InvocationId = bondy_rpc_promise:invocation_id(Promise),
+    RegId = bondy_rpc_promise:get(registration_id, Promise, undefined),
+    Base = bondy_rpc_promise:get(invocation_details, Promise, #{}),
+    Progress = maps:get(progress, Msg#call.options, false),
+    Details =
+        case Progress of
+            true ->
+                Base#{progress => true};
+            false ->
+                maps:remove(progress, Base)
+        end,
+    Invocation = bondy_wamp_message:invocation_from(
+        Msg, InvocationId, RegId, Details
+    ),
+    _ = bondy_rpc_promise:refresh(Promise),
+    _ =
+        case Progress of
+            true -> ok;
+            false -> bondy_rpc_promise:end_input(Promise)
+        end,
+    bondy_router_peer:send(RealmUri, Callee, Invocation, #{from => Caller}).
+
+%% @private
+%% Counterpart of `forward_input_chunk/4` on a node holding a call promise for
+%% a callee on another node or behind a bridge: the chunk follows the first
+%% one, marked `input_continuation` so the callee's node only delivers it to
+%% the open invocation or discards it (see `forward/3`). That node reads only
+%% the procedure, `'$private'.call_id` and `Options.progress` from it; the full
+%% `prepare_call_rib/3` envelope keeps one wire shape for every chunk. The call
+%% promise is refreshed, not settled.
+forward_call_chunk(Call, Promise, Caller) ->
+    _ = bondy_rpc_promise:refresh(Promise),
+    send_to_callee(Promise, Call, #{
+        from => Caller, rib_completion => true, input_continuation => true
+    }).
+
+%% @private
+%% Sends `M` to the callee of a call promise along the relays the call took, so
+%% a bridged callee is reached through its bridge relay
+%% (`bondy_connect_bridge_progressive_SUITE`).
+send_to_callee(Promise, M, Opts) ->
+    Via = bondy_rpc_promise:get(callee_via, Promise, undefined),
+    {To, SendOpts} = bondy_router_peer:prepare_send(
+        bondy_rpc_promise:callee(Promise), Opts#{via => Via}
+    ),
+    bondy_router_peer:send(
+        bondy_rpc_promise:realm_uri(Promise), To, M, SendOpts
+    ).
+
+%% @private
+%% The call promise of a CALL this node forwards to `Callee`. It matches the
+%% RESULT | ERROR, and keeps the callee and the relays that reach it so later
+%% chunks and a CANCEL follow the call (`send_to_callee/3`). A caller-gated
+%% receive_progress marks it, so progressive RESULTs do not settle it.
+forwarded_call_promise(
+    RealmUri, Msg, Caller, CallId, Callee, SendOpts, PromiseOpts
+) ->
+    bondy_rpc_promise:new_call(
+        RealmUri,
+        Caller,
+        CallId,
+        maybe_mark_progressive_call_input(
+            maybe_mark_progress(
+                PromiseOpts#{
+                    callee => Callee,
+                    callee_via => maps:get(via, SendOpts, undefined)
+                },
+                maps:get(receive_progress, Msg#call.options, false)
+            ),
+            Msg
+        )
+    ).
+
+%% @private
+%% Runs before authorization and dispatch: the outcome, an ABORT from
+%% `forward/2`, does not depend on the procedure.
+maybe_gate_progressive_caller(#call{options = #{progress := true}}, Ctxt) ->
+    caller_negotiated(Ctxt) orelse
+        throw({progressive_call_invocations_unsupported, caller}),
+    ok;
+maybe_gate_progressive_caller(_, _) ->
+    ok.
+
+%% @private
+%% First-chunk callee gate for a progressive-input CALL routed to a LOCAL callee.
+%% A remote/bridged callee is gated at its own node (see the client clause of
+%% `forward/3`), so this only rejects when the chosen entry lives here.
+maybe_gate_progressive_callee(#call{options = #{progress := true}}, Entry) ->
+    Callee = bondy_registry_entry:ref(Entry),
+    case bondy_ref:is_local(Callee) of
+        true ->
+            progressive_callee_supported(Callee) orelse
+                throw({progressive_call_invocations_unsupported, callee}),
+            ok;
+        false ->
+            ok
+    end;
+maybe_gate_progressive_callee(_, _) ->
+    ok.
+
+%% @private
+%% Bondy serves every procedure in a reserved namespace itself, since
+%% `maybe_reserved_ns/1` refuses a peer's registration there, and none of them
+%% reads progressive input, so Bondy is a callee without the feature.
+maybe_reject_progressive_static(#call{options = #{progress := true}}) ->
+    throw({progressive_call_invocations_unsupported, callee});
+maybe_reject_progressive_static(_) ->
+    ok.
+
+%% @private
+%% Owner-node predicate mirroring `maybe_gate_progressive_callee/2` for a callee
+%% reached via `forward/3` (a remote caller). A progressive-input CALL is
+%% admissible only if the local callee announced `progressive_call_invocations`;
+%% a non-progressive CALL is always admissible. Returns a boolean (not a throw)
+%% because `forward/3` runs on the relay-inbound path with no caller context to
+%% unwind to — the rejection is sent back explicitly.
+progressive_input_admissible(#call{options = #{progress := true}}, Callee) ->
+    progressive_callee_supported(Callee);
+progressive_input_admissible(_, _) ->
+    true.
+
+%% @private
+%% Whether a callee supports progressive input: its negotiated session role
+%% announced both `progressive_call_invocations` and `call_canceling`, as the
+%% WAMP specification requires of a callee. Shared by the local gate and the
+%% owner-node predicate.
+progressive_callee_supported(Callee) ->
+    SessionId = bondy_ref:session_id(Callee),
+    session_feature(SessionId, callee, progressive_call_invocations) andalso
+        session_feature(SessionId, callee, call_canceling).
+
+%% @private
+%% Build the client-facing ERROR for a rejected progressive-input CALL. Shared
+%% by the local-caller path (the `forward/2` catch clauses) and the owner-node
+%% path (`reply_progressive_call_invocations_error/3`), so both reject an
+%% unsupported callee with one message.
+progressive_call_invocations_error(#call{} = Msg, {unsupported, callee}) ->
+    bondy_wamp_error:to_wamp(
+        bondy_connect_error:new(feature_not_supported, #{
+            message =>
+                ~"The callee does not support the progressive_call_invocations feature."
+        }),
+        Msg
+    ).
+
+%% @private
+%% Send a progressive-input rejection back to the caller from the callee's owner
+%% node. The ERROR follows the `via` route stashed in `Opts` back to the origin
+%% node, whose call promise matches it and fails the caller's call fast.
+reply_progressive_call_invocations_error(
+    #call{} = Msg, Kind, #{from := Caller} = Opts
+) ->
+    RealmUri = ?GET_REALM_URI(Opts),
+    Error = progressive_call_invocations_error(Msg, Kind),
+    {To, SendOpts} = bondy_router_peer:prepare_send(Caller, Opts),
+    bondy_router_peer:send(RealmUri, To, Error, SendOpts).
+
+%% @private
+%% Absolute expiry cap from the CALL.Options._deadline extension. For a
+%% progressive call the WAMP timeout is an inter-result inactivity window that
+%% each progressive result restarts, so without a deadline a slowly-dripping
+%% stream is unbounded; the deadline bounds the whole call.
+%%
+%% The READING of the option is `bondy_wamp_api_utils:deadline/1`, shared with
+%% the static `bondy.*` handlers that honour it themselves — a routed call and
+%% `bondy.alarm.history` must not read one option two ways.
+promise_deadline(CallOpts) ->
+    bondy_wamp_api_utils:deadline(CallOpts).
+
+%% @private
+%% A YIELD marked progressive settles nothing: the invocation promise
+%% stays in place to match further YIELDs and the RESULT forwarded to the
+%% caller carries Details.progress = true (call latency is observed on the
+%% final settlement only). Per the WAMP spec the call timeout is, for a
+%% progressive call, the limit between the call and the first result and
+%% between results thereafter — so each progressive result slides the
+%% promise expiry (capped by any CALL.Options._deadline).
+%%
+%% A progressive YIELD for a promise that was not marked receive_progress
+%% is a protocol violation: the callee's session is closed and the YIELD
+%% dropped (the session cleanup flushes the promise, fast-failing the
+%% caller with no_eligible_callee). A callee without a local session (an
+%% internal target, which cannot be closed) is demoted to a final result
+%% instead.
+handle_progressive_yield(M0, Key, RealmUri, Callee) ->
+    case bondy_rpc_promise:find(Key) of
+        {ok, Promise} ->
+            case bondy_rpc_promise:get(receive_progress, Promise, false) of
+                true ->
+                    _ = bondy_rpc_promise:refresh(Promise),
+                    send_yield_result(M0, Promise, RealmUri, Callee);
+                false ->
+                    handle_progressive_violation(M0, Key, RealmUri, Callee)
+            end;
+        error ->
+            no_matching_promise(M0)
+    end.
+
+%% @private
+handle_progressive_violation(M0, Key, RealmUri, Callee) ->
+    ?LOG_WARNING(#{
+        description =>
+            "Callee sent a progressive YIELD for a call that did not "
+            "request progressive results. This is a protocol violation.",
+        realm_uri => RealmUri,
+        callee => Callee,
+        invocation_id => M0#yield.request_id
+    }),
+
+    SessionId = bondy_ref:session_id(Callee),
+
+    Session =
+        case SessionId == undefined of
+            true -> {error, not_found};
+            false -> bondy_session:lookup(SessionId)
+        end,
+
+    case Session of
+        {ok, S} ->
+            bondy_session_manager:close(S, ?WAMP_PROTOCOL_VIOLATION);
+        {error, not_found} ->
+            %% No closable session — demote to the final result so the
+            %% caller is still answered.
+            M = M0#yield{
+                options = maps:remove(progress, M0#yield.options)
+            },
+            case bondy_rpc_promise:take(Key) of
+                {ok, P} ->
+                    ok = notify_call_latency(P, success),
+                    send_yield_result(M, P, RealmUri, Callee);
+                error ->
+                    no_matching_promise(M)
+            end
+    end.
+
+%% @private
+%% Turns a YIELD into a RESULT and routes it towards the caller.
+%%
+%% Via might be undefined or might have been set when handling the
+%% INVOCATION in forward/3 and provides the route back to the Caller i.e.
+%% a pipe of relays. If the Caller is remote the RESULT will be forwarded
+%% through relays and potentially bridge relays till the Caller; when it
+%% arrives at the node where the Caller is connected it will match a call
+%% promise. If the Caller is local, we are done (only one promise exists).
+send_yield_result(M, Promise, RealmUri, Callee) ->
+    Caller = bondy_rpc_promise:caller(Promise),
+    CallId = bondy_rpc_promise:call_id(Promise),
+    Via = bondy_rpc_promise:via(Promise),
+    SendOpts0 = #{from => Callee, via => Via},
+    {To, SendOpts} = bondy_router_peer:prepare_send(Caller, SendOpts0),
+
+    Result = bondy_wamp_message:result_from(
+        M,
+        CallId,
+        %% We fwd all yield options (we know we should at least forward
+        %% all ppt_* attributes in Options; progress also survives here).
+        M#yield.options
+    ),
+
+    bondy_router_peer:send(RealmUri, To, Result, SendOpts).
+
+%% @private
+%% Emits the latency (promise creation to first response) for a settled
+%% promise, inline via telemetry (`bondy_prometheus` sinks it into
+%% `bondy_wamp_call_latency_milliseconds` /
+%% `bondy_wamp_invocation_latency_milliseconds`).
+%%
+%% A call promise measures the full CALL round trip. An invocation
+%% promise measures the INVOCATION→YIELD leg (≈ callee execution +
+%% transport) — and when its caller is LOCAL it is also the only promise
+%% for the call, so it doubles as the call round-trip observation (a
+%% remote caller's node observes call latency on its own call promise).
+%%
+%% `Outcome` is how the settling message classifies: `success` for a
+%% RESULT/YIELD, `error` for a WAMP ERROR. One promise settles on one
+%% message, so both legs of a doubled emission share it.
+notify_call_latency(Promise, Outcome) ->
+    case bondy_rpc_promise:procedure_uri(Promise) of
+        Uri when is_binary(Uri) ->
+            Elapsed =
+                erlang:system_time(millisecond) -
+                    bondy_rpc_promise:timestamp(Promise),
+            Trace = bondy_rpc_promise:get(trace, Promise, #{}),
+            case bondy_rpc_promise:type(Promise) of
+                call ->
+                    bondy_telemetry:rpc_latency(
+                        call, Uri, Elapsed, Trace, Outcome, undefined
+                    );
+                invocation ->
+                    ok = bondy_telemetry:rpc_latency(
+                        invocation,
+                        Uri,
+                        Elapsed,
+                        Trace,
+                        Outcome,
+                        callee_agent(Promise)
+                    ),
+                    Caller = bondy_rpc_promise:caller(Promise),
+                    case bondy_ref:is_local(Caller) of
+                        true ->
+                            bondy_telemetry:rpc_latency(
+                                call, Uri, Elapsed, Trace, Outcome, undefined
+                            );
+                        false ->
+                            ok
+                    end
+            end;
+        _ ->
+            ok
+    end.
+
+%% @private
+%% The invocation leg's `peer_service` metadata: the callee's HELLO
+%% agent, read through the total `bondy_session:agent/2` — `undefined`
+%% for a callback callee (no session behind the ref) or when the callee
+%% session is already gone (an ERROR can settle the promise precisely
+%% because the callee died).
+callee_agent(Promise) ->
+    case bondy_rpc_promise:callee(Promise) of
+        undefined ->
+            undefined;
+        Ref ->
+            case bondy_ref:session_id(Ref) of
+                undefined ->
+                    undefined;
+                SessionId ->
+                    bondy_session:agent(SessionId, undefined)
+            end
+    end.
+
+%% @private
+%% The call's trace context for the promise being created, so the
+%% `[bondy, rpc, latency]` settlement event can carry it (see
+%% notify_call_latency/1). A call promise reads the CALL's validated
+%% options; an invocation promise reads the INVOCATION details the
+%% router built from them (the trace attrs are copied verbatim across —
+%% see ?WAMP_TRACE_ATTRS carry seats).
+promise_trace(#call{options = Opts}) ->
+    bondy_telemetry:trace_meta(Opts);
+promise_trace(#invocation{details = Details}) ->
+    bondy_telemetry:trace_meta(Details).
+
+%% =============================================================================
+%% PRIVATE - CALLS AND INVOCATION STRATEGIES (LOAD BALANCING, FAIL OVER, ETC)
+%% =============================================================================
+
+%% @private
+-spec handle_call(wamp_call(), bondy_context:t(), uri(), map()) -> ok.
+
+handle_call(#call{} = Msg, Ctxt0, Uri, Opts0) ->
+    RealmUri = bondy_context:realm_uri(Ctxt0),
+    CallUri = Msg#call.procedure_uri,
+    %% Extract caller here to avoid copying the entire Ctxt0 in Fun
+    Caller = bondy_context:ref(Ctxt0),
+
+    %% Based on procedure registration and passed options, we will
+    %% determine how many invocations and to whom we should do.
+    %% A response to the caller will be send asynchronously by handle_call
+    %% using the following fun.
+    Fun = fun(Entry, Ctxt) ->
+        Callee = bondy_registry_entry:ref(Entry),
+        CalleeType = bondy_ref:type(Callee),
+        IsLocal = bondy_ref:is_local(Callee),
+
+        case bondy_ref:target_type(Callee) of
+            callback when IsLocal == true, CallUri == Uri ->
+                %% A callback implemented procedure e.g. WAMP Session APIs
+                %% on this node. We apply here as we do not need invoke/5 to
+                %% enqueue a promise, we will apply the callback
+                %% and respond sequentially.
+                CBArgs = bondy_registry_entry:callback_args(Entry),
+                Response = apply_dynamic_callback(Msg, Callee, CBArgs),
+
+                bondy_router_peer:send(RealmUri, Caller, Response, #{
+                    from => Callee
+                }),
+
+                %% We return no message as we already replied
+                {ok, Ctxt};
+            _ when IsLocal == false orelse CalleeType == bridge_relay ->
+                %% The Callee is on a cluster peer or a bridged node, so the
+                %% call is forwarded with a '$private' field under 'options'.
+                %% A traced call gets the cluster-forward hop marker stamped
+                %% FIRST, as in `prepare_call_rib/3`: the marker rides the
+                %% forwarded options and the invocation details built from
+                %% them. The local branch below stays unstamped: no forward,
+                %% no hop span.
+                Msg1 = Msg#call{
+                    options = bondy_telemetry:maybe_hop_trace(
+                        Msg#call.options
+                    )
+                },
+                Call = prepare_call(Msg1, Uri, Entry, Ctxt),
+                {ok, Call, Ctxt};
+            _ ->
+                Invocation = call_to_invocation(Msg, Uri, Entry, Ctxt),
+                {ok, Invocation, Ctxt}
+        end
+    end,
+
+    Opts = Opts0#{call_opts => Msg#call.options},
+
+    handle_call(Msg, Uri, Fun, Opts, Ctxt0).
+
+%% @private
+-doc """
+Used to handle calls from local callers only.
+Throws `{not_authorized, binary()}`.
+""".
+-spec handle_call(
+    wamp_call(), uri(), call_fun(), invoke_opts(), bondy_context:t()
+) ->
+    ok.
+
+handle_call(Msg, ProcUri, Fun, Opts, Ctxt) when is_function(Fun, 2) ->
+    CallId = Msg#call.request_id,
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    %% choose/2 expects a match result w/continuations
+    Matches = bondy_registry:find_matches(
+        registration, RealmUri, ProcUri, reg_match_opts()
+    ),
+
+    Chosen = choose_rib(Matches, RealmUri, ProcUri, Opts),
+
+    case Chosen of
+        {ok, Entry} ->
+            ok = maybe_gate_progressive_callee(Msg, Entry),
+            do_call(Msg, ProcUri, Fun, Opts, Ctxt, Entry);
+        {forward_node, Nodestring} ->
+            rib_forward_call(Msg, CallId, ProcUri, Opts, Ctxt, Nodestring);
+        {error, noproc} ->
+            %% The matches were all dead (local process dead or remote target
+            %% unreachable)
+            Error =
+                case format_error(no_such_procedure, Opts) of
+                    undefined ->
+                        bondy_wamp_api_utils:no_such_procedure_error(
+                            ProcUri, ?CALL, CallId
+                        );
+                    Value ->
+                        Value
+                end,
+
+            #call{options = O} = Msg,
+            Progressive =
+                maps:get(receive_progress, O, false) orelse
+                    maps:get(progress, O, false),
+
+            %% No callee ran the call, so a call that asks for retries waits
+            %% for a registration, backing off between attempts. The waiting
+            %% call is a call promise without a callee, and its expiry is the
+            %% next attempt (`retry/1`). `_retries` and the retry deadline bound
+            %% the waits, so the backoff state keeps no deadline of its own.
+            case {Progressive, bondy_wamp_api_utils:retry_deadline(O)} of
+                {false, Deadline} when is_integer(Deadline) ->
+                    Left = Deadline - erlang:system_time(millisecond),
+                    Retry0 =
+                        case Opts of
+                            #{retry_backoff := R} ->
+                                R;
+                            #{} ->
+                                bondy_connect_retry:init(CallId, #{
+                                    max_retries => maps:get('_retries', O),
+                                    deadline => 0,
+                                    backoff_enabled => true,
+                                    backoff_min => 500
+                                })
+                        end,
+                    case bondy_connect_retry:fail(Retry0) of
+                        {Delay, Retry} when is_integer(Delay), Delay < Left ->
+                            Promise = bondy_rpc_promise:new_call(
+                                RealmUri,
+                                bondy_context:ref(Ctxt),
+                                CallId,
+                                #{
+                                    procedure_uri => ProcUri,
+                                    timeout => Delay,
+                                    deadline => Deadline,
+                                    retry => #{
+                                        call => Msg,
+                                        uri => ProcUri,
+                                        opts => Opts#{retry_backoff => Retry},
+                                        ctxt => Ctxt
+                                    }
+                                }
+                            ),
+                            ok = bondy_rpc_promise:add(Promise);
+                        {Delay, _} when is_integer(Delay) ->
+                            ok = reply_error(Error, Ctxt)
+                    end;
+                {false, infinity} ->
+                    ok = reply_error(Error, Ctxt);
+                {true, _} ->
+                    ok = reply_error(Error, Ctxt)
+            end;
+        {error, ErrorMap} when is_map(ErrorMap) ->
+            %% bondy_rpc_load_balancer opts validation error. It is carried as
+            %% a cause so the caller gets both the general condition and the
+            %% specific option that was wrong.
+            Error = bondy_wamp_error:to_wamp(
+                bondy_connect_error:wrap(
+                    bondy_connect_error:new(invalid_argument, #{
+                        message =>
+                            ~"The request failed due to invalid option parameters.",
+                        description => <<
+                            "A required options parameter was missing in the "
+                            "request or while present they were malformed."
+                        >>
+                    }),
+                    ErrorMap
+                ),
+                ?CALL,
+                CallId,
+                #{}
+            ),
+            ok = reply_error(Error, Ctxt)
+    end.
+
+%% @private
+-spec do_call(
+    wamp_call(), uri(), call_fun(), invoke_opts(), bondy_context:t(), entry()
+) -> ok.
+
+do_call(
+    #call{request_id = CallId} = Call, ProcUri, UserFun, Opts, Ctxt0, Entry
+) ->
+    case UserFun(Entry, Ctxt0) of
+        {ok, _} ->
+            %% UserFun sent a response sequentially, no need
+            %% for promises. This is the case for callback
+            %% implemented procedures.
+            ok;
+        {ok, Msg, Ctxt1} ->
+            RealmUri = bondy_context:realm_uri(Ctxt1),
+            Caller = bondy_context:ref(Ctxt1),
+            Ref = bondy_registry_entry:ref(Entry),
+            Origin = bondy_registry_entry:origin_ref(Entry),
+
+            %% SendOpts might include 'via' field which we use
+            %% to build the promise
+            {Callee, SendOpts} = bondy_router_peer:prepare_send(
+                Ref, Origin, Opts#{from => Caller}
+            ),
+
+            Timeout = bondy_router_utils:timeout(call_opts(SendOpts)),
+
+            PromiseOpts = #{
+                procedure_uri => ProcUri,
+                timeout => Timeout,
+                deadline => promise_deadline(call_opts(SendOpts)),
+                trace => promise_trace(Msg)
+            },
+
+            {Promise, SendOpts1} =
+                case Msg of
+                    #call{} ->
+                        %% The callee is on another node or bridged cluster,
+                        %% so the call is forwarded; the remote node stores an
+                        %% invocation promise.
+                        P = forwarded_call_promise(
+                            RealmUri,
+                            Msg,
+                            Caller,
+                            CallId,
+                            Callee,
+                            SendOpts,
+                            PromiseOpts
+                        ),
+                        {P, maybe_rib_completion(SendOpts, Ref)};
+                    #invocation{request_id = InvocationId} ->
+                        %% The callee is local.
+                        %% We will store an invocation promise
+                        %% to match the incoming YIELD | ERROR.
+                        %% The promise is marked progressive iff the flag
+                        %% survived both caller- and callee-side gating into
+                        %% the INVOCATION details.
+                        P = bondy_rpc_promise:new_invocation(
+                            RealmUri,
+                            Caller,
+                            CallId,
+                            Callee,
+                            InvocationId,
+                            maybe_mark_retry(
+                                maybe_mark_progressive_input(
+                                    maybe_mark_progress(
+                                        PromiseOpts,
+                                        maps:get(
+                                            receive_progress,
+                                            Msg#invocation.details,
+                                            false
+                                        )
+                                    ),
+                                    Msg
+                                ),
+                                Call,
+                                Entry,
+                                #{
+                                    call => Call,
+                                    uri => ProcUri,
+                                    opts => Opts,
+                                    ctxt => Ctxt0
+                                }
+                            )
+                        ),
+                        {P, SendOpts}
+                end,
+
+            ok = bondy_rpc_promise:add(Promise),
+
+            ok = bondy_router_peer:send(RealmUri, Callee, Msg, SendOpts1)
+    end.
+
+-doc """
+Assumes `Entries` is sorted using `bondy_registry_entry:mg_comparator()`.
+""".
+-spec choose(
+    Entries :: {[entry()], trie_continuation() | eot()} | eot(),
+    CallOpts :: map()
+) -> {ok, Entry :: entry()} | {error, noproc}.
+
+choose(?EOT, _) ->
+    {error, noproc};
+choose({L, Cont}, CallOpts) ->
+    choose(L, CallOpts, undefined, [], Cont).
+
+-doc """
+Assumes `Entries` is sorted using `bondy_registry_entry:mg_comparator()`.
+""".
+-spec choose(
+    Entries :: [entry()],
+    CallOpts :: map(),
+    Group :: {Uri :: uri(), Match :: binary(), Invoke :: binary()} | undefined,
+    Acc :: [entry()],
+    Cont :: trie_continuation()
+) ->
+    {ok, Entry :: entry()} | {error, noproc | any()}.
+
+choose([], _, _, [], ?EOT) ->
+    {error, noproc};
+choose([], CallOpts, _, [], Cont) ->
+    choose(bondy_registry:find_matches(Cont), CallOpts);
+choose([], CallOpts, {_, _, Invoke}, Acc, Cont) ->
+    L = lists:reverse(Acc),
+    LBOpts = lb_opts(Invoke, CallOpts),
+
+    case bondy_rpc_load_balancer:select(L, LBOpts) of
+        {ok, _} = OK ->
+            OK;
+        {error, noproc} ->
+            choose(bondy_registry:find_matches(Cont), CallOpts);
+        Error ->
+            Error
+    end;
+choose([H | T], CallOpts, LastGroup, Acc, Cont) ->
+    Uri = bondy_registry_entry:uri(H),
+    Match = bondy_registry_entry:match_policy(H),
+    Invoke = bondy_registry_entry:invocation_policy(H),
+    Group = {Uri, Match, Invoke},
+
+    case LastGroup == undefined orelse LastGroup == Group of
+        true ->
+            choose(T, CallOpts, Group, [H | Acc], Cont);
+        false ->
+            L = lists:reverse(Acc),
+            LBOpts = lb_opts(Invoke, CallOpts),
+
+            case bondy_rpc_load_balancer:select(L, LBOpts) of
+                {ok, _} = OK ->
+                    OK;
+                {error, noproc} ->
+                    choose(T, CallOpts, Group, [H], Cont);
+                Error ->
+                    Error
+            end
+    end.
+
+%% @private
+-doc """
+The load balancer options for a CALL, built from the CALL's options in
+`Opts`. A CALL with `runmode = "partition"` is routed by
+`jump_consistent_hash` over its `rkey` instead of the registration's
+invocation policy
+([Sharded Registration](https://wamp-proto.org/_static/gen/wamp_latest.html#sharded-registration),
+caller side only).
+""".
+lb_opts(Strategy, Opts) ->
+    coerce_routing_key(coerce_strategy(Strategy, call_opts(Opts))).
+
+%% @private
+coerce_strategy(_, #{runmode := <<"partition">>} = CallOpts) ->
+    maps:put(strategy, jump_consistent_hash, CallOpts);
+coerce_strategy(Strategy, CallOpts) ->
+    %% An invalid runmode value would have been caught by
+    %% wamp_message's validation.
+    maps:put(strategy, Strategy, CallOpts).
+
+%% @private
+coerce_routing_key(#{rkey := Value} = CallOpts) ->
+    maps:put('_routing_key', Value, CallOpts);
+coerce_routing_key(CallOpts) ->
+    CallOpts.
+
+%% @private
+-doc """
+We add context and metadata to the details of the CALL so that we
+con forward it to a remote node or create an INVOCATION with it.
+""".
+prepare_call(M0, Uri, Entry, Ctxt) ->
+    M = with_callback_args(M0, Entry),
+    Options = prepare_call_options(
+        M#call.options, M#call.request_id, Uri, Entry, Ctxt
+    ),
+    M#call{options = Options}.
+
+%% @private
+call_to_invocation(#call{options = #{'$private' := _}} = M, _, Entry, Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    Callee = bondy_registry_entry:ref(Entry),
+    CalleeSessionId = bondy_ref:session_id(Callee),
+    InvocationId = bondy_message_id:session(RealmUri, CalleeSessionId),
+    call_to_invocation(
+        gate_receive_progress(M, CalleeSessionId), InvocationId
+    );
+call_to_invocation(#call{} = M, Uri, Entry, Ctxt) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    Callee = bondy_registry_entry:ref(Entry),
+    CalleeSessionId = bondy_ref:session_id(Callee),
+    InvocationId = bondy_message_id:session(RealmUri, CalleeSessionId),
+    Call = prepare_call(M, Uri, Entry, Ctxt),
+    call_to_invocation(
+        gate_receive_progress(Call, CalleeSessionId), InvocationId
+    ).
+
+%% @private
+call_to_invocation(#call{options = #{'$private' := Private}} = M, ReqId) ->
+    RegistrationId = maps:get(registration_id, Private),
+    Details = maps:get(invocation_details, Private),
+    bondy_wamp_message:invocation_from(M, ReqId, RegistrationId, Details).
+
+-doc """
+`M` bound for `Entry`. A callback entry here is a remote one (a local callback
+is applied in place), so Bondy is the callee: the payload is decoded and the
+entry's static arguments are prepended, sparing the receiving node a lookup of
+its copy of the entry. Any other entry gets `M` unchanged.
+""".
+with_callback_args(#call{} = M0, Entry) ->
+    case bondy_registry_entry:is_callback(Entry) of
+        true ->
+            M = bondy_wamp_message:decode_partial(M0),
+            CBArgs = bondy_registry_entry:callback_args(Entry),
+            M#call{args = CBArgs ++ args_to_list(M#call.args)};
+        false ->
+            M0
+    end.
+
+%% @private
+-doc """
+An internal function that we use to parse and evaluate `CALL.Options`. We
+use this to cache certain metadata we need to either forward the CALL
+to another node and/or turn the CALL into an INVOCATION.
+The resulting CALL has `Options.'$private'` field with subfields `call_id`,
+`registration_id` and `invocation_details`. The latter is the map we will pass
+as value to `INVOCATION.Details`.
+""".
+prepare_call_options(Opts, CallId, Uri, Entry, Ctxt) ->
+    RegistrationId =
+        case bondy_registry_entry:is_proxy(Entry) of
+            true ->
+                %% The entry was registered by a bridge relay.
+                %% We need to use the origin registration id (as
+                %% opposed to the bridge relay's registration).
+                bondy_registry_entry:origin_id(Entry);
+            false ->
+                bondy_registry_entry:id(Entry)
+        end,
+
+    EOpts = bondy_registry_entry:options(Entry),
+
+    %% Forward PPT and trace-context attributes to INVOCATION.Details.
+    %% Trace context is a verbatim pass-through (see ?WAMP_TRACE_ATTRS).
+    Details0 = maps:with(?WAMP_PPT_ATTRS ++ ?WAMP_TRACE_ATTRS, Opts),
+    Details1 = Details0#{procedure => Uri, trust_level => 0},
+    Details2 = maybe_receive_progress(Details1, Opts),
+    Details2b = maybe_progress(Details2, Opts),
+    Details3 = maybe_disclose_caller(Details2b, Ctxt, EOpts, Opts),
+    Details = maybe_disclose_session(Details3, Ctxt, EOpts, Opts),
+
+    %% We build the invocation details with local data, and store under
+    %% CALL.options.'$private'
+    Opts#{
+        '$private' => #{
+            call_id => CallId,
+            registration_id => RegistrationId,
+            invocation_details => Details
+        }
+    }.
+
+%% @private
+%% Carry a (caller-gated) receive_progress option into the INVOCATION
+%% details. The callee-side gate (`gate_receive_progress/2`) runs later, at
+%% the node hosting the selected callee.
+maybe_receive_progress(Details, #{receive_progress := true}) ->
+    Details#{receive_progress => true};
+maybe_receive_progress(Details, _) ->
+    Details.
+
+%% @private
+%% Carry CALL.Options.progress (a progressive-input chunk marker) into the
+%% INVOCATION details. The call was already gated at `handle_call/5` (dealer +
+%% caller + callee all announced `progressive_call_invocations`), so this only
+%% runs for a supported progressive call; a plain call never carries `progress`.
+maybe_progress(Details, #{progress := true}) ->
+    Details#{progress => true};
+maybe_progress(Details, _) ->
+    Details.
+
+%% @private
+%% TODO disclose info only if feature is announced by Callee, Dealer
+%% and Caller
+%% NOTICE: The spec defines disclose_me and disclose_caller BUT Autobhan
+%% has deprecated this in favour of a router-based authrotization which is
+%% unfortunate as the ideal solution should be the combination of both.
+%% So for the time being we revert this to `true'.
+maybe_disclose_caller(Acc, Ctxt, EOpts, Opts) ->
+    Disclose =
+        maps:get(disclose_caller, EOpts, true) orelse
+            maps:get(disclose_me, Opts, true),
+
+    case Disclose of
+        true ->
+            bondy_context:caller_details(Ctxt, Acc);
+        false ->
+            Acc
+    end.
+
+%% @private
+maybe_disclose_session(Acc, Ctxt, #{'_disclose_session_info' := true}, _) ->
+    Session = bondy_context:session(Ctxt),
+    Info = bondy_session:to_external(Session),
+    Acc#{'_session_info' => Info};
+maybe_disclose_session(Acc, Ctxt, #{'x_disclose_session_info' := true}, _) ->
+    %% To be deprecated
+    Session = bondy_context:session(Ctxt),
+    Info = bondy_session:to_external(Session),
+    Acc#{
+        'x_session_info' => Info#{
+            'x_authroles' => bondy_session:authroles(Session),
+            'x_meta' => key_value:get([authextra, meta], Info, #{})
+        }
+    };
+maybe_disclose_session(Acc, _, _, _) ->
+    Acc.
+
+%% @private
+call_opts(#{call_opts := Val}) -> Val;
+call_opts(_) -> #{}.
+
+%% =============================================================================
+%% PRIVATE: META EVENTS
+%% =============================================================================
+
+%% @private
+%% The aggregate metric is counted unconditionally (telemetry); the WAMP
+%% meta-event publication is demand-gated (see bondy_meta_events).
+on_register(Entry) ->
+    ok = bondy_telemetry:registry_event(registration, added, Entry),
+    ok = bondy_event_manager:notify({
+        [bondy, dealer, registration, added], Entry
+    }),
+    bondy_meta_events:maybe_publish(added, Entry).
+
+%% @private
+on_unregister(Entry) ->
+    ok = bondy_telemetry:registry_event(registration, removed, Entry),
+    ok = bondy_event_manager:notify(
+        {[bondy, dealer, registration, removed], Entry}
+    ),
+    bondy_meta_events:maybe_publish(removed, Entry).
+
+%% @private
+%% Hierarchical (RIB `read` mode) selection: the caller picks a NODE — self,
+%% or a peer advertising the procedure in the stub view — and the winning
+%% node completes the selection among its own live local registrations.
+%% Groups (pattern × policy) are tried in match-policy precedence order,
+%% mirroring `choose/2`. Remote FULL entries in the trie are deliberately
+%% ignored: under `read`, remote reachability comes from the stubs alone
+%% (the full-entry replication is the rollback net).
+choose_rib(Matches, RealmUri, ProcUri, Opts) ->
+    Entries =
+        case Matches of
+            ?EOT -> [];
+            {L, _} -> L;
+            L when is_list(L) -> L
+        end,
+    Locals = [E || E <- Entries, bondy_registry_entry:is_local(E)],
+    StubGroups = bondy_registry_rib:match_stubs(RealmUri, ProcUri),
+    Groups = bondy_registry_rib:rank_groups(Locals, StubGroups),
+    try_rib_groups(Groups, RealmUri, ProcUri, Opts).
+
+%% @private
+%% Node-stage selection per group: `self` (summarised from the group's local
+%% entries) competes with the remote stub nodes; `self` winning falls into
+%% the existing local load balancer, a peer winning yields a node-addressed
+%% forward. A group with no live candidates falls through to the next.
+try_rib_groups([], _, _, _) ->
+    {error, noproc};
+try_rib_groups(
+    [{_K, {Invoke, LocalsG, Stubs0}} | Rest], RealmUri, ProcUri, Opts
+) ->
+    %% Retry exclusion: nodes that already answered a completion miss for
+    %% this call are out of the candidate set (self never misses — a local
+    %% win invokes directly).
+    Stubs =
+        case maps:get(rib_exclude, Opts, []) of
+            [] ->
+                Stubs0;
+            Excluded ->
+                [S || {N, _} = S <- Stubs0, not lists:member(N, Excluded)]
+        end,
+    SelfUnits =
+        case LocalsG of
+            [] ->
+                [];
+            _ ->
+                Created = [bondy_registry_entry:created(E) || E <- LocalsG],
+                [
+                    {self, #{
+                        count => length(LocalsG),
+                        earliest => lists:min(Created),
+                        latest => lists:max(Created)
+                    }}
+                ]
+        end,
+    LBOpts = lb_opts(Invoke, Opts),
+
+    Units = prefer_reachable(SelfUnits ++ Stubs, fun is_reachable/1),
+
+    Result = bondy_rpc_load_balancer:select_node(
+        Units,
+        LBOpts#{realm_uri => RealmUri, uri => ProcUri}
+    ),
+
+    case Result of
+        {ok, self} ->
+            case bondy_rpc_load_balancer:select(LocalsG, LBOpts) of
+                {ok, _} = OK ->
+                    OK;
+                {error, Invalid} when is_map(Invalid) ->
+                    %% The CALL's options are wrong, which no other group
+                    %% fixes; the caller gets `invalid_argument`.
+                    {error, Invalid};
+                {error, _} ->
+                    try_rib_groups(Rest, RealmUri, ProcUri, Opts)
+            end;
+        {ok, Nodestring} when is_binary(Nodestring) ->
+            {forward_node, Nodestring};
+        {error, noproc} ->
+            try_rib_groups(Rest, RealmUri, ProcUri, Opts)
+    end.
+
+%% @private
+%% Liveness at SELECTION time. A node's RIB cells outlive the node — only the
+%% node named in the key may write them, so nobody can clear a dead peer's
+%% registrations — and the node stage would otherwise keep handing calls to a
+%% corpse, which answers nothing and times the CALL out instead of failing
+%% over to a live sibling.
+%%
+%% Reachability is a PREFERENCE, not an exclusion: if it would empty the
+%% candidate set the original set is returned unchanged. That keeps the
+%% transformation monotone — it can only replace a candidate that cannot
+%% answer with one that might, never turn a routable call into an error — so
+%% the `no_such_procedure` semantics of an exhausted group are untouched.
+%%
+%% Note this is a hint, not a guarantee: the peer may die between the probe
+%% and the send. The bounded pre-invocation retry (`rib_exclude`) remains the
+%% mechanism that makes routing failures recoverable; this only stops the
+%% obviously-doomed candidate from consuming a retry.
+prefer_reachable([_] = Units, _) ->
+    %% Nothing to prefer over, so skip the probe entirely — this is the
+    %% common shape on the CALL hot path.
+    Units;
+prefer_reachable(Units, IsReachable) ->
+    case lists:filter(fun({N, _}) -> IsReachable(N) end, Units) of
+        [] -> Units;
+        Reachable -> Reachable
+    end.
+
+%% @private
+%% One lock-free ETS read per remote candidate (`partisan_peer_connections`
+%% is a plain public table; `count/1` is a `lookup_element`).
+is_reachable(self) ->
+    true;
+is_reachable(Nodestring) when is_binary(Nodestring) ->
+    %% A connected peer's name is already an atom in Partisan's tables, so a
+    %% nodestring with no existing atom has never been connected here.
+    %% Resolving with `binary_to_existing_atom/2` also denies replicated RIB
+    %% data any way to grow the atom table.
+    try binary_to_existing_atom(Nodestring, utf8) of
+        Node ->
+            is_connected(Node)
+    catch
+        error:badarg ->
+            false
+    end.
+
+%% @private
+%% Fail OPEN when Partisan cannot answer: "unknown" must never remove a
+%% candidate, or a probe failure would look exactly like a cluster-wide outage.
+%% `partisan_sup` sets Partisan's config before its manager creates the
+%% connections table, so the table's presence implies a node name.
+is_connected(Node) ->
+    case ets:whereis(partisan_peer_connections) of
+        undefined ->
+            true;
+        _ ->
+            partisan_peer_connections:is_connected(Node)
+    end.
+
+%% @private
+%% Forward `Msg` node-addressed to `Nodestring` for owner-side completion:
+%% no entry is chosen here — the call is prepared entry-less and the owner
+%% binds its own selected registration (`rib_rebind/2`). The address ref
+%% only carries the node; the receiving clause ignores it as a callee.
+rib_forward_call(Msg, CallId, ProcUri, Opts, Ctxt, Nodestring) ->
+    RealmUri = bondy_context:realm_uri(Ctxt),
+    Caller = bondy_context:ref(Ctxt),
+    Call = prepare_call_rib(Msg, ProcUri, Ctxt),
+    Timeout = bondy_router_utils:timeout(call_opts(Opts)),
+    %% The retry budget rides in the call promise: on a PRE-invocation miss
+    %% (the owner found no live local callee) the promise's taker re-selects
+    %% among the remaining candidate nodes. The prepared entry-less CALL is
+    %% node-agnostic, so it is stored as-is for re-sending.
+    Max = routing_max_candidates(Msg#call.options),
+    Retry = #{
+        call => Call,
+        opts => Opts,
+        tried => [Nodestring],
+        remaining => Max - 1
+    },
+    send_rib_call(
+        RealmUri,
+        Caller,
+        CallId,
+        ProcUri,
+        Call,
+        Opts,
+        Nodestring,
+        Timeout,
+        Retry
+    ).
+
+%% @private
+%% Send a node-addressed entry-less CALL to `Nodestring` under a fresh call
+%% promise carrying the retry state. Shared by the first send and by every
+%% retry (which passes the REMAINING time as `Timeout`, so retries never
+%% extend the original call deadline).
+send_rib_call(
+    RealmUri, Caller, CallId, ProcUri, Call, Opts, Nodestring, Timeout, Retry
+) ->
+    NodeRef = bondy_ref:new(internal, self(), undefined, Nodestring),
+    {To, SendOpts} = bondy_router_peer:prepare_send(NodeRef, Opts#{
+        from => Caller
+    }),
+
+    PromiseOpts = maybe_mark_progressive_call_input(
+        maybe_mark_progress(
+            #{
+                procedure_uri => ProcUri,
+                timeout => Timeout,
+                deadline => promise_deadline(Call#call.options),
+                trace => promise_trace(Call),
+                rib_retry => Retry,
+                %% Node-addressed: the callee is whichever local
+                %% registration the owner node completes to. Address the
+                %% node so a caller CANCEL or a caller-death flush relays
+                %% there — the owner node resolves its invocation and
+                %% INTERRUPTs (see forward/3).
+                callee => NodeRef
+            },
+            maps:get(receive_progress, Call#call.options, false)
+        ),
+        Call
+    ),
+
+    %% The owner node may retry a call to an idempotent procedure, which this
+    %% node cannot tell, so a call that may be retried waits for its retry
+    %% deadline. The owner node's ERROR settles a call it does not retry.
+    Promise = bondy_rpc_promise:new_call(
+        RealmUri,
+        Caller,
+        CallId,
+        case
+            {PromiseOpts,
+                bondy_wamp_api_utils:retry_deadline(Call#call.options)}
+        of
+            {_, infinity} ->
+                PromiseOpts;
+            {#{receive_progress := true}, _} ->
+                PromiseOpts;
+            {#{progressive_input := true}, _} ->
+                PromiseOpts;
+            {#{}, Deadline} when is_integer(Deadline) ->
+                PromiseOpts#{
+                    timeout => max(
+                        1, Deadline - erlang:system_time(millisecond)
+                    ),
+                    deadline => Deadline
+                }
+        end
+    ),
+    ok = bondy_rpc_promise:add(Promise),
+
+    ok = bondy_router_peer:send(RealmUri, To, Call, SendOpts#{
+        rib_completion => true
+    }).
+
+%% @private
+%% Total distinct nodes a CALL may be routed to before its failure is
+%% final: the `CALL.Options._routing_max_candidates` extension (declared in
+%% bondy_config's WAMP extended_options), default 2 — the original
+%% candidate plus one retry. Extension options pass validation untyped, so
+%% anything but a usable integer falls back to the default.
+routing_max_candidates(CallOpts) ->
+    case maps:get('_routing_max_candidates', CallOpts, 2) of
+        N when is_integer(N) andalso N >= 1 ->
+            N;
+        _ ->
+            2
+    end.
+
+%% @private
+%% Bounded pre-invocation retry: when a node-addressed CALL comes back with
+%% the owner's completion-miss error — guaranteed pre-invocation, so
+%% at-most-once invocation is preserved — re-run node selection excluding
+%% every node already tried, within the original call deadline and the
+%% `routing_max_candidates` budget. Any other ERROR is final. Returns `true`
+%% iff the call was re-routed and the caller must keep waiting.
+maybe_rib_retry(
+    #error{
+        error_uri = ?WAMP_NO_ELIGIBLE_CALLE,
+        details = #{rib_completion_miss := true}
+    } = M,
+    Promise,
+    RealmUri,
+    Caller
+) ->
+    case bondy_rpc_promise:info(Promise) of
+        #{progressive_input := true} ->
+            %% The caller's later chunks follow the first to the node it
+            %% reached, so re-routing the first alone would hand another
+            %% callee a stream with a gap.
+            false;
+        #{rib_retry := #{remaining := N} = Retry} when N > 0 ->
+            case promise_remaining_time(Promise) of
+                0 ->
+                    rib_retry_exhausted();
+                Timeout ->
+                    rib_retry(M, Promise, RealmUri, Caller, Retry, Timeout)
+            end;
+        #{rib_retry := _} ->
+            rib_retry_exhausted();
+        _ ->
+            %% Not a node-addressed call of ours — nothing to retry.
+            false
+    end;
+maybe_rib_retry(_, _, _, _) ->
+    false.
+
+%% @private
+rib_retry_exhausted() ->
+    ok = rib_count(bondy_rpc_rib_retries_total, #{outcome => exhausted}),
+    false.
+
+%% @private
+%% Record a routing metric without ever raising — this runs on the relayed
+%% ERROR path, where a metrics hiccup must never cost the caller its reply.
+rib_count(Name, Label) ->
+    try
+        bondy_metrics:counter(#{name => Name, label => Label})
+    catch
+        %% `bondy_metrics` raises `badarg` only when its ETS table is gone.
+        error:badarg ->
+            ok
+    end.
+
+%% @private
+%% Milliseconds left before the original call deadline, `infinity` for an
+%% unbounded call, `0` when already past it.
+promise_remaining_time(Promise) ->
+    case bondy_rpc_promise:expiry(Promise) of
+        infinity ->
+            infinity;
+        Expiry when is_integer(Expiry) ->
+            max(0, Expiry - erlang:system_time(millisecond))
+    end.
+
+%% @private
+%% Re-select and re-route a node-addressed CALL after a completion miss.
+%% Selection re-runs from a FRESH match (the local view may have learned of
+%% the miss meanwhile) with the failed nodes excluded; `self` competes
+%% again, so a local registration can absorb the retry — dispatched exactly
+%% as owner-side completion dispatches it (the stored CALL is entry-less).
+rib_retry(M, Promise, RealmUri, Caller, Retry, Timeout) ->
+    #{call := Call0, opts := Opts0, tried := Tried, remaining := N} = Retry,
+    CallId = M#error.request_id,
+    ProcUri = bondy_rpc_promise:procedure_uri(Promise),
+
+    %% The retried leg runs on the REMAINING time, not a fresh budget.
+    Call = rib_call_with_timeout(Call0, M, Timeout),
+
+    Matches = bondy_registry:find_matches(
+        registration, RealmUri, ProcUri, reg_match_opts()
+    ),
+
+    case choose_rib(Matches, RealmUri, ProcUri, Opts0#{rib_exclude => Tried}) of
+        {ok, Entry} ->
+            ok = rib_count(bondy_rpc_rib_retries_total, #{outcome => local}),
+            ok = forward(
+                rib_rebind(Call, Entry),
+                bondy_registry_entry:ref(Entry),
+                #{realm_uri => RealmUri, from => Caller, entry => Entry}
+            ),
+            true;
+        {forward_node, Nodestring} ->
+            ok = rib_count(bondy_rpc_rib_retries_total, #{outcome => node}),
+            ok = send_rib_call(
+                RealmUri,
+                Caller,
+                CallId,
+                ProcUri,
+                Call,
+                Opts0,
+                Nodestring,
+                Timeout,
+                Retry#{tried := [Nodestring | Tried], remaining := N - 1}
+            ),
+            true;
+        {error, noproc} ->
+            %% No untried candidate is left — the miss is final.
+            rib_retry_exhausted()
+    end.
+
+%% @private
+%% A call that may be retried keeps its timeout for each attempt, and resumes
+%% with the retries the missed attempt had left.
+rib_call_with_timeout(
+    #call{options = O} = C, #error{details = #{'_retries' := N}}, Timeout
+) when is_integer(Timeout) ->
+    C#call{options = O#{'_retries' => N, '_deadline' => Timeout}};
+rib_call_with_timeout(#call{options = O} = C, #error{}, Timeout) when
+    is_integer(Timeout)
+->
+    C#call{options = O#{timeout => Timeout}};
+rib_call_with_timeout(C, #error{}, infinity) ->
+    C.
+
+%% @private
+%% The completion-miss details are routing-internal — never relay them to the
+%% client.
+strip_rib_details(#error{details = Details} = M) when is_map(Details) ->
+    M#error{details = maps:without([rib_completion_miss, '_retries'], Details)};
+strip_rib_details(M) ->
+    M.
+
+%% @private
+%% As `prepare_call/4` but entry-less: `registration_id => undefined` marks
+%% the call node-addressed so the owner binds its own selection. Without an
+%% entry there are no entry options, so caller disclosure follows the
+%% defaults and entry-opted session disclosure is not available.
+prepare_call_rib(M, Uri, Ctxt) ->
+    %% A traced call gets the cluster-forward hop marker stamped into its
+    %% `'_tracestate'` FIRST, so the marker rides both legs from one seat:
+    %% the forwarded options (this node's RIB call promise reads them) and
+    %% the invocation details built from them below (the owner node's
+    %% invocation promise reads those). Traceparent and baggage still carry
+    %% verbatim; see `bondy_telemetry:maybe_hop_trace/1`.
+    Opts = bondy_telemetry:maybe_hop_trace(M#call.options),
+    %% PPT and trace-context attributes carry over exactly as in
+    %% `prepare_call_options/5` (the entry-addressed builder).
+    Details0 = maps:with(?WAMP_PPT_ATTRS ++ ?WAMP_TRACE_ATTRS, Opts),
+    Details1 = Details0#{procedure => Uri, trust_level => 0},
+    Details2 = maybe_receive_progress(Details1, Opts),
+    Details3 = maybe_progress(Details2, Opts),
+    Details = maybe_disclose_caller(Details3, Ctxt, #{}, Opts),
+    M#call{
+        options = Opts#{
+            '$private' => #{
+                call_id => M#call.request_id,
+                registration_id => undefined,
+                invocation_details => Details
+            }
+        }
+    }.
+
+%% @private
+%% Bind an entry-less node-addressed CALL to the owner-selected entry: the
+%% owner's registration id replaces the `undefined` marker and, for a
+%% callback entry, the statically defined arguments are appended (the caller
+%% could not — it never chose an entry). An entry-addressed CALL (a sender
+%% without `read` mode) passes through untouched.
+rib_rebind(
+    #call{options = #{'$private' := #{registration_id := undefined} = P} = O} =
+        M,
+    Entry
+) ->
+    RegId =
+        case bondy_registry_entry:is_proxy(Entry) of
+            true -> bondy_registry_entry:origin_id(Entry);
+            false -> bondy_registry_entry:id(Entry)
+        end,
+    M1 = with_callback_args(M, Entry),
+    M1#call{options = O#{'$private' := P#{registration_id := RegId}}};
+rib_rebind(M, _) ->
+    M.
+
+%% @private
+%% A forwarded cluster CALL is node-addressed: tag it so the receiving node
+%% re-selects among ITS live local registrations instead of trusting this
+%% node's — possibly stale — choice of entry. Bridge-relay targets keep the
+%% entry-addressed contract (the edge owns its registry).
+maybe_rib_completion(Opts, Ref) ->
+    case
+        not bondy_ref:is_local(Ref) andalso
+            bondy_ref:type(Ref) =/= bridge_relay
+    of
+        true ->
+            Opts#{rib_completion => true};
+        false ->
+            Opts
+    end.
+
+%% @private
+%% Owner-side completion for a node-addressed forwarded CALL: select among
+%% the live LOCAL registrations only. Match-policy precedence and the
+%% per-group invocation-policy selection are the same as for a caller-side
+%% CALL (`choose/2`); the continuation is dropped deliberately — re-fetching
+%% it would reintroduce remote entries.
+rib_local_callee(RealmUri, ProcUri, Msg, Opts) ->
+    Matches = bondy_registry:find_matches(
+        registration, RealmUri, ProcUri, reg_match_opts()
+    ),
+    Entries =
+        case Matches of
+            ?EOT -> [];
+            {L, _Cont} -> L;
+            L when is_list(L) -> L
+        end,
+    Locals = [E || E <- Entries, bondy_registry_entry:is_local(E)],
+    choose({Locals, ?EOT}, Opts#{call_opts => Msg#call.options}).
+
+%% @private
+%% The registration match options a CALL routes with: every match policy.
+%% Pattern-based registration is not optional — see `bondy_config:setup_wamp/0'
+%% — so a CALL that considered exact registrations alone would miss the
+%% router's own `wamp.session.<hash>..get' wildcard.
+reg_match_opts() ->
+    #{limit => ?MATCH_LIMIT, match => '_'}.
+
+%% @private
+%% A node-addressed forwarded CALL found no live local callee (a stale
+%% route): return ?WAMP_NO_ELIGIBLE_CALLE to the caller node, whose call
+%% promise matches the ERROR. The `rib_completion_miss` detail marks the
+%% failure as PRE-invocation — no INVOCATION was dispatched — which makes
+%% it the one no_eligible_callee the caller node may safely retry on
+%% another candidate node. The same error produced by a callee-death flush
+%% (an invocation WAS in flight) never carries the marker and is never
+%% retried, preserving at-most-once invocation. The `_retries` detail carries
+%% the retries the missed attempt had, for the caller node to resume with.
+reply_no_eligible_callee(
+    #call{options = CallOpts} = Msg, #{from := Caller} = Opts
+) ->
+    RealmUri = ?GET_REALM_URI(Opts),
+    Error0 = bondy_wamp_error:to_wamp(
+        bondy_connect_error:new(no_eligible_callee, #{
+            message => ~"There are no eligible callees for the procedure.",
+            description => <<
+                "The node this call was routed to no longer has a live "
+                "registration for the procedure."
+            >>
+        }),
+        Msg
+    ),
+    %% The details are stamped on the record AFTER construction: they are not
+    %% part of the client-facing details vocabulary. Wire decode keeps an
+    %% unknown details key as a binary (`bondy_wamp_details:new/2`), so an
+    %% ERROR decoded from a callee's frame cannot carry these atom keys and
+    %% force a retry of a delivered invocation. Peers relay records verbatim.
+    Error = Error0#error{
+        details = maps:merge(
+            (Error0#error.details)#{rib_completion_miss => true},
+            maps:with(['_retries'], CallOpts)
+        )
+    },
+    {To, SendOpts} = bondy_router_peer:prepare_send(Caller, Opts),
+    bondy_router_peer:send(RealmUri, To, Error, SendOpts).
+
+%% @private
+%% Flush callback for promises whose caller session `Ref` died. Per the
+%% WAMP spec the dealer INTERRUPTs (mode killnowait) callees still
+%% servicing the departed caller's calls:
+%%
+%% - invocation promise → the callee is local: INTERRUPT it directly
+%%   (skipped for self-calls — the callee IS the dying session — and for
+%%   callees that did not announce `call_canceling`).
+%% - call promise → the callee is remote (a resolved entry or, for a
+%%   node-addressed RIB call, the owner node) or bridged: relay a CANCEL
+%%   (mode killnowait) keyed by the call id; the callee's node resolves
+%%   its invocation promise and INTERRUPTs (see forward/3). A promise
+%%   without a callee is a call waiting for a registration, which the
+%%   flush removes with the caller's other promises.
+caller_flush_fun(Ref) ->
+    RefSessionId = bondy_ref:session_id(Ref),
+
+    fun(Promise) ->
+        case bondy_rpc_promise:type(Promise) of
+            invocation ->
+                interrupt_local_callee(Promise, RefSessionId);
+            call ->
+                cancel_remote_callee(Promise)
+        end
+    end.
+
+%% @private
+interrupt_local_callee(Promise, RefSessionId) ->
+    Callee = bondy_rpc_promise:callee(Promise),
+    CalleeSessionId = bondy_ref:session_id(Callee),
+
+    Interruptible =
+        CalleeSessionId =/= RefSessionId andalso interruptible(Callee),
+
+    case Interruptible of
+        true ->
+            RealmUri = bondy_rpc_promise:realm_uri(Promise),
+            InvocationId = bondy_rpc_promise:invocation_id(Promise),
+            Caller = bondy_rpc_promise:caller(Promise),
+            Via = bondy_rpc_promise:via(Promise),
+
+            Interrupt = bondy_wamp_message:interrupt(
+                InvocationId, #{mode => <<"killnowait">>}
+            ),
+            SendOpts0 = #{from => Caller, via => Via},
+            {To, SendOpts} = bondy_router_peer:prepare_send(Callee, SendOpts0),
+            _ = bondy_router_peer:send(RealmUri, To, Interrupt, SendOpts),
+            ok;
+        false ->
+            ok
+    end.
+
+%% @private
+cancel_remote_callee(Promise) ->
+    case bondy_rpc_promise:callee(Promise) of
+        undefined ->
+            ok;
+        Callee when Callee =/= undefined ->
+            Cancel = bondy_wamp_message:cancel(
+                bondy_rpc_promise:call_id(Promise), #{mode => <<"killnowait">>}
+            ),
+            _ = send_to_callee(Promise, Cancel, #{
+                from => bondy_rpc_promise:caller(Promise)
+            }),
+            ok
+    end.
+
+%% @private
+%% Routes the call again (`retry/1`) or replies to the caller of an in-flight
+%% invocation promise with `wamp.error.canceled`, as the WAMP specification's
+%% "Callee Leaving During an RPC Invocation" requires. The reply is routed back
+%% through any relays stored in the promise's `via` queue.
+send_callee_left(Promise) ->
+    case retry(Promise) of
+        true ->
+            ok;
+        false ->
+            RealmUri = bondy_rpc_promise:realm_uri(Promise),
+            Caller = bondy_rpc_promise:caller(Promise),
+            Callee = bondy_rpc_promise:callee(Promise),
+            CallId = bondy_rpc_promise:call_id(Promise),
+            Via = bondy_rpc_promise:via(Promise),
+
+            Error = bondy_wamp_error:to_wamp(
+                bondy_connect_error:new(canceled, #{
+                    message => ~"The callee left before the call completed."
+                }),
+                ?CALL,
+                CallId,
+                #{}
+            ),
+
+            SendOpts0 = #{from => Callee, via => Via},
+            {To, SendOpts} = bondy_router_peer:prepare_send(Caller, SendOpts0),
+            _ = bondy_router_peer:send(RealmUri, To, Error, SendOpts),
+            ok
+    end.
+
+%% @private
+%% `call_cancelled' is kept as Args[0]: it is a token clients match on, not
+%% prose.
+cancelled_error(CallId) ->
+    bondy_wamp_error:to_wamp(
+        bondy_connect_error:new(canceled, #{
+            message => ~"call_cancelled",
+            description => ~"The call was cancelled by the user."
+        }),
+        ?CALL,
+        CallId,
+        #{}
+    ).
+
+%% @private
+badarity_error(CallId, Type) ->
+    bondy_wamp_error:to_wamp(
+        bondy_connect_error:new(invalid_argument, #{
+            message => <<
+                "The call was made passing the wrong number of positional "
+                "arguments."
+            >>
+        }),
+        Type,
+        CallId,
+        #{}
+    ).
+
+%% @private
+badarg_error(CallId, Type) ->
+    bondy_wamp_error:to_wamp(
+        bondy_connect_error:new(invalid_argument, #{
+            message => ~"The call was made passing invalid arguments."
+        }),
+        Type,
+        CallId,
+        #{}
+    ).
+
+%% @private
+not_found_error(M, _Ctxt) ->
+    Msg = iolist_to_binary(
+        [
+            "There are no registered procedures matching the id ",
+            $',
+            M#unregister.registration_id,
+            $'
+        ]
+    ),
+    bondy_wamp_error:to_wamp(
+        bondy_connect_error:new(no_such_registration, #{
+            message => Msg,
+            description => ~"The unregister request failed.",
+            details => #{registration_id => M#unregister.registration_id}
+        }),
+        ?UNREGISTER,
+        M#unregister.request_id,
+        #{}
+    ).
+
+%% @private
+maybe_reserved_ns(<<"com.leapsight.bondy", _/binary>>) ->
+    throw({not_authorized, ?RESERVED_NS(<<"com.leapsight.bondy">>)});
+maybe_reserved_ns(<<"bondy", _/binary>>) ->
+    throw({not_authorized, ?RESERVED_NS(<<"bondy">>)});
+maybe_reserved_ns(<<"wamp", _/binary>>) ->
+    throw({not_authorized, ?RESERVED_NS(<<"wamp">>)});
+maybe_reserved_ns(_) ->
+    ok.

@@ -9,21 +9,15 @@
 -include("bondy_wamp.hrl").
 -compile(export_all).
 
-
-
 all() ->
     common:all().
 
 groups() ->
     [{main, [parallel], common:tests(?MODULE)}].
 
-
-
-
 %% =============================================================================
 %% JSON
 %% =============================================================================
-
 
 init_per_suite(Config) ->
     _ = application:ensure_all_started(bondy_wamp),
@@ -33,13 +27,13 @@ init_per_suite(Config) ->
 end_per_suite(_) ->
     ok.
 
-
 hello_json_test(_) ->
     M = bondy_wamp_message:hello(<<"realm1">>, #{
         <<"roles">> => #{
             <<"caller">> => #{}
-        }}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+        }
+    }),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
 
     ?assertEqual(
         hello,
@@ -58,31 +52,38 @@ welcome_json_test(_) ->
         <<"roles">> => #{
             <<"dealer">> => #{},
             <<"broker">> => #{}
-        }}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+        }
+    }),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     welcome = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 abort_json_test(_) ->
-    M = bondy_wamp_message:abort(#{<<"message">> => <<"foo">>}, <<"wamp.error.foo">>),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    M = bondy_wamp_message:abort(
+        #{<<"message">> => <<"foo">>}, <<"wamp.error.foo">>
+    ),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     abort = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 challenge_json_test(_) ->
     M = bondy_wamp_message:challenge(<<"foo">>, #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     challenge = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 authenticate_json_test(_) ->
     M = bondy_wamp_message:authenticate(<<"foo">>, #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     authenticate = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 goodbye_json_test(_) ->
@@ -90,7 +91,7 @@ goodbye_json_test(_) ->
         #{<<"message">> => <<"The host is shutting down now.">>},
         <<"wamp.error.system_shutdown">>
     ),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     ?assertEqual(
         goodbye,
         bondy_wamp_encoding:decode_message_name(
@@ -102,142 +103,160 @@ goodbye_json_test(_) ->
         bondy_wamp_encoding:decode({ws, text, json}, Bin)
     ).
 
-
 error_json_test(_) ->
     M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     error = bondy_wamp_encoding:decode_message_name({ws, text, json}, Bin),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 error_json_2_test(_) ->
     M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>, []),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     error = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 error_json_3_test(_) ->
-    M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>, [], #{}),Bin = bondy_wamp_encoding:encode(M, json),
+    M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>, [], #{}),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     error = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 publish_json_test(_) ->
     M = bondy_wamp_message:publish(1, #{}, <<"com.leapsight.topic1">>),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     publish = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 publish_json_2_test(_) ->
     M = bondy_wamp_message:publish(1, #{}, <<"com.leapsight.topic1">>),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     publish = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 publish_json_3_test(_) ->
     M = bondy_wamp_message:publish(1, #{}, <<"com.leapsight.topic1">>, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     publish = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 published_json_test(_) ->
     M = bondy_wamp_message:published(1, 2),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     published = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 subscribe_json_test(_) ->
     M = bondy_wamp_message:subscribe(1, #{}, <<"com.leapsight.topic1">>),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     subscribe = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 subscribed_json_test(_) ->
     M = bondy_wamp_message:subscribed(1, 3),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     subscribed = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 unsubscribe_json_test(_) ->
     M = bondy_wamp_message:unsubscribe(1, 3),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     unsubscribe = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 unsubscribed_json_test(_) ->
     M = bondy_wamp_message:unsubscribed(1),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     unsubscribed = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 event_json_test(_) ->
     M = bondy_wamp_message:event(3, 2, #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     event = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 event_json_2_test(_) ->
     M = bondy_wamp_message:event(3, 2, #{}, []),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     event = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 event_json_3_test(_) ->
     M = bondy_wamp_message:event(3, 2, #{}, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     event = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 call_json_test(_) ->
     M = bondy_wamp_message:call(1, #{}, <<"com.leapsight.myprocedure1">>),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     call = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 call_json_2_test(_) ->
     M = bondy_wamp_message:call(1, #{}, <<"com.leapsight.myprocedure1">>, []),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     call = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 call_json_3_test(_) ->
-    M = bondy_wamp_message:call(1, #{}, <<"com.leapsight.myprocedure1">>, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    M = bondy_wamp_message:call(
+        1, #{}, <<"com.leapsight.myprocedure1">>, [], #{}
+    ),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     call = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 call_json_4_test(_) ->
     M0 = bondy_wamp_message:call(
-        1, #{}, <<"foo">>,
+        1,
+        #{},
+        <<"foo">>,
         [#{bar => pid_to_list(self())}],
         #{baz => [#{1 => 2}]}
     ),
-    Bin = bondy_wamp_encoding:encode(M0, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M0, json)),
     call = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M1], <<>>} = bondy_wamp_encoding:decode(
         {ws, text, json}, Bin, #{partial_decode => false}
     ),
     ?assertMatch(
-        {call, 1, _, <<"foo">>,
-            [#{<<"bar">> := _}],
-            #{<<"baz">> := [#{<<"1">> := 2}]},
-            undefined
-        },
+        {call, 1, _, <<"foo">>, [#{<<"bar">> := _}],
+            #{<<"baz">> := [#{<<"1">> := 2}]}, undefined},
         M1
     ),
     {[M2], <<>>} = bondy_wamp_encoding:decode(
@@ -248,134 +267,147 @@ call_json_4_test(_) ->
         M2
     ),
     ?assertEqual(
-        bondy_wamp_encoding:encode(M1, json),
-        bondy_wamp_encoding:encode(M2, json)
+        iolist_to_binary(bondy_wamp_encoding:encode(M1, json)),
+        iolist_to_binary(bondy_wamp_encoding:encode(M2, json))
     ).
 
 cancel_json_test(_) ->
     M = bondy_wamp_message:cancel(1, #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     cancel = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 result_json_test(_) ->
     M = bondy_wamp_message:result(1, #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     result = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 result_json_2_test(_) ->
     M = bondy_wamp_message:result(1, #{}, []),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     result = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 result_json_3_test(_) ->
     M = bondy_wamp_message:result(1, #{}, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     result = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 register_json_test(_) ->
     M = bondy_wamp_message:register(1, #{}, <<"com.leapsight.myprocedure1">>),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     register = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 registered_json_2_test(_) ->
     M = bondy_wamp_message:registered(1, 4),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     registered = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 unregister_json_3_test(_) ->
     M = bondy_wamp_message:unregister(1, 4),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     unregister = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 unregistered_json_test(_) ->
     M = bondy_wamp_message:unregistered(1),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     unregistered = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 invocation_json_test(_) ->
     M = bondy_wamp_message:invocation(1, 4, #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     invocation = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 invocation_json_2_test(_) ->
     M = bondy_wamp_message:invocation(1, 4, #{}, []),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     invocation = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 invocation_json_3_test(_) ->
     M = bondy_wamp_message:invocation(1, 4, #{}, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     invocation = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 interrupt_json_test(_) ->
     M = bondy_wamp_message:interrupt(1, #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     interrupt = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 yield_json_test(_) ->
     M = bondy_wamp_message:yield(1, #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     yield = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 yield_json_2_test(_) ->
     M = bondy_wamp_message:yield(1, #{}, []),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     yield = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
 
 yield_json_3_test(_) ->
     M = bondy_wamp_message:yield(1, #{}, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
     yield = bondy_wamp_encoding:decode_message_name(
-        {ws, text, json}, Bin),
+        {ws, text, json}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin).
-
-
 
 %% =============================================================================
 %% MSGPACK
 %% =============================================================================
 
-
-
-
 hello_msgpack_test(_) ->
     M = bondy_wamp_message:hello(<<"realm1">>, #{
         <<"roles">> => #{
             <<"caller">> => #{}
-        }}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+        }
+    }),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     hello = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode(
-        {ws, binary, msgpack}, Bin).
+        {ws, binary, msgpack}, Bin
+    ).
 
 welcome_msgpack_test(_) ->
     M = bondy_wamp_message:welcome(1, #{
@@ -385,31 +417,38 @@ welcome_msgpack_test(_) ->
         <<"roles">> => #{
             <<"dealer">> => #{},
             <<"broker">> => #{}
-        }}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+        }
+    }),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     welcome = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 abort_msgpack_test(_) ->
-    M = bondy_wamp_message:abort(#{<<"message">> => <<"foo">>}, <<"wamp.error.foo">>),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    M = bondy_wamp_message:abort(
+        #{<<"message">> => <<"foo">>}, <<"wamp.error.foo">>
+    ),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     abort = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 challenge_msgpack_test(_) ->
     M = bondy_wamp_message:challenge(<<"foo">>, #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     challenge = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 authenticate_msgpack_test(_) ->
     M = bondy_wamp_message:authenticate(<<"foo">>, #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     authenticate = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 goodbye_msgpack_test(_) ->
@@ -417,252 +456,283 @@ goodbye_msgpack_test(_) ->
         #{<<"message">> => <<"The host is shutting down now.">>},
         <<"wamp.error.system_shutdown">>
     ),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     goodbye = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
-
 
 error_msgpack_test(_) ->
     M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     error = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 error_msgpack_2_test(_) ->
     M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>, []),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     error = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 error_msgpack_3_test(_) ->
     M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     error = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 publish_msgpack_test(_) ->
     M = bondy_wamp_message:publish(1, #{}, <<"com.leapsight.topic1">>),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     publish = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 publish_msgpack_2_test(_) ->
     M = bondy_wamp_message:publish(1, #{}, <<"com.leapsight.topic1">>, []),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     publish = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 publish_msgpack_3_test(_) ->
     M = bondy_wamp_message:publish(1, #{}, <<"com.leapsight.topic1">>, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     publish = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 published_msgpack_test(_) ->
     M = bondy_wamp_message:published(1, 2),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     published = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 subscribe_msgpack_test(_) ->
     M = bondy_wamp_message:subscribe(1, #{}, <<"com.leapsight.topic1">>),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     subscribe = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 subscribed_msgpack_test(_) ->
     M = bondy_wamp_message:subscribed(1, 3),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     subscribed = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 unsubscribe_msgpack_test(_) ->
     M = bondy_wamp_message:unsubscribe(1, 3),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     unsubscribe = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 unsubscribed_msgpack_test(_) ->
     M = bondy_wamp_message:unsubscribed(1),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     unsubscribed = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 event_msgpack_test(_) ->
     M = bondy_wamp_message:event(3, 2, #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     event = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 event_msgpack_2_test(_) ->
     M = bondy_wamp_message:event(3, 2, #{}, []),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     event = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 event_msgpack_3_test(_) ->
     M = bondy_wamp_message:event(3, 2, #{}, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     event = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 call_msgpack_test(_) ->
     M = bondy_wamp_message:call(1, #{}, <<"com.leapsight.myprocedure1">>),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     call = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 call_msgpack_2_test(_) ->
     M = bondy_wamp_message:call(1, #{}, <<"com.leapsight.myprocedure1">>, []),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     call = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 call_msgpack_3_test(_) ->
-    M = bondy_wamp_message:call(1, #{}, <<"com.leapsight.myprocedure1">>, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    M = bondy_wamp_message:call(
+        1, #{}, <<"com.leapsight.myprocedure1">>, [], #{}
+    ),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     call = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 cancel_msgpack_test(_) ->
     M = bondy_wamp_message:cancel(1, #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     cancel = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 result_msgpack_test(_) ->
     M = bondy_wamp_message:result(1, #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     result = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 result_msgpack_2_test(_) ->
     M = bondy_wamp_message:result(1, #{}, []),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     result = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 result_msgpack_3_test(_) ->
     M = bondy_wamp_message:result(1, #{}, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     result = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 register_msgpack_test(_) ->
     M = bondy_wamp_message:register(1, #{}, <<"com.leapsight.myprocedure1">>),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     register = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 registered_msgpack_2_test(_) ->
     M = bondy_wamp_message:registered(1, 4),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     registered = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 unregister_msgpack_3_test(_) ->
     M = bondy_wamp_message:unregister(1, 4),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     unregister = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 unregistered_msgpack_test(_) ->
     M = bondy_wamp_message:unregistered(1),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     unregistered = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 invocation_msgpack_test(_) ->
     M = bondy_wamp_message:invocation(1, 4, #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     invocation = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 invocation_msgpack_2_test(_) ->
     M = bondy_wamp_message:invocation(1, 4, #{}, []),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     invocation = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 invocation_msgpack_3_test(_) ->
     M = bondy_wamp_message:invocation(1, 4, #{}, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     invocation = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 interrupt_msgpack_test(_) ->
     M = bondy_wamp_message:interrupt(1, #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     interrupt = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 yield_msgpack_test(_) ->
     M = bondy_wamp_message:yield(1, #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     yield = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 yield_msgpack_2_test(_) ->
     M = bondy_wamp_message:yield(1, #{}, []),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     yield = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
 
 yield_msgpack_3_test(_) ->
     M = bondy_wamp_message:yield(1, #{}, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     yield = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, msgpack}, Bin),
+        {ws, binary, msgpack}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin).
-
-
 
 %% =============================================================================
 %% BERT
 %% =============================================================================
 
-
-
-
 hello_bert_test(_) ->
     M = bondy_wamp_message:hello(<<"realm1">>, #{
         <<"roles">> => #{
             <<"caller">> => #{}
-        }}),
+        }
+    }),
     {[M], <<>>} = bondy_wamp_encoding:decode(
-        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 welcome_bert_test(_) ->
     M = bondy_wamp_message:welcome(1, #{
@@ -672,189 +742,276 @@ welcome_bert_test(_) ->
         <<"roles">> => #{
             <<"dealer">> => #{},
             <<"broker">> => #{}
-        }}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+        }
+    }),
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 abort_bert_test(_) ->
-    M = bondy_wamp_message:abort(#{<<"message">> => <<"foo">>}, <<"wamp.error.foo">>),
+    M = bondy_wamp_message:abort(
+        #{<<"message">> => <<"foo">>}, <<"wamp.error.foo">>
+    ),
     ?assertMatch(
         {[M], <<>>},
-        bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert))
+        bondy_wamp_encoding:decode(
+            {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+        )
     ).
 
 challenge_bert_test(_) ->
     M = bondy_wamp_message:challenge(<<"foo">>, #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 authenticate_bert_test(_) ->
     M = bondy_wamp_message:authenticate(<<"foo">>, #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 goodbye_bert_test(_) ->
     M = bondy_wamp_message:goodbye(
         #{<<"message">> => <<"The host is shutting down now.">>},
         <<"wamp.error.system_shutdown">>
     ),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
-
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 error_bert_test(_) ->
     M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 error_bert_2_test(_) ->
     M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>, []),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 error_bert_3_test(_) ->
     M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>, [], #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 publish_bert_test(_) ->
     M = bondy_wamp_message:publish(1, #{}, <<"com.leapsight.topic1">>),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 publish_bert_2_test(_) ->
     M = bondy_wamp_message:publish(1, #{}, <<"com.leapsight.topic1">>, []),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 publish_bert_3_test(_) ->
     M = bondy_wamp_message:publish(1, #{}, <<"com.leapsight.topic1">>, [], #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 published_bert_test(_) ->
     M = bondy_wamp_message:published(1, 2),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 subscribe_bert_test(_) ->
     M = bondy_wamp_message:subscribe(1, #{}, <<"com.leapsight.topic1">>),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 subscribed_bert_test(_) ->
     M = bondy_wamp_message:subscribed(1, 3),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 unsubscribe_bert_test(_) ->
     M = bondy_wamp_message:unsubscribe(1, 3),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 unsubscribed_bert_test(_) ->
     M = bondy_wamp_message:unsubscribed(1),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 event_bert_test(_) ->
     M = bondy_wamp_message:event(3, 2, #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 event_bert_2_test(_) ->
     M = bondy_wamp_message:event(3, 2, #{}, []),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 event_bert_3_test(_) ->
     M = bondy_wamp_message:event(3, 2, #{}, [], #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 call_bert_test(_) ->
     M = bondy_wamp_message:call(1, #{}, <<"com.leapsight.myprocedure1">>),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 call_bert_2_test(_) ->
     M = bondy_wamp_message:call(1, #{}, <<"com.leapsight.myprocedure1">>, []),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 call_bert_3_test(_) ->
-    M = bondy_wamp_message:call(1, #{}, <<"com.leapsight.myprocedure1">>, [], #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    M = bondy_wamp_message:call(
+        1, #{}, <<"com.leapsight.myprocedure1">>, [], #{}
+    ),
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 cancel_bert_test(_) ->
     M = bondy_wamp_message:cancel(1, #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 result_bert_test(_) ->
     M = bondy_wamp_message:result(1, #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 result_bert_2_test(_) ->
     M = bondy_wamp_message:result(1, #{}, []),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 result_bert_3_test(_) ->
     M = bondy_wamp_message:result(1, #{}, [], #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 result_bert_4_test(_) ->
     M = bondy_wamp_message:result(1, #{}, [true], #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 result_bert_5_test(_) ->
     M = bondy_wamp_message:result(1, #{}, [false], #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 result_bert_6_test(_) ->
     M = bondy_wamp_message:result(1, #{}, [undefined], #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 result_bert_7_test(_) ->
     M = bondy_wamp_message:result(1, #{}, [#{foo => true, bar => baz}], #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 register_bert_test(_) ->
     M = bondy_wamp_message:register(1, #{}, <<"com.leapsight.myprocedure1">>),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 registered_bert_2_test(_) ->
     M = bondy_wamp_message:registered(1, 4),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 unregister_bert_3_test(_) ->
     M = bondy_wamp_message:unregister(1, 4),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 unregistered_bert_test(_) ->
     M = bondy_wamp_message:unregistered(1),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 invocation_bert_test(_) ->
     M = bondy_wamp_message:invocation(1, 4, #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 invocation_bert_2_test(_) ->
     M = bondy_wamp_message:invocation(1, 4, #{}, []),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 invocation_bert_3_test(_) ->
     M = bondy_wamp_message:invocation(1, 4, #{}, [], #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 interrupt_bert_test(_) ->
     M = bondy_wamp_message:interrupt(1, #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 yield_bert_test(_) ->
     M = bondy_wamp_message:yield(1, #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 yield_bert_2_test(_) ->
     M = bondy_wamp_message:yield(1, #{}, []),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 yield_bert_3_test(_) ->
     M = bondy_wamp_message:yield(1, #{}, [], #{}),
-    {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)).
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, bondy_wamp_encoding:encode(M, bert)
+    ).
 
 %% =============================================================================
 %% ERL
 %% =============================================================================
 
-
 hello_erl_test(_) ->
     M = bondy_wamp_message:hello(<<"realm1">>, #{
         <<"roles">> => #{
             <<"caller">> => #{}
-        }}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+        }
+    }),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     hello = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 welcome_erl_test(_) ->
@@ -865,10 +1022,12 @@ welcome_erl_test(_) ->
         <<"roles">> => #{
             <<"dealer">> => #{},
             <<"broker">> => #{}
-        }}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+        }
+    }),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     welcome = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 welcome_erl_test_2(_) ->
@@ -876,31 +1035,38 @@ welcome_erl_test_2(_) ->
         roles => #{
             dealer => #{},
             broker => #{}
-        }}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+        }
+    }),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     welcome = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 abort_erl_test(_) ->
-    M = bondy_wamp_message:abort(#{<<"message">> => <<"foo">>}, <<"wamp.error.foo">>),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    M = bondy_wamp_message:abort(
+        #{<<"message">> => <<"foo">>}, <<"wamp.error.foo">>
+    ),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     abort = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 challenge_erl_test(_) ->
     M = bondy_wamp_message:challenge(<<"foo">>, #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     challenge = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 authenticate_erl_test(_) ->
     M = bondy_wamp_message:authenticate(<<"foo">>, #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     authenticate = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 goodbye_erl_test(_) ->
@@ -908,129 +1074,148 @@ goodbye_erl_test(_) ->
         #{<<"message">> => <<"The host is shutting down now.">>},
         <<"wamp.error.system_shutdown">>
     ),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     goodbye = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
-
 
 error_erl_test(_) ->
     M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     error = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 error_erl_2_test(_) ->
     M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>, []),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     error = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 error_erl_3_test(_) ->
     M = bondy_wamp_message:error(0, 1, #{}, <<"wamp.error.foo">>, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     error = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 publish_erl_test(_) ->
     M = bondy_wamp_message:publish(1, #{}, <<"com.leapsight.topic1">>),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     publish = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 publish_erl_2_test(_) ->
     M = bondy_wamp_message:publish(1, #{}, <<"com.leapsight.topic1">>, []),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     publish = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 publish_erl_3_test(_) ->
     M = bondy_wamp_message:publish(1, #{}, <<"com.leapsight.topic1">>, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     publish = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 published_erl_test(_) ->
     M = bondy_wamp_message:published(1, 2),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     published = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 subscribe_erl_test(_) ->
     M = bondy_wamp_message:subscribe(1, #{}, <<"com.leapsight.topic1">>),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     subscribe = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 subscribed_erl_test(_) ->
     M = bondy_wamp_message:subscribed(1, 3),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     subscribed = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 unsubscribe_erl_test(_) ->
     M = bondy_wamp_message:unsubscribe(1, 3),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     unsubscribe = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 unsubscribed_erl_test(_) ->
     M = bondy_wamp_message:unsubscribed(1),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     unsubscribed = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 event_erl_test(_) ->
     M = bondy_wamp_message:event(3, 2, #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     event = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 event_erl_2_test(_) ->
     M = bondy_wamp_message:event(3, 2, #{}, []),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     event = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 event_erl_3_test(_) ->
     M = bondy_wamp_message:event(3, 2, #{}, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     event = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 call_erl_test(_) ->
     M = bondy_wamp_message:call(1, #{}, <<"com.leapsight.myprocedure1">>),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     call = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 call_erl_2_test(_) ->
     M = bondy_wamp_message:call(1, #{}, <<"com.leapsight.myprocedure1">>, []),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     call = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 call_erl_3_test(_) ->
-    M = bondy_wamp_message:call(1, #{}, <<"com.leapsight.myprocedure1">>, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    M = bondy_wamp_message:call(
+        1, #{}, <<"com.leapsight.myprocedure1">>, [], #{}
+    ),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     call = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 call_erl_4_test(_) ->
@@ -1038,44 +1223,47 @@ call_erl_4_test(_) ->
         [{bar, self()}]
     ],
     M0 = bondy_wamp_message:call(1, #{}, <<"foo">>, Args, #{}),
-    Bin = bondy_wamp_encoding:encode(M0, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M0, erl)),
     call = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M1], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin),
     ?assertMatch(
-        {call, 1, _, <<"foo">>, [#{<<"bar">> := _}],
-        undefined, undefined},
+        {call, 1, _, <<"foo">>, [[[<<"bar">>, _]]], undefined, undefined},
         M1
     ).
 
 cancel_erl_test(_) ->
     M = bondy_wamp_message:cancel(1, #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     cancel = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 result_erl_test(_) ->
     M = bondy_wamp_message:result(1, #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     result = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 result_erl_2_test(_) ->
     M = bondy_wamp_message:result(1, #{}, []),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     result = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 result_erl_3_test(_) ->
     M = bondy_wamp_message:result(1, #{}, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     result = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
-
 
 result_erl_4_test(_) ->
     Arg = #{
@@ -1097,7 +1285,7 @@ result_erl_4_test(_) ->
         }
     },
     M = bondy_wamp_message:result(1, #{}, [Arg], #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     ExpectedArg = #{
         <<"a">> => undefined,
         <<"b">> => true,
@@ -1127,87 +1315,95 @@ result_erl_4_test(_) ->
 
 register_erl_test(_) ->
     M = bondy_wamp_message:register(1, #{}, <<"com.leapsight.myprocedure1">>),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     register = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 registered_erl_2_test(_) ->
     M = bondy_wamp_message:registered(1, 4),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     registered = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 unregister_erl_3_test(_) ->
     M = bondy_wamp_message:unregister(1, 4),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     unregister = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 unregistered_erl_test(_) ->
     M = bondy_wamp_message:unregistered(1),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     unregistered = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 invocation_erl_test(_) ->
     M = bondy_wamp_message:invocation(1, 4, #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     invocation = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 invocation_erl_2_test(_) ->
     M = bondy_wamp_message:invocation(1, 4, #{}, []),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     invocation = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 invocation_erl_3_test(_) ->
     M = bondy_wamp_message:invocation(1, 4, #{}, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     invocation = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 interrupt_erl_test(_) ->
     M = bondy_wamp_message:interrupt(1, #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     interrupt = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 yield_erl_test(_) ->
     M = bondy_wamp_message:yield(1, #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     yield = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 yield_erl_2_test(_) ->
     M = bondy_wamp_message:yield(1, #{}, []),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     yield = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
 
 yield_erl_3_test(_) ->
     M = bondy_wamp_message:yield(1, #{}, [], #{}),
-    Bin = bondy_wamp_encoding:encode(M, erl),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     yield = bondy_wamp_encoding:decode_message_name(
-        {ws, binary, erl}, Bin),
+        {ws, binary, erl}, Bin
+    ),
     {[M], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, Bin).
-
-
 
 %% =============================================================================
 %% EXTENSION KEYS VALIDATION
 %% =============================================================================
-
 
 validate_extension_key_1_test(_) ->
     Keys = [
@@ -1218,7 +1414,7 @@ validate_extension_key_1_test(_) ->
         '_foo',
         'bar'
     ],
-    Allowed =[{yield, Keys}],
+    Allowed = [{yield, Keys}],
     ok = app_config:set(wamp, extended_options, Allowed),
     Keys = app_config:get(wamp, [extended_options, yield]),
 
@@ -1243,25 +1439,21 @@ validate_extension_key_1_test(_) ->
     M2 = bondy_wamp_message:cancel(1, Opts),
     ?assertEqual(maps:new(), bondy_wamp_message:options(M2)).
 
-
 %% =============================================================================
 %% is_encoding/1 TESTS
 %% =============================================================================
 
 is_encoding_test(_) ->
-    %% Valid encodings
     ?assert(bondy_wamp_encoding:is_encoding(bert)),
     ?assert(bondy_wamp_encoding:is_encoding(erl)),
     ?assert(bondy_wamp_encoding:is_encoding(json)),
     ?assert(bondy_wamp_encoding:is_encoding(msgpack)),
 
-    %% Invalid encodings
     ?assertNot(bondy_wamp_encoding:is_encoding(xml)),
     ?assertNot(bondy_wamp_encoding:is_encoding(foo)),
     ?assertNot(bondy_wamp_encoding:is_encoding(undefined)),
     ?assertNot(bondy_wamp_encoding:is_encoding(<<>>)),
     ?assertNot(bondy_wamp_encoding:is_encoding(123)).
-
 
 %% =============================================================================
 %% pack/unpack TESTS
@@ -1271,31 +1463,36 @@ pack_unpack_optionals_test(_) ->
     %% Test with undefined args and kwargs (should omit both)
     M1 = bondy_wamp_message:call(1, #{}, <<"proc">>),
     Packed1 = bondy_wamp_encoding:pack(M1),
-    ?assertEqual(4, length(Packed1)),  %% [TYPE, ReqId, Options, ProcUri]
+    %% [TYPE, ReqId, Options, ProcUri]
+    ?assertEqual(4, length(Packed1)),
     ?assertEqual(M1, bondy_wamp_encoding:unpack(Packed1)),
 
     %% Test with empty args list (should omit both)
     M2 = bondy_wamp_message:call(1, #{}, <<"proc">>, []),
     Packed2 = bondy_wamp_encoding:pack(M2),
-    ?assertEqual(4, length(Packed2)),  %% Empty args should be omitted
+    ?assertEqual(4, length(Packed2)),
     Unpacked2 = bondy_wamp_encoding:unpack(Packed2),
     ?assertEqual(undefined, Unpacked2#call.args),
 
     %% Test with empty kwargs map (should omit both)
     M3 = bondy_wamp_message:call(1, #{}, <<"proc">>, [1, 2], #{}),
     Packed3 = bondy_wamp_encoding:pack(M3),
-    ?assertEqual(5, length(Packed3)),  %% [TYPE, ReqId, Options, ProcUri, Args]
+    %% [TYPE, ReqId, Options, ProcUri, Args]
+    ?assertEqual(5, length(Packed3)),
     Unpacked3 = bondy_wamp_encoding:unpack(Packed3),
     ?assertEqual([1, 2], Unpacked3#call.args),
     ?assertEqual(undefined, Unpacked3#call.kwargs),
 
     %% Test with only kwargs (should include empty args list)
-    M4 = bondy_wamp_message:call(1, #{}, <<"proc">>, undefined, #{<<"key">> => <<"val">>}),
+    M4 = bondy_wamp_message:call(1, #{}, <<"proc">>, undefined, #{
+        <<"key">> => <<"val">>
+    }),
     Packed4 = bondy_wamp_encoding:pack(M4),
     ?assertEqual(
         6,
         length(Packed4)
-    ),  %% [TYPE, ReqId, Options, ProcUri, [], KWArgs]
+        %% [TYPE, ReqId, Options, ProcUri, [], KWArgs]
+    ),
     Unpacked4 = bondy_wamp_encoding:unpack(Packed4),
     %% When kwargs is present, args defaults to empty list
     ?assert(
@@ -1304,35 +1501,36 @@ pack_unpack_optionals_test(_) ->
     ?assertEqual(#{<<"key">> => <<"val">>}, Unpacked4#call.kwargs),
 
     %% Test with both args and kwargs
-    M5 = bondy_wamp_message:call(1, #{}, <<"proc">>, [1], #{<<"key">> => <<"val">>}),
+    M5 = bondy_wamp_message:call(1, #{}, <<"proc">>, [1], #{
+        <<"key">> => <<"val">>
+    }),
     Packed5 = bondy_wamp_encoding:pack(M5),
     ?assertEqual(
         6,
         length(Packed5)
-    ),  %% [TYPE, ReqId, Options, ProcUri, Args, KWArgs]
+        %% [TYPE, ReqId, Options, ProcUri, Args, KWArgs]
+    ),
     ?assertEqual(M5, bondy_wamp_encoding:unpack(Packed5)).
 
-
 unpack_invalid_message_test(_) ->
-    %% Invalid message should error
-    ?assertError({invalid_message, _}, bondy_wamp_encoding:unpack([999, 1, #{}])),
+    ?assertError(
+        {invalid_message, _}, bondy_wamp_encoding:unpack([999, 1, #{}])
+    ),
     ?assertError({invalid_message, _}, bondy_wamp_encoding:unpack(invalid)),
     ?assertError({invalid_message, _}, bondy_wamp_encoding:unpack([])).
 
-
 unregistered_with_details_test(_) ->
-    %% Unregistered without details
     M1 = bondy_wamp_message:unregistered(123),
     Packed1 = bondy_wamp_encoding:pack(M1),
-    ?assertEqual(2, length(Packed1)),  %% [TYPE, ReqId]
+    %% [TYPE, ReqId]
+    ?assertEqual(2, length(Packed1)),
     ?assertEqual(M1, bondy_wamp_encoding:unpack(Packed1)),
 
-    %% Unregistered with details
     M2 = bondy_wamp_message:unregistered(123, #{<<"reason">> => <<"test">>}),
     Packed2 = bondy_wamp_encoding:pack(M2),
-    ?assertEqual(3, length(Packed2)),  %% [TYPE, ReqId, Details]
+    %% [TYPE, ReqId, Details]
+    ?assertEqual(3, length(Packed2)),
     ?assertEqual(M2, bondy_wamp_encoding:unpack(Packed2)).
-
 
 %% =============================================================================
 %% message_name/1 TESTS
@@ -1365,22 +1563,25 @@ message_name_test(_) ->
     ?assertEqual(interrupt, bondy_wamp_encoding:message_name(69)),
     ?assertEqual(yield, bondy_wamp_encoding:message_name(70)).
 
-
 %% =============================================================================
 %% decode_message_name/2 ERROR HANDLING TESTS
 %% =============================================================================
 
 decode_message_name_json_invalid_test(_) ->
-    %% Invalid JSON for message name
-    ?assertError(badarg, bondy_wamp_encoding:decode_message_name({ws, text, json}, <<"{}">>)),
-    ?assertError(badarg, bondy_wamp_encoding:decode_message_name({ws, text, json}, <<"[1">>)),
     ?assertError(
-        badarg, bondy_wamp_encoding:decode_message_name({ws, text, json}, <<"invalid">>)
+        badarg,
+        bondy_wamp_encoding:decode_message_name({ws, text, json}, <<"{}">>)
+    ),
+    ?assertError(
+        badarg,
+        bondy_wamp_encoding:decode_message_name({ws, text, json}, <<"[1">>)
+    ),
+    ?assertError(
+        badarg,
+        bondy_wamp_encoding:decode_message_name({ws, text, json}, <<"invalid">>)
     ).
 
-
 decode_message_name_erl_invalid_test(_) ->
-    %% Invalid Erlang term for message name
     ?assertError(
         badarg,
         bondy_wamp_encoding:decode_message_name(
@@ -1388,17 +1589,19 @@ decode_message_name_erl_invalid_test(_) ->
         )
     ),
     ?assertError(
-        badarg, bondy_wamp_encoding:decode_message_name({ws, binary, erl}, <<"invalid">>)
+        badarg,
+        bondy_wamp_encoding:decode_message_name(
+            {ws, binary, erl}, <<"invalid">>
+        )
     ).
-
 
 decode_message_name_msgpack_invalid_test(_) ->
-    %% Invalid msgpack for message name
     ?assertError(
         badarg,
-        bondy_wamp_encoding:decode_message_name({ws, binary, msgpack}, <<"invalid">>)
+        bondy_wamp_encoding:decode_message_name(
+            {ws, binary, msgpack}, <<"invalid">>
+        )
     ).
-
 
 %% =============================================================================
 %% ERROR HANDLING TESTS
@@ -1406,13 +1609,13 @@ decode_message_name_msgpack_invalid_test(_) ->
 
 encode_unsupported_encoding_test(_) ->
     %% hello requires roles in details with at least one role
-    M = bondy_wamp_message:hello(<<"realm">>, #{<<"roles">> => #{<<"caller">> => #{}}}),
+    M = bondy_wamp_message:hello(<<"realm">>, #{
+        <<"roles">> => #{<<"caller">> => #{}}
+    }),
     ?assertError({unsupported_encoding, _}, bondy_wamp_encoding:encode(M, xml)),
     ?assertError({unsupported_encoding, _}, bondy_wamp_encoding:encode(M, foo)).
 
-
 decode_unsupported_encoding_test(_) ->
-    %% Unsupported text encoding
     ?assertError(
         {unsupported_encoding, _},
         bondy_wamp_encoding:decode({ws, text, xml}, <<"data">>)
@@ -1422,7 +1625,6 @@ decode_unsupported_encoding_test(_) ->
         bondy_wamp_encoding:decode({ws, text, msgpack}, <<"data">>)
     ).
 
-
 %% =============================================================================
 %% PARTIAL ENCODING/DECODING TESTS
 %% =============================================================================
@@ -1431,7 +1633,7 @@ partial_decode_publish_test(_) ->
     M = bondy_wamp_message:publish(
         1, #{}, <<"topic">>, [1, 2, 3], #{<<"key">> => <<"value">>}
     ),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
 
     %% Decode with partial_decode enabled (default)
     {[Decoded], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin),
@@ -1441,8 +1643,7 @@ partial_decode_publish_test(_) ->
     ?assertEqual(undefined, Decoded#publish.kwargs),
     ?assertMatch({json, _}, bondy_wamp_message:partial(Decoded)),
 
-    %% Re-encode partial should work
-    ReEncoded = bondy_wamp_encoding:encode(Decoded, json),
+    ReEncoded = iolist_to_binary(bondy_wamp_encoding:encode(Decoded, json)),
     ?assertEqual(Bin, ReEncoded),
 
     %% Decode with partial_decode disabled
@@ -1453,6 +1654,82 @@ partial_decode_publish_test(_) ->
     ?assertEqual(#{<<"key">> => <<"value">>}, FullDecoded#publish.kwargs),
     ?assertEqual(undefined, bondy_wamp_message:partial(FullDecoded)).
 
+%% decode_partial/1 must leave a CALL fully decoded: args/kwargs set AND the
+%% partial cleared. A CALL that keeps its partial has two copies of its
+%% arguments, and the raw one wins the next time anything decodes it.
+partial_decode_call_test(_) ->
+    M = bondy_wamp_message:call(
+        1, #{}, <<"com.example.proc">>, [1, 2], #{<<"key">> => <<"value">>}
+    ),
+    lists:foreach(
+        fun({Enc, Subprotocol}) ->
+            Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, Enc)),
+            {[Decoded], <<>>} = bondy_wamp_encoding:decode(Subprotocol, Bin),
+            ?assertMatch({Enc, _}, bondy_wamp_message:partial(Decoded)),
+
+            Full = bondy_wamp_message:decode_partial(Decoded),
+            ?assertEqual([1, 2], Full#call.args),
+            ?assertEqual(#{<<"key">> => <<"value">>}, Full#call.kwargs),
+            ?assertEqual(undefined, bondy_wamp_message:partial(Full)),
+
+            %% Arguments set after decoding are the ones that survive.
+            Rewritten = bondy_wamp_message:decode_partial(Full#call{args = [3]}),
+            ?assertEqual([3], Rewritten#call.args)
+        end,
+        [{json, {ws, text, json}}, {cbor, {ws, binary, cbor}}]
+    ).
+
+%% A Payload Passthru Mode message decoded off the wire keeps its single opaque
+%% payload in `partial`, and decoding the partial yields it. A passthru message
+%% whose payload breaks the passthru rule (more than one argument) is still
+%% refused, once the payload is decoded.
+partial_decode_ppt_test(_) ->
+    Opts = #{ppt_scheme => <<"x_custom">>},
+    Payload = [<<"opaque">>],
+    Ms = [
+        bondy_wamp_message:call(1, Opts, <<"com.example.p">>, Payload),
+        bondy_wamp_message:publish(1, Opts, <<"com.example.t">>, Payload),
+        bondy_wamp_message:event(1, 2, Opts, Payload),
+        bondy_wamp_message:result(1, Opts, Payload),
+        bondy_wamp_message:yield(1, Opts, Payload),
+        bondy_wamp_message:invocation(1, 2, Opts, Payload),
+        bondy_wamp_message:error(48, 1, Opts, <<"com.example.e">>, Payload)
+    ],
+    lists:foreach(
+        fun({M, {Enc, Subprotocol}}) ->
+            Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, Enc)),
+            {[Decoded], <<>>} = bondy_wamp_encoding:decode(Subprotocol, Bin),
+            ?assertMatch({Enc, _}, bondy_wamp_message:partial(Decoded)),
+            Full = bondy_wamp_message:decode_partial(Decoded),
+            ?assertEqual(Payload, args_of(Full)),
+            ?assertEqual(undefined, bondy_wamp_message:partial(Full))
+        end,
+        [
+            {M, EncSub}
+         || M <- Ms,
+            EncSub <- [{json, {ws, text, json}}, {cbor, {ws, binary, cbor}}]
+        ]
+    ),
+    Bad = bondy_wamp_message:call(1, #{}, <<"com.example.p">>, [<<"a">>, 1]),
+    lists:foreach(
+        fun({Enc, Subprotocol}) ->
+            Bin = iolist_to_binary(bondy_wamp_encoding:encode(Bad, Enc)),
+            {[Decoded0], <<>>} = bondy_wamp_encoding:decode(Subprotocol, Bin),
+            Decoded = Decoded0#call{options = Opts},
+            ?assertError(
+                badarg, bondy_wamp_message:decode_partial(Decoded)
+            )
+        end,
+        [{json, {ws, text, json}}, {cbor, {ws, binary, cbor}}]
+    ).
+
+args_of(#call{args = A}) -> A;
+args_of(#publish{args = A}) -> A;
+args_of(#event{args = A}) -> A;
+args_of(#result{args = A}) -> A;
+args_of(#yield{args = A}) -> A;
+args_of(#invocation{args = A}) -> A;
+args_of(#error{args = A}) -> A.
 
 partial_decode_error_test(_) ->
     M = bondy_wamp_message:error(
@@ -1463,7 +1740,7 @@ partial_decode_error_test(_) ->
         [<<"arg1">>, <<"arg2">>],
         #{<<"k">> => <<"v">>}
     ),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
 
     %% Decode with partial_decode enabled
     {[Decoded], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin),
@@ -1471,10 +1748,8 @@ partial_decode_error_test(_) ->
     ?assertEqual(undefined, Decoded#error.kwargs),
     ?assertMatch({json, _}, bondy_wamp_message:partial(Decoded)),
 
-    %% Re-encode should work
-    ReEncoded = bondy_wamp_encoding:encode(Decoded, json),
+    ReEncoded = iolist_to_binary(bondy_wamp_encoding:encode(Decoded, json)),
     ?assertEqual(Bin, ReEncoded).
-
 
 partial_decode_event_test(_) ->
     %% Note: Event messages may not fully support partial decoding
@@ -1482,66 +1757,61 @@ partial_decode_event_test(_) ->
     M = bondy_wamp_message:event(
         1, 2, #{}, [<<"data1">>, <<"data2">>], #{<<"meta">> => true}
     ),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
 
     %% Decode with partial disabled to avoid set_partial badarg
     {[Decoded], <<>>} = bondy_wamp_encoding:decode(
         {ws, text, json}, Bin, #{partial_decode => false}
     ),
 
-    %% Verify the decoded message
     ?assertEqual([<<"data1">>, <<"data2">>], Decoded#event.args),
     ?assertEqual(#{<<"meta">> => true}, Decoded#event.kwargs).
 
-
 partial_decode_result_test(_) ->
     M = bondy_wamp_message:result(1, #{}, [42, 43], #{<<"status">> => <<"ok">>}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
 
     {[Decoded], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin),
     ?assertMatch({json, _}, bondy_wamp_message:partial(Decoded)),
 
-    ReEncoded = bondy_wamp_encoding:encode(Decoded, json),
+    ReEncoded = iolist_to_binary(bondy_wamp_encoding:encode(Decoded, json)),
     ?assertEqual(Bin, ReEncoded).
-
 
 partial_decode_invocation_test(_) ->
     M = bondy_wamp_message:invocation(
         1, 2, #{}, [<<"a">>, <<"b">>], #{<<"opt">> => 1}
     ),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
 
     {[Decoded], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin),
     ?assertMatch({json, _}, bondy_wamp_message:partial(Decoded)),
 
-    ReEncoded = bondy_wamp_encoding:encode(Decoded, json),
+    ReEncoded = iolist_to_binary(bondy_wamp_encoding:encode(Decoded, json)),
     ?assertEqual(Bin, ReEncoded).
-
 
 partial_decode_yield_test(_) ->
     M = bondy_wamp_message:yield(1, #{}, [1, 2, 3], #{<<"done">> => true}),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
 
     {[Decoded], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, Bin),
     ?assertMatch({json, _}, bondy_wamp_message:partial(Decoded)),
 
-    ReEncoded = bondy_wamp_encoding:encode(Decoded, json),
+    ReEncoded = iolist_to_binary(bondy_wamp_encoding:encode(Decoded, json)),
     ?assertEqual(Bin, ReEncoded).
-
 
 partial_to_other_encoding_test(_) ->
     %% Test that partial JSON messages can be re-encoded
     M = bondy_wamp_message:call(
         1, #{}, <<"proc">>, [1, 2, 3], #{<<"key">> => <<"val">>}
     ),
-    JsonBin = bondy_wamp_encoding:encode(M, json),
+    JsonBin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
 
-    %% Decode with partial
-    {[PartialMsg], <<>>} = bondy_wamp_encoding:decode({ws, text, json}, JsonBin),
+    {[PartialMsg], <<>>} = bondy_wamp_encoding:decode(
+        {ws, text, json}, JsonBin
+    ),
     ?assertMatch({json, _}, bondy_wamp_message:partial(PartialMsg)),
 
-    %% Re-encode to JSON should work
-    JsonBin2 = bondy_wamp_encoding:encode(PartialMsg, json),
+    JsonBin2 = iolist_to_binary(bondy_wamp_encoding:encode(PartialMsg, json)),
     ?assert(is_binary(JsonBin2)),
 
     %% Verify by decoding fully
@@ -1550,7 +1820,6 @@ partial_to_other_encoding_test(_) ->
     ),
     ?assertEqual([1, 2, 3], FullyDecoded#call.args),
     ?assertEqual(#{<<"key">> => <<"val">>}, FullyDecoded#call.kwargs).
-
 
 %% =============================================================================
 %% SUBPROTOCOL VARIATIONS
@@ -1569,49 +1838,47 @@ raw_binary_subprotocol_test(_) ->
     ),
 
     %% Test with msgpack over raw binary
-    MsgpackBin = bondy_wamp_encoding:encode(M, msgpack),
+    MsgpackBin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
     {[Decoded1], <<>>} = bondy_wamp_encoding:decode(
         {raw, binary, msgpack}, MsgpackBin
     ),
     ?assertEqual(M, Decoded1),
 
     %% Test with erl over raw binary
-    ErlBin = bondy_wamp_encoding:encode(M, erl),
+    ErlBin = iolist_to_binary(bondy_wamp_encoding:encode(M, erl)),
     {[Decoded2], <<>>} = bondy_wamp_encoding:decode({raw, binary, erl}, ErlBin),
     ?assertEqual(M, Decoded2),
 
     %% Test with bert over raw binary
-    BertBin = bondy_wamp_encoding:encode(M, bert),
-    {[Decoded3], <<>>} = bondy_wamp_encoding:decode({raw, binary, bert}, BertBin),
+    BertBin = iolist_to_binary(bondy_wamp_encoding:encode(M, bert)),
+    {[Decoded3], <<>>} = bondy_wamp_encoding:decode(
+        {raw, binary, bert}, BertBin
+    ),
     ?assertEqual(M, Decoded3).
-
 
 %% =============================================================================
 %% ERROR MESSAGE WITH BINARY PAYLOAD
 %% =============================================================================
 
 error_with_args_only_test(_) ->
-    %% Test error message with just args (no kwargs)
-    M = bondy_wamp_message:error(16, 1, #{}, <<"error.uri">>, [<<"error message">>]),
-    Bin = bondy_wamp_encoding:encode(M, json),
+    M = bondy_wamp_message:error(16, 1, #{}, <<"error.uri">>, [
+        <<"error message">>
+    ]),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, json)),
 
     error = bondy_wamp_encoding:decode_message_name({ws, text, json}, Bin),
     {[Decoded], <<>>} = bondy_wamp_encoding:decode(
         {ws, text, json}, Bin, #{partial_decode => false}
     ),
 
-    %% The args should be preserved
     ?assertEqual(M, Decoded).
 
-
 error_with_args_msgpack_test(_) ->
-    %% Test error message with args via msgpack
     M = bondy_wamp_message:error(16, 1, #{}, <<"error.uri">>, [<<"error">>]),
-    Bin = bondy_wamp_encoding:encode(M, msgpack),
+    Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, msgpack)),
 
     {[Decoded], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, Bin),
     ?assertEqual(M, Decoded).
-
 
 %% =============================================================================
 %% ROUNDTRIP TESTS
@@ -1622,32 +1889,33 @@ roundtrip_all_encodings_test(_) ->
     %% Note: Different encodings handle binary/string conversion differently,
     %% so we test encodings individually
 
-    %% JSON roundtrip
     JSONMsg = bondy_wamp_message:result(1, #{}, [42], #{<<"done">> => true}),
-    JSONBin = bondy_wamp_encoding:encode(JSONMsg, json),
+    JSONBin = iolist_to_binary(bondy_wamp_encoding:encode(JSONMsg, json)),
     {[JSONDecoded], <<>>} = bondy_wamp_encoding:decode(
         {ws, text, json}, JSONBin, #{partial_decode => false}
     ),
     ?assertEqual(JSONMsg, JSONDecoded),
 
-    %% Msgpack roundtrip
     MPMsg = bondy_wamp_message:invocation(1, 2, #{}, [1, 2], #{}),
-    MPBin = bondy_wamp_encoding:encode(MPMsg, msgpack),
-    {[MPDecoded], <<>>} = bondy_wamp_encoding:decode({ws, binary, msgpack}, MPBin),
+    MPBin = iolist_to_binary(bondy_wamp_encoding:encode(MPMsg, msgpack)),
+    {[MPDecoded], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, msgpack}, MPBin
+    ),
     ?assertEqual(MPMsg, MPDecoded),
 
-    %% ERL roundtrip
     ERLMsg = bondy_wamp_message:yield(1, #{}, [<<"result">>], #{}),
-    ERLBin = bondy_wamp_encoding:encode(ERLMsg, erl),
-    {[ERLDecoded], <<>>} = bondy_wamp_encoding:decode({ws, binary, erl}, ERLBin),
+    ERLBin = iolist_to_binary(bondy_wamp_encoding:encode(ERLMsg, erl)),
+    {[ERLDecoded], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, erl}, ERLBin
+    ),
     ?assertEqual(ERLMsg, ERLDecoded),
 
-    %% BERT roundtrip
     BERTMsg = bondy_wamp_message:result(1, #{}, [99], #{}),
-    BERTBin = bondy_wamp_encoding:encode(BERTMsg, bert),
-    {[BERTDecoded], <<>>} = bondy_wamp_encoding:decode({ws, binary, bert}, BERTBin),
+    BERTBin = iolist_to_binary(bondy_wamp_encoding:encode(BERTMsg, bert)),
+    {[BERTDecoded], <<>>} = bondy_wamp_encoding:decode(
+        {ws, binary, bert}, BERTBin
+    ),
     ?assertEqual(BERTMsg, BERTDecoded).
-
 
 %% =============================================================================
 %% EDGE CASES
@@ -1667,9 +1935,122 @@ empty_details_options_test(_) ->
     M3 = bondy_wamp_message:result(1, #{}),
     ?assertEqual(M3, bondy_wamp_encoding:unpack(bondy_wamp_encoding:pack(M3))).
 
-
 pack_badarg_test(_) ->
-    %% pack with invalid argument should error
     ?assertError(badarg, bondy_wamp_encoding:pack(invalid)),
     ?assertError(badarg, bondy_wamp_encoding:pack({not_a_wamp_message})),
     ?assertError(badarg, bondy_wamp_encoding:pack(undefined)).
+
+%% A WAMP null is `undefined` in Erlang whichever encoding carried it, so a
+%% value crossing between JSON, CBOR and MessagePack peers keeps it.
+null_maps_alike_across_encodings_test(_) ->
+    Term = [undefined, null, #{<<"k">> => undefined}],
+    Json = bondy_wamp_json:decode(
+        iolist_to_binary(bondy_wamp_json:encode(Term))
+    ),
+    Cbor = bondy_wamp_cbor:decode(
+        iolist_to_binary(bondy_wamp_cbor:encode(Term))
+    ),
+    Msgpack = bondy_msgpack:decode(
+        iolist_to_binary(bondy_msgpack:encode(Term))
+    ),
+    ?assertEqual(Json, Msgpack),
+    ?assertEqual(Cbor, Msgpack).
+
+%% A nil option means the option is absent, so the router accepts a nil
+%% `timeout` from every encoding.
+null_decodes_alike_in_wamp_messages_test(_) ->
+    Call = [48, 1, #{~"timeout" => null}, ~"a.b", [null], #{~"k" => null}],
+    Hello = [
+        1,
+        ~"realm1",
+        #{~"roles" => #{~"caller" => #{}}, ~"authextra" => #{~"k" => null}}
+    ],
+    lists:foreach(
+        fun({Sub, Encode}) ->
+            Enc = element(3, Sub),
+            Full = [
+                {partial_decode, false} | bondy_wamp_encoding:opts(Enc, decode)
+            ],
+            {[C], <<>>} = bondy_wamp_encoding:decode(Sub, Encode(Call), Full),
+            ?assertEqual(
+                {#{}, [undefined], #{~"k" => undefined}},
+                {C#call.options, C#call.args, C#call.kwargs},
+                Enc
+            ),
+            {[RC], <<>>} = bondy_wamp_encoding:decode(Sub, Encode(Call)),
+            ?assertEqual(#{}, RC#call.options, Enc),
+            {[H], <<>>} = bondy_wamp_encoding:decode(Sub, Encode(Hello)),
+            ?assertEqual(
+                #{~"k" => undefined}, maps:get(authextra, H#hello.details), Enc
+            )
+        end,
+        [
+            {{ws, text, json}, fun(T) -> iolist_to_binary(json:encode(T)) end},
+            {{ws, binary, msgpack}, fun(T) ->
+                iolist_to_binary(bondy_msgpack:encode(T))
+            end},
+            {{ws, binary, cbor}, fun(T) ->
+                iolist_to_binary(bondy_cbor:encode(T))
+            end}
+        ]
+    ).
+
+%% A datetime and a key-value list in a payload reach a peer as the same
+%% string and object, whether it negotiated JSON, CBOR or MessagePack.
+in_vm_terms_encode_alike_test(_) ->
+    DT = {{2026, 10, 29}, {1, 2, 3}},
+    Args = [
+        #{~"at" => DT, ~"atf" => {{2026, 10, 29}, {1, 2, 3.5}}},
+        [{a, 1}],
+        #{~"m" => [{~"b", DT}]}
+    ],
+    M = bondy_wamp_message:result(1, #{}, Args),
+    Expected = [
+        #{
+            ~"at" => ~"2026-10-29T01:02:03Z",
+            ~"atf" => ~"2026-10-29T01:02:03.500Z"
+        },
+        #{~"a" => 1},
+        #{~"m" => #{~"b" => ~"2026-10-29T01:02:03Z"}}
+    ],
+    lists:foreach(
+        fun({Sub, Enc}) ->
+            Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, Enc)),
+            Opts = [
+                {partial_decode, false} | bondy_wamp_encoding:opts(Enc, decode)
+            ],
+            {[R], <<>>} = bondy_wamp_encoding:decode(Sub, Bin, Opts),
+            ?assertEqual(Expected, R#result.args, Enc)
+        end,
+        [
+            {{ws, text, json}, json},
+            {{ws, binary, cbor}, cbor},
+            {{ws, binary, msgpack}, msgpack}
+        ]
+    ).
+
+%% A list whose first element is a datetime reaches a peer as a list of
+%% strings, not an object. Lists that mix shapes are not covered.
+datetime_list_encodes_as_strings_test(_) ->
+    DT = {{2026, 10, 29}, {1, 2, 3}},
+    DTf = {{2026, 10, 29}, {1, 2, 3.5}},
+    M = bondy_wamp_message:result(1, #{}, [[DT, DTf], #{~"l" => [DT]}]),
+    Expected = [
+        [~"2026-10-29T01:02:03Z", ~"2026-10-29T01:02:03.500Z"],
+        #{~"l" => [~"2026-10-29T01:02:03Z"]}
+    ],
+    lists:foreach(
+        fun({Sub, Enc}) ->
+            Bin = iolist_to_binary(bondy_wamp_encoding:encode(M, Enc)),
+            Opts = [
+                {partial_decode, false} | bondy_wamp_encoding:opts(Enc, decode)
+            ],
+            {[R], <<>>} = bondy_wamp_encoding:decode(Sub, Bin, Opts),
+            ?assertEqual(Expected, R#result.args, Enc)
+        end,
+        [
+            {{ws, text, json}, json},
+            {{ws, binary, cbor}, cbor},
+            {{ws, binary, msgpack}, msgpack}
+        ]
+    ).

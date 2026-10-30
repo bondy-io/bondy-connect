@@ -1,0 +1,534 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+%%
+%% Proves the secondary-index-writer collapse on the production `main` topology
+%% (`bondy_db_topology_shared_shards`, `instances_strategy => per_shard`): every
+%% index of every table on a secondary shard shares ONE
+%% `bondy_oplog_secondary_writer`, demuxing the dispatched ops back to each
+%% `(NS, IndexName)` stream — the secondary-side mirror of the per-shard primary
+%% instance, which multiplexes tables by entity-type bucket.
+%%
+%% Two tables, each with an index, on the same DB must:
+%%
+%%   1. resolve to exactly `sec_shard_count` writers total — one per
+%%      `(DbName, SecShard)` — NOT `indexes × sec_shards`; both tables' index
+%%      shard-N entries point at the same writer pid;
+%%   2. project each index independently (no cross-stream contamination), with
+%%      the shared writer routing each stream to its own projection;
+%%   3. keep the shared writer alive while any index shard still references its
+%%      `writer_key` (refcounted teardown), stopping it only once the last one
+%%      closes.
+%% =============================================================================
+-module(bondy_db_shared_writer_test).
+
+-include_lib("eunit/include/eunit.hrl").
+
+-define(TOPOLOGY, bondy_db_topology_shared_shards).
+-define(SHARDS, 4).
+-define(DB, shared_writer_db).
+
+shared_writer_test_() ->
+    {foreach, fun setup/0, fun cleanup/1, [
+        gen("one_writer_per_secshard", fun one_writer_per_secshard/1),
+        gen(
+            "independent_index_projections",
+            fun independent_index_projections/1
+        ),
+        gen("refcounted_writer_teardown", fun refcounted_writer_teardown/1),
+        gen(
+            "secondary_sup_restart_keeps_writers",
+            fun secondary_sup_restart_keeps_writers/1
+        ),
+        gen("one_writer_per_writer_key", fun one_writer_per_writer_key/1),
+        gen(
+            "open_during_last_close_of_writer_key",
+            fun open_during_last_close_of_writer_key/1
+        ),
+        gen(
+            "close_discards_buffer_on_shared_writer",
+            fun close_discards_buffer_on_shared_writer/1
+        )
+    ]}.
+
+gen(Title, Fn) ->
+    fun(Ctx) -> {Title, {timeout, 60, fun() -> Fn(Ctx) end}} end.
+
+setup() ->
+    process_flag(trap_exit, true),
+    {ok, _} = application:ensure_all_started(bondy_db),
+    bondy_oplog_sync_scheduler:set_dispatch(undefined),
+    bondy_oplog_gc_scheduler:set_trigger(undefined),
+    Dir = make_tempdir(),
+    {ok, Sup} = bondy_db_leveled_sup:start_link(),
+    {ok, Db} = bondy_db:open(?DB, #{
+        topology => ?TOPOLOGY,
+        topology_opts => #{sup => Sup, dir => Dir},
+        shard_count => ?SHARDS,
+        fold_module => lww_register
+    }),
+    {ok, Users} = bondy_db:open_table(Db, users, #{
+        fold_module => lww_register,
+        indexes => [#{name => by_value, extract => []}]
+    }),
+    {ok, Groups} = bondy_db:open_table(Db, groups, #{
+        fold_module => lww_register,
+        indexes => [#{name => by_value, extract => []}]
+    }),
+    {Db, Users, Groups, Sup, Dir}.
+
+cleanup({Db, _U, _G, Sup, Dir}) ->
+    _ =
+        try
+            bondy_db:close(Db)
+        catch
+            _:_ -> ok
+        end,
+    _ = [
+        try
+            bondy_oplog:stop_instance(I)
+        catch
+            _:_ -> ok
+        end
+     || I <- bondy_oplog:list_instances()
+    ],
+    case is_process_alive(Sup) of
+        true ->
+            _ =
+                try
+                    bondy_db_leveled_sup:stop(Sup)
+                catch
+                    _:_ -> ok
+                end;
+        false ->
+            ok
+    end,
+    rmrf(Dir),
+    rmrf(wal_dir()),
+    ok.
+
+%% =============================================================================
+%% Tests
+%% =============================================================================
+
+%% Two tables, each with an index ⇒ exactly `sec_shard_count` writers, one per
+%% secondary shard, shared across BOTH tables — not `indexes × sec_shards`. Both
+%% tables' shard-N index entries resolve to the same writer pid.
+one_writer_per_secshard({_Db, Users, Groups, _Sup, _Dir}) ->
+    populate(Users, <<"u">>),
+    populate(Groups, <<"g">>),
+    ok = flush_index(Users, by_value),
+    ok = flush_index(Groups, by_value),
+
+    UserPids = writer_pids(Users, by_value),
+    GroupPids = writer_pids(Groups, by_value),
+
+    ?assertEqual(?SHARDS, map_size(UserPids)),
+    ?assertEqual(?SHARDS, map_size(GroupPids)),
+
+    lists:foreach(
+        fun(Shard) ->
+            ?assertEqual(
+                maps:get(Shard, UserPids), maps:get(Shard, GroupPids)
+            )
+        end,
+        lists:seq(0, ?SHARDS - 1)
+    ),
+
+    Distinct = lists:usort(
+        maps:values(UserPids) ++ maps:values(GroupPids)
+    ),
+    ?assertEqual(?SHARDS, length(Distinct)),
+    ?assert(lists:all(fun erlang:is_process_alive/1, Distinct)).
+
+%% Both indexes answer correctly and independently — the shared writer routes
+%% each `(NS, IndexName)` stream to its own projection, with no cross-stream
+%% contamination, even for an identical `(Realm, Key, Term)`.
+independent_index_projections({_Db, Users, Groups, _Sup, _Dir}) ->
+    R = <<"r1">>,
+    %% Same key, same indexed term in both tables.
+    ok = bondy_db:apply(
+        Users, R, <<"k1">>, {set, bondy_db:tick(Users), <<"x">>}
+    ),
+    ok = bondy_db:apply(
+        Groups, R, <<"k1">>, {set, bondy_db:tick(Groups), <<"x">>}
+    ),
+    %% A term only one table holds.
+    ok = bondy_db:apply(
+        Users, R, <<"k2">>, {set, bondy_db:tick(Users), <<"only_users">>}
+    ),
+    ok = flush_index(Users, by_value),
+    ok = flush_index(Groups, by_value),
+
+    %% The shared term resolves to each table's OWN key, not the sibling's.
+    ?assertEqual(
+        {ok, [{<<"k1">>, #{}}]},
+        bondy_db:index_get(Users, R, by_value, <<"x">>, #{})
+    ),
+    ?assertEqual(
+        {ok, [{<<"k1">>, #{}}]},
+        bondy_db:index_get(Groups, R, by_value, <<"x">>, #{})
+    ),
+    %% The users-only term is absent from the groups index stream.
+    ?assertEqual(
+        {ok, [{<<"k2">>, #{}}]},
+        bondy_db:index_get(Users, R, by_value, <<"only_users">>, #{})
+    ),
+    ?assertEqual(
+        {ok, []},
+        bondy_db:index_get(Groups, R, by_value, <<"only_users">>, #{})
+    ).
+
+%% Closing one table leaves its sibling's index fully working AND keeps the
+%% shared writers up (a sibling index shard still references each `writer_key`);
+%% closing the last table stops them.
+refcounted_writer_teardown({_Db, Users, Groups, _Sup, _Dir}) ->
+    populate(Users, <<"u">>),
+    populate(Groups, <<"g">>),
+    ok = flush_index(Users, by_value),
+    ok = flush_index(Groups, by_value),
+
+    Shared = lists:usort(maps:values(writer_pids(Groups, by_value))),
+    ?assertEqual(?SHARDS, length(Shared)),
+    ?assert(lists:all(fun erlang:is_process_alive/1, Shared)),
+
+    %% Drop `users`: `groups`' index shards still reference every writer_key,
+    %% so the shared writers must stay up.
+    ok = bondy_db:close_table(Users),
+    ?assert(lists:all(fun erlang:is_process_alive/1, Shared)),
+
+    %% `groups`' index is unaffected — a fresh write still indexes.
+    ok = bondy_db:apply(
+        Groups,
+        <<"r1">>,
+        <<"post_close">>,
+        {set, bondy_db:tick(Groups), <<"pc">>}
+    ),
+    ok = flush_index(Groups, by_value),
+    ?assertEqual(
+        {ok, [{<<"post_close">>, #{}}]},
+        bondy_db:index_get(Groups, <<"r1">>, by_value, <<"pc">>, #{})
+    ),
+    ?assertEqual(
+        Shared, lists:usort(maps:values(writer_pids(Groups, by_value)))
+    ),
+
+    %% Drop the last table: nothing references the writer_keys now, so the
+    %% shared writers stop.
+    ok = bondy_db:close_table(Groups),
+    ok = wait_until(
+        fun() -> lists:all(fun(P) -> not is_process_alive(P) end, Shared) end,
+        50
+    ),
+    ?assert(lists:all(fun(P) -> not is_process_alive(P) end, Shared)).
+
+%% A restart of `bondy_oplog_secondary_sup` (here a kill; in production the
+%% exhaustion of its restart intensity) takes every writer with it. The
+%% restarted supervisor must drive every registered index shard again, and the
+%% write made while no writer ran must reach the index, which the restarted
+%% writer replays from the primary's intent.
+%% Covers a single restart; a crash loop that exhausts `bondy_oplog_sup` too is
+%% not exercised.
+secondary_sup_restart_keeps_writers({_Db, Users, Groups, _Sup, _Dir}) ->
+    R = <<"r1">>,
+    populate(Users, <<"u">>),
+    populate(Groups, <<"g">>),
+    ok = flush_index(Users, by_value),
+    ok = flush_index(Groups, by_value),
+    Before = lists:usort(maps:values(writer_pids(Users, by_value))),
+
+    ok = sys:suspend(bondy_oplog_sup),
+    SecSup = whereis(bondy_oplog_secondary_sup),
+    Ref = monitor(process, SecSup),
+    exit(SecSup, kill),
+    receive
+        {'DOWN', Ref, process, SecSup, _} -> ok
+    end,
+    ok = bondy_db:apply(
+        Users, R, <<"gap">>, {set, bondy_db:tick(Users), <<"gap">>}
+    ),
+    ok = sys:resume(bondy_oplog_sup),
+    ok = wait_until(
+        fun() ->
+            New = whereis(bondy_oplog_secondary_sup),
+            is_pid(New) andalso New =/= SecSup
+        end,
+        200
+    ),
+    %% The supervisor registers before its `init/1` starts the writers, and a
+    %% call to it returns once that `init/1` has, so every writer has stamped.
+    _ = supervisor:which_children(bondy_oplog_secondary_sup),
+
+    lists:foreach(
+        fun(Table) ->
+            Pids = lists:usort(maps:values(writer_pids(Table, by_value))),
+            ?assertEqual(?SHARDS, length(Pids)),
+            ?assert(lists:all(fun erlang:is_process_alive/1, Pids)),
+            ?assertEqual([], Pids -- live_writers())
+        end,
+        [Users, Groups]
+    ),
+    ?assertNot(lists:any(fun erlang:is_process_alive/1, Before)),
+
+    ok = bondy_db:apply(
+        Groups, R, <<"after">>, {set, bondy_db:tick(Groups), <<"after">>}
+    ),
+    ok = flush_index(Groups, by_value),
+    ?assertEqual(
+        {ok, [{<<"after">>, #{}}]},
+        bondy_db:index_get(Groups, R, by_value, <<"after">>, #{})
+    ),
+    ?assertEqual(
+        ok,
+        wait_until(
+            fun() ->
+                {ok, [{<<"gap">>, #{}}]} =:=
+                    bondy_db:index_get(Users, R, by_value, <<"gap">>, #{})
+            end,
+            500
+        )
+    ).
+
+%% Starting a writer for a `writer_key` that already has one returns the
+%% running writer rather than a second process for the same streams.
+one_writer_per_writer_key({_Db, Users, _Groups, _Sup, _Dir}) ->
+    #{0 := Pid} = writer_pids(Users, by_value),
+    NS = maps:get(namespace, bondy_db:info(Users)),
+    {ok, Entry} = bondy_oplog_core_registry:lookup(NS, by_value, 0),
+    WriterKey = bondy_oplog_core_registry:entry_writer_key(Entry),
+    Live = live_writers(),
+    ?assertEqual(
+        {ok, Pid},
+        bondy_oplog_secondary_sup:start_writer(
+            #{writer_key => WriterKey, shard => 0}
+        )
+    ),
+    ?assertEqual(Live, live_writers()).
+
+%% Opening a table whose index shards share a `writer_key` with a table whose
+%% close is stopping that key's writer. The close is held inside the stop (its
+%% `terminate_child` call waits on the suspended supervisor), after it found the
+%% key unused, and the open is let run until it blocks too. Covers this one
+%% interleaving; an open that reaches the supervisor before the stop is not
+%% forced.
+open_during_last_close_of_writer_key({Db, Users, Groups, _Sup, _Dir}) ->
+    ok = bondy_db:close_table(Groups),
+    SecSup = whereis(bondy_oplog_secondary_sup),
+    ok = sys:suspend(SecSup),
+    Self = self(),
+    _ = spawn_link(fun() -> Self ! {closed, bondy_db:close_table(Users)} end),
+    ok = wait_until(fun() -> queue_len(SecSup) >= 1 end, 200),
+    %% The opener owns the table's registry rows, so it lives until the checks
+    %% below are done.
+    Opener = spawn_link(fun() ->
+        Self ! {opened, bondy_db:open_table(Db, groups, groups_opts())},
+        receive
+            {close, T} -> Self ! {closed_again, bondy_db:close_table(T)}
+        end
+    end),
+    _ = wait_until(fun() -> queue_len(SecSup) >= 2 end, 30),
+    ok = sys:resume(SecSup),
+    Closed =
+        receive
+            {closed, C} -> C
+        after 30000 -> timeout
+        end,
+    Opened =
+        receive
+            {opened, O} -> O
+        after 30000 -> timeout
+        end,
+    ?assertEqual(ok, Closed),
+    ?assertMatch({ok, _}, Opened),
+    {ok, Groups1} = Opened,
+    Pids = maps:values(writer_pids(Groups1, by_value)),
+    ?assert(lists:all(fun erlang:is_process_alive/1, Pids)),
+    ok = bondy_db:apply(
+        Groups1, <<"r1">>, <<"k">>, {set, bondy_db:tick(Groups1), <<"v">>}
+    ),
+    ok = flush_index(Groups1, by_value),
+    ?assertEqual(
+        {ok, [{<<"k">>, #{}}]},
+        bondy_db:index_get(Groups1, <<"r1">>, by_value, <<"v">>, #{})
+    ),
+    Opener ! {close, Groups1},
+    receive
+        {closed_again, ok} -> ok
+    end.
+
+%% A close leaves the shared writers running for `groups`, holding `users`' op
+%% in their buffers (a long `coalesce_ms` keeps them from flushing it). The
+%% close must discard it: the reopen replays the op from the primary's intent
+%% and flushes exactly that one op, the one its in-flight count reserved. A
+%% kept stale copy is flushed too, which the clamped count does not show.
+close_discards_buffer_on_shared_writer({Db, Users0, Groups0, _Sup, _Dir}) ->
+    ok = bondy_db:close_table(Users0),
+    ok = bondy_db:close_table(Groups0),
+    Slow = #{
+        fold_module => lww_register,
+        indexes => [#{name => by_value, extract => [], coalesce_ms => 600000}]
+    },
+    {ok, Users1} = bondy_db:open_table(Db, users, Slow),
+    {ok, Groups} = bondy_db:open_table(Db, groups, Slow),
+    R = <<"r1">>,
+    ok = bondy_db:apply(
+        Users1, R, <<"u1">>, {set, bondy_db:tick(Users1), <<"v">>}
+    ),
+    Shared = lists:usort(maps:values(writer_pids(Groups, by_value))),
+    ok = bondy_db:close_table(Users1),
+    ?assert(lists:all(fun erlang:is_process_alive/1, Shared)),
+    NS = maps:get(namespace, bondy_db:info(Users1)),
+    Flushed = atomics:new(1, []),
+    HandlerId = {?MODULE, flushed, erlang:unique_integer()},
+    ok = telemetry:attach(
+        HandlerId,
+        [bondy_oplog, secondary_writer, flush],
+        fun
+            (
+                _E, #{ops := N}, #{namespace := Ns, index_name := by_value}, _C
+            ) when
+                Ns =:= NS
+            ->
+                atomics:add(Flushed, 1, N);
+            (_E, _M, _Meta, _C) ->
+                ok
+        end,
+        undefined
+    ),
+    {ok, Users2} =
+        try
+            bondy_db:open_table(Db, users, Slow)
+        after
+            telemetry:detach(HandlerId)
+        end,
+    ?assertEqual(1, atomics:get(Flushed, 1)),
+    ?assertEqual(0, inflight(Users2, by_value)),
+    ?assertEqual(
+        {ok, [{<<"u1">>, #{}}]},
+        bondy_db:index_get(Users2, R, by_value, <<"v">>, #{})
+    ),
+    ok = bondy_db:close_table(Users2),
+    ok = bondy_db:close_table(Groups).
+
+%% =============================================================================
+%% Helpers
+%% =============================================================================
+
+queue_len(Pid) ->
+    {message_queue_len, N} = process_info(Pid, message_queue_len),
+    N.
+
+groups_opts() ->
+    #{
+        fold_module => lww_register,
+        indexes => [#{name => by_value, extract => []}]
+    }.
+
+live_writers() ->
+    lists:sort([
+        P
+     || {_, P, _, _} <- supervisor:which_children(bondy_oplog_secondary_sup),
+        is_pid(P)
+    ]).
+
+populate(Table, Tag) ->
+    R = <<"r1">>,
+    lists:foreach(
+        fun(I) ->
+            K = key(I),
+            V = <<Tag/binary, "/", K/binary>>,
+            ok = bondy_db:apply(Table, R, K, {set, bondy_db:tick(Table), V})
+        end,
+        lists:seq(1, 40)
+    ).
+
+%% `#{Shard => WriterPid}` for an index, read off each shard's registry row.
+writer_pids(Table, IndexName) ->
+    Info = bondy_db:info(Table),
+    NS = maps:get(namespace, Info),
+    #{IndexName := #{sec_shard_count := N}} = maps:get(indexes, Info),
+    maps:from_list([
+        begin
+            {ok, Entry} = bondy_oplog_core_registry:lookup(
+                NS, IndexName, Shard
+            ),
+            Pid = bondy_oplog_core_registry:entry_writer_pid(Entry),
+            true = is_pid(Pid),
+            {Shard, Pid}
+        end
+     || Shard <- lists:seq(0, N - 1)
+    ]).
+
+inflight(Table, IndexName) ->
+    Info = bondy_db:info(Table),
+    NS = maps:get(namespace, Info),
+    #{IndexName := #{sec_shard_count := N}} = maps:get(indexes, Info),
+    lists:sum([
+        begin
+            {ok, Entry} = bondy_oplog_core_registry:lookup(
+                NS, IndexName, Shard
+            ),
+            bondy_oplog_core_registry:index_inflight(Entry)
+        end
+     || Shard <- lists:seq(0, N - 1)
+    ]).
+
+flush_index(Table, IndexName) ->
+    Info = bondy_db:info(Table),
+    NS = maps:get(namespace, Info),
+    #{IndexName := #{sec_shard_count := N}} = maps:get(indexes, Info),
+    lists:foreach(
+        fun(Shard) ->
+            {ok, Entry} = bondy_oplog_core_registry:lookup(
+                NS, IndexName, Shard
+            ),
+            Pid = bondy_oplog_core_registry:entry_writer_pid(Entry),
+            true = is_pid(Pid),
+            ok = bondy_oplog_secondary_writer:flush_sync(Pid)
+        end,
+        lists:seq(0, N - 1)
+    ).
+
+wait_until(_Pred, 0) ->
+    timeout;
+wait_until(Pred, N) ->
+    case Pred() of
+        true ->
+            ok;
+        false ->
+            timer:sleep(10),
+            wait_until(Pred, N - 1)
+    end.
+
+key(I) ->
+    iolist_to_binary(io_lib:format("k~4..0b", [I])).
+
+make_tempdir() ->
+    Base = filename:join([
+        "/tmp",
+        "bondy_db_shared_writer_test",
+        integer_to_list(erlang:unique_integer([positive, monotonic]))
+    ]),
+    ok = filelib:ensure_dir(filename:join(Base, ".keep")),
+    Base.
+
+wal_dir() ->
+    filename:join([
+        "/tmp", "bondy_oplog_wal", os:getpid(), atom_to_list(?DB)
+    ]).
+
+rmrf(Dir) ->
+    %% An instance id names ONE directory (`<Db>-<Shard>`), so a DB's
+    %% instances are SIBLINGS rather than children of `<Db>/`. Removing `Dir`
+    %% alone therefore leaves their WAL behind, and the next case in the
+    %% module reads the previous case's rows.
+    _ = [
+        file:del_dir_r(P)
+     || P <- filelib:wildcard(unicode:characters_to_list(Dir) ++ "-*")
+    ],
+    case file:del_dir_r(Dir) of
+        ok -> ok;
+        {error, enoent} -> ok;
+        {error, _} -> ok
+    end.

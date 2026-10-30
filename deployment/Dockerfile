@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.3
+# syntax=docker/dockerfile:1.6
 # =============================================================================
 # SPDX-FileCopyrightText: 2016 - 2026 Leapsight
 # SPDX-License-Identifier: Apache-2.0
@@ -7,20 +7,32 @@
 # =============================================================================
 # Build stage 1
 # =============================================================================
-FROM erlang:27.3.4 AS builder
+FROM erlang:29.1.2 AS builder
 
-# Install build dependencies.
-# libsnappy-dev (headers) is correct HERE — the NIFs that link snappy are
-# compiled in this stage. The runtime stage only needs the shared library.
+# The base image bundles rebar3 3.27.0; the build uses 3.28.0.
+ADD --chmod=755 --checksum=sha256:5a28b1cca082d3b023ec0f5df9d9f9d52557036c6f2a21c1ffa11b93a984dd42 \
+    https://github.com/erlang/rebar3/releases/download/3.28.0/rebar3 \
+    /usr/local/bin/rebar3
+
+# Build dependencies. RocksDB is gone, so the packages that existed only for it
+# are removed: libsnappy-dev (RocksDB linked system snappy), plus libssl-dev and
+# curl (no surviving NIF needs OpenSSL headers, and nothing at build fetches over
+# HTTP). What stays is exactly what the surviving native NIFs need to compile:
+#   - build-essential : gcc/g++/make/patch — crc32cer (C++), lz4 & ezstd (C)
+#   - cmake           : crc32cer's `make nif` invokes cmake — NOT a RocksDB
+#                       leftover (crc32cer backs brod's Kafka CRC32C)
+#   - git             : rebar3 git deps AND crc32cer's cmake ExternalProject
+#                       fetches google/crc32c 1.1.2 at build time
 RUN --mount=type=cache,id=apt,sharing=locked,target=/var/cache/apt apt-get update && \
     apt-get -y install --no-install-recommends \
     build-essential \
     cmake \
-    git \
-    libssl-dev \
-    libsnappy-dev \
-    curl && \
+    git && \
     rm -rf /var/lib/apt/lists/*
+
+# google/crc32c 1.1.2 ships a pre-3.5 CMakeLists; give modern cmake a policy floor
+# so crc32cer's ExternalProject configures.
+ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 
 WORKDIR /bondy/src
 
@@ -37,15 +49,11 @@ RUN rebar3 as docker tar && \
 # =============================================================================
 # Build stage 2
 # =============================================================================
-# debian trixie (Debian 13). `debian:stable-slim` rolled from bookworm to
-# trixie, so watch the Debian 13 security tracker for this image.
-#
-# For reproducible, audit-friendly builds, pin the base by digest instead of
-# the floating tag, e.g.:
-#   FROM debian:trixie-slim@sha256:<digest> AS runner
-# You can get the current digest with:
-#   docker buildx imagetools inspect debian:trixie-slim
-FROM debian:trixie-slim AS runner
+# Debian 13 (trixie), pinned to a dated snapshot so a rebuild starts from a
+# known base; `apt-get upgrade` below then adds the security updates published
+# since. Move the snapshot forward with the `erlang:` tag above, and check the
+# result with `docker scout cves`.
+FROM debian:trixie-20261005-slim AS runner
 
 # We define defaults
 # We assume you have DNS. Erlang will take the FQDN and generate
@@ -70,9 +78,21 @@ ENV HOME "/bondy"
 #
 #   - bash      : entrypoint / relx boot scripts
 #   - procps    : ps, top, free, kill, sysctl, etc. (ops diagnostics)
-#   - iproute2  : ip, ss (replaces the deprecated net-tools)
 #   - openssl   : required by the Erlang crypto application
-#   - libsnappy1v5 : runtime shared lib for snappy compression (not the -dev headers)
+#   - libstdc++6 : runtime C++ stdlib for the crc32cer NIF (google/crc32c is
+#                 C++). It USED to arrive transitively via libsnappy1v5 (also
+#                 C++); with RocksDB/snappy removed it must be requested
+#                 explicitly or the Kafka CRC32C NIF fails to load.
+#   - ca-certificates : the OS trust store. The SMTP relay and the SDK's TLS
+#                 transports read only `public_key:cacerts_get/0`, which raises
+#                 `failed_load_cacerts` when there is none. Debian's
+#                 20250419+deb13u1 still ships emSign Root CA - C1 and emSign
+#                 ECC Root CA - C3, which Mozilla distrusted in October 2026,
+#                 so both are deselected before `update-ca-certificates`.
+#
+# Removed with RocksDB:
+#   - libsnappy1v5 : RocksDB was the only consumer of system snappy; no
+#                 surviving NIF links it (lz4/ezstd vendor their own sources).
 #
 # Deliberately NOT installed (each removed a CVE class):
 #   - sudo      : container runs as the single non-root `bondy` user; no use for
@@ -81,21 +101,43 @@ ENV HOME "/bondy"
 #                 several MEDIUM findings with NO upstream fix. Bondy resolves
 #                 DNS via the Erlang runtime; dig/nslookup are not needed.
 #   - nano      : editor, not needed in a production image (2 CVEs).
-#   - net-tools : deprecated; superseded by iproute2.
+#   - iproute2  : ip, ss. Its libtirpc dependency carries two MEDIUMs with no
+#                 Debian fix; inspect sockets from the host instead.
+#   - net-tools : deprecated.
 #
 # `apt-get upgrade` ensures base-image packages pick up Debian security updates
 # (glibc, systemd, libcap2, nghttp2, ...) rather than staying frozen at the
 # versions cached in the base layer.
+#
+# The four VOLUME paths (etc, data, log, tmp) MUST exist in the image and be
+# owned by `bondy` BEFORE the VOLUME instruction below. Docker creates a missing
+# mountpoint as root:root 0755 at container-create time, and this image runs as
+# the unprivileged `bondy` user — so an image without them boots into
+# `filelib:ensure_path/1` failing on `/bondy/data/bondy_db/main` (surfaced by
+# `bondy_namespace_catalog` as `{badmatch,{error,enoent}}`; ensure_path/1 reports
+# the underlying EACCES as `enoent`). When the mountpoint DOES exist, Docker
+# seeds the anonymous volume from it and carries its ownership over.
+#
+# `/bondy/run` is created here for the opposite reason: it holds the internal
+# admin listener's Unix domain socket and must stay on the container's own
+# filesystem, so it is deliberately NOT a VOLUME (see the VOLUME line below).
+# It still has to be created and chowned here — `/bondy` itself is root:root
+# 0755, so the `bondy` uid cannot create a child of it at runtime.
 RUN apt-get update && \
     apt-get -y upgrade && \
     apt-get -y install --no-install-recommends \
-        bash procps iproute2 openssl libsnappy1v5 \
+        bash procps openssl libstdc++6 ca-certificates \
+    && sed -i \
+        -e 's|^mozilla/emSign_Root_CA_-_C1.crt$|!&|' \
+        -e 's|^mozilla/emSign_ECC_Root_CA_-_C3.crt$|!&|' \
+        /etc/ca-certificates.conf \
+    && update-ca-certificates --fresh \
     && apt-get -y autoremove && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 1000 -r bondy \
     && useradd -u 1000 -r -g bondy -d /bondy -s /bin/bash -c "bondy" bondy \
-    && mkdir -p /bondy/etc \
-    && chown bondy:bondy /bondy/etc
+    && mkdir -p /bondy/etc /bondy/data /bondy/log /bondy/tmp /bondy/run \
+    && chown bondy:bondy /bondy/etc /bondy/data /bondy/log /bondy/tmp /bondy/run
 
 WORKDIR /bondy
 
@@ -124,6 +166,14 @@ EXPOSE 18086/tcp
 
 # The pre_start script will hardcode the following paths i.e. ignoring the
 # user-defined environment variables (BONDY_*_DIR)
+#
+# `/bondy/run` is NOT in this list and must not be added to it. It holds the
+# internal admin listener's Unix domain socket, and several filesystems an
+# operator can legitimately mount reject an AF_UNIX bind with ENOTSUP (NFS,
+# SMB/CIFS, 9p, some FUSE CSI drivers, gVisor's gofer). Declaring it a VOLUME
+# invites exactly the mount that breaks the node's control endpoint. With a
+# read-only root filesystem, mount an emptyDir/tmpfs there instead — both
+# accept the bind.
 VOLUME ["/bondy/etc", "/bondy/data", "/bondy/log", "/bondy/tmp"]
 
-ENTRYPOINT ["bondy", "foreground"]
+ENTRYPOINT ["bondy-connect", "foreground"]

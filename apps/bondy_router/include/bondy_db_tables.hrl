@@ -1,0 +1,44 @@
+%% =============================================================================
+%% BONDY DB TABLE NAMES + MARKERS
+%% =============================================================================
+
+-define(EOT, '$end_of_table').
+-define(TOMBSTONE, '$deleted').
+
+%% These atoms are the bondy_db logical table names. They are persisted as part
+%% of the on-disk layout, so changing them requires migrating existing data.
+-define(BONDY_DB_REALM_TAB, bondy_realm).
+%% The realm's signing/encryption key material, stored OUT of the realm
+%% identity cell (see `bondy_realm`): the realm's bondy_db identity/digest is its
+%% Uri + config, never the volatile random key bytes.
+-define(BONDY_DB_REALM_KEYS_TAB, bondy_realm_keys).
+-define(BONDY_DB_USER_TAB, security_users).
+-define(BONDY_DB_GROUP_TAB, security_groups).
+-define(BONDY_DB_GROUP_MEMBERS_TAB, security_group_members).
+-define(BONDY_DB_GROUP_GRANT_TAB, security_group_grants).
+-define(BONDY_DB_USER_GRANT_TAB, security_user_grants).
+-define(BONDY_DB_SOURCE_TAB, security_sources).
+-define(BONDY_DB_TICKET_TAB, bondy_ticket).
+-define(BONDY_DB_OAUTH_TOKEN_TAB, bondy_oauth_token).
+%% Interface metadata (procedure/topic/error descriptions and schemas), read
+%% through WAMP Interface Reflection. Keyed per realm by {Kind, MatchPolicy,
+%% Uri} — a URI, never a registration; the registry does not know it exists.
+-define(BONDY_DB_INTERFACE_TAB, bondy_interface).
+%% MCP overlay documents (`bondy_mcp_gateway`): one key per loaded document,
+%% flat bucket, source-map values — the MCP-facing naming/annotation layer
+%% joined with `bondy_interface` at manifest compile time.
+-define(BONDY_DB_MCP_GATEWAY_TAB, mcp_gateway).
+%% Upstream MCP tool pins (`bondy_mcp_upstream`): one key per
+%% {UpstreamName, ToolName} banded by realm, the value the pinned tool
+%% definition and its canonical-JSON content hash. Read on every
+%% projection pass to gate registration on drift.
+-define(BONDY_DB_MCP_UPSTREAM_TAB, mcp_upstream).
+-define(BONDY_DB_REGISTRY_ACTOR, '$bondy_registry').
+
+%% REGISTRY
+%% The RIB (Routing Information Base) summary tables — the replicated
+%% routing cells: one cell per (Realm, MatchPolicy, Uri, Node), written
+%% only by Node. Maintained by bondy_registry_rib. A cell holds Node's latest
+%% reading of its live local count.
+-define(BONDY_DB_REGISTRATION_RIB_TAB, bondy_rib_registrations).
+-define(BONDY_DB_SUBSCRIPTION_RIB_TAB, bondy_rib_subscriptions).

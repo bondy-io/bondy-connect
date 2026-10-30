@@ -1,62 +1,105 @@
-aae.data_exchange_timeout = 1m
-aae.enabled = on
-aae.exchange_timer = 1m
-aae.hashtree_timer = 10s
-aae.hashtree_ttl = 1w
+log.handlers.default.level = info
+log.level = info
 
-admin_api.http.acceptors_pool_size = 200
-admin_api.http.backlog = 1024
-admin_api.http.enabled = on
-admin_api.http.keepalive = off
-admin_api.http.max_connections = 250000
-admin_api.http.nodelay = on
-admin_api.http.port = 18181
 
-admin_api.https.acceptors_pool_size = 200
-admin_api.http.backlog = 1024
-admin_api.https.enabled = off
-admin_api.https.keepalive = off
-admin_api.https.max_connections = 250000
-admin_api.https.backlog = 18184
+## `admin` is the reserved name for the node's administrable listener: an
+## operator declares it under this name rather than the historical
+## `admin_api_http`, or the manager injects its own default in its place.
+listeners.admin.transport = tcp
+listeners.admin.protocol = http
+listeners.admin.port = 18181
+listeners.admin.start_phase = early
+listeners.admin.services = admin_api, wamp_ws, admin, metrics
+listeners.admin.acceptors_pool_size = 200
+listeners.admin.max_connections = 500000
 
-api_gateway.config_file = ${BONDY_ETC_DIR}/api_gateway_config.json
-api_gateway.http.acceptors_pool_size = 200
-api_gateway.http.backlog = 4096
-api_gateway.http.keepalive = off
-api_gateway.http.max_connections = 500000
-api_gateway.http.nodelay = on
-api_gateway.http.port = 18180
+## Socket options go directly on `listeners.admin.*`, Cowboy ones under
+## `listeners.admin.http.*`.
+##
+## `http.idle_timeout` and `http.active_n` are stated explicitly because
+## Cowboy's own defaults differ from the values this listener has always run
+## with: 60s rather than 15s, and `active_n` 1 rather than 100
+## (`cowboy_http.erl:214,336`).
+listeners.admin.backlog = 65535
+listeners.admin.keepalive = off
+listeners.admin.reuseport = on
+listeners.admin.http.max_keepalive = 1000
+listeners.admin.http.linger.timeout = 1s
+listeners.admin.http.buffer.min = 1KB
+listeners.admin.http.buffer.max = 128KB
+listeners.admin.http.idle_timeout = 15s
+listeners.admin.http.active_n = 100
 
-api_gateway.https.acceptors_pool_size = 200
-api_gateway.https.backlog = 4096
-api_gateway.https.keepalive = off
-api_gateway.https.max_connections = 500000
-api_gateway.https.nodelay = on
-api_gateway.https.port = 18183
+listeners.admin_api_https.transport = tls
+listeners.admin_api_https.protocol = http
+listeners.admin_api_https.port = 18184
+listeners.admin_api_https.start_phase = early
+listeners.admin_api_https.services = admin_api, wamp_ws, admin, metrics
+
+listeners.admin_api_https.acceptors_pool_size = 200
+listeners.admin_api_https.keepalive = off
+listeners.admin_api_https.max_connections = 250000
+listeners.admin_api_https.backlog = 4096
+listeners.admin_api_https.tls.cacertfile = ${BONDY_ETC_DIR}/ssl/server/cacert.pem
+listeners.admin_api_https.tls.certfile = ${BONDY_ETC_DIR}/ssl/server/keycert.pem
+listeners.admin_api_https.tls.keyfile = ${BONDY_ETC_DIR}/ssl/server/key.pem
+
+api_gateway.config_file = ${BONDY_ETC_DIR}/api_spec.json
+
+listeners.api_gateway_http.transport = tcp
+listeners.api_gateway_http.protocol = http
+listeners.api_gateway_http.port = 18180
+listeners.api_gateway_http.services = api_gateway, wamp_ws, wamp_sse, wamp_longpoll
+## `ip` is read from the listener's own block by `resolve_ip/3`, and takes a
+## literal address — `inet:parse_address/1`, so not a hostname.
+#listeners.api_gateway_http.ip = ::1
+#listeners.api_gateway_http.ip_version = 6
+
+listeners.api_gateway_http.acceptors_pool_size = 200
+listeners.api_gateway_http.backlog = 4096
+listeners.api_gateway_http.keepalive = off
+listeners.api_gateway_http.max_connections = 500000
+listeners.api_gateway_http.nodelay = on
+
+listeners.api_gateway_https.transport = tls
+listeners.api_gateway_https.protocol = http
+listeners.api_gateway_https.port = 18183
+listeners.api_gateway_https.services = api_gateway, wamp_ws, wamp_sse, wamp_longpoll
+
+listeners.api_gateway_https.tls.cacertfile = ${BONDY_ETC_DIR}/ssl/server/cacert.pem
+listeners.api_gateway_https.tls.certfile = ${BONDY_ETC_DIR}/ssl/server/keycert.pem
+listeners.api_gateway_https.tls.keyfile = ${BONDY_ETC_DIR}/ssl/server/key.pem
 
 broker_bridge.config_file = ${BONDY_ETC_DIR}/broker_bridge_config.json
-broker_bridge.kafka.clients.default.allow_topic_auto_creation = on
-broker_bridge.kafka.clients.default.auto_start_producers = on
-broker_bridge.kafka.clients.default.endpoints = [{"127.0.0.1", 9092}]
-broker_bridge.kafka.clients.default.max_metadata_sock_retry = 5
-broker_bridge.kafka.clients.default.producer.partition_restart_delay_seconds = 2s
-broker_bridge.kafka.clients.default.producer.required_acks = 1
-broker_bridge.kafka.clients.default.producer.topic_restart_delay_seconds = 10s
-broker_bridge.kafka.clients.default.reconnect_cool_down_seconds = 10s
-broker_bridge.kafka.clients.default.restart_delay_seconds = 10s
 broker_bridge.kafka.enabled = off
-broker_bridge.kafka.topics.wamp_events = com.leapsight.wamp.events
+
+# broker_bridge.kafka.clients.default.allow_topic_auto_creation = on
+# broker_bridge.kafka.clients.default.auto_start_producers = on
+# broker_bridge.kafka.clients.default.endpoints = [{"127.0.0.1", 9092}]
+# broker_bridge.kafka.clients.default.max_metadata_sock_retry = 5
+# broker_bridge.kafka.clients.default.producer.partition_restart_delay_seconds = 2s
+# broker_bridge.kafka.clients.default.producer.required_acks = 1
+# broker_bridge.kafka.clients.default.producer.topic_restart_delay_seconds = 10s
+# broker_bridge.kafka.clients.default.reconnect_cool_down_seconds = 10s
+# broker_bridge.kafka.clients.default.restart_delay_seconds = 10s
+
+# broker_bridge.kafka.topics.wamp_events = com.leapsight.wamp.events
 
 cluster.automatic_leave = off
 cluster.parallelism = 1
+#cluster.listen_addrs = 192.168.50.174:18186
 cluster.peer_port = 18186
-cluster.peer_discovery.enabled = off
+cluster.peer_discovery.enabled = on
+cluster.peer_discovery.type = list
+cluster.peer_discovery.config.addresses = [bondy1@127.0.0.1:18086]
 cluster.peer_discovery.polling_interval = 10s
 cluster.peer_discovery.initial_delay = 1s
 cluster.peer_discovery.timeout = 5s
-cluster.peer_discovery.type = list
-cluster.peer_discovery.config.addresses = [bondy1@127.0.0.1:18086]
+
 cluster.tls.enabled = off
+## Loopback dev/test cluster: acknowledge the plaintext peer plane so the
+## startup guard warns instead of refusing. Never use off a trusted network.
+cluster.tls.allow_insecure = on
 cluster.tls.server.cacertfile = ${BONDY_ETC_DIR}/ssl/server/cacert.pem
 cluster.tls.server.certfile = ${BONDY_ETC_DIR}/ssl/server/keycert.pem
 cluster.tls.server.keyfile = ${BONDY_ETC_DIR}/ssl/server/key.pem
@@ -68,9 +111,12 @@ cluster.tls.client.keyfile = ${BONDY_ETC_DIR}/ssl/client/key.pem
 cluster.tls.client.versions = 1.2,1.3
 cluster.tls.client.verify = verify_none
 
-erlang.async_threads = 64
-erlang.max_ports = 65536
+vm.async_thread.number = 64
+## No vm.port.limit: the historical `erlang.max_ports = 65536` never reached
+## the VM, and 65536 would cap total ports below the max_connections this file
+## declares. The erts default is what this node has been running with.
 load_regulation.router.pool.capacity = 1000000
+
 
 oauth2.client_credentials_grant.duration = 15m
 oauth2.code_grant.duration = 10m
@@ -78,35 +124,99 @@ oauth2.config_file = ${BONDY_ETC_DIR}/oauth2_config.json
 oauth2.password_grant.duration = 15m
 oauth2.refresh_token.duration = 30d
 oauth2.refresh_token.length = 40
-platform_data_dir = ./data
-platform_etc_dir = ./etc
-platform_log_dir = ./log
-platform_tmp_dir = ./tmp
+# platform_data_dir = ./data
+# platform_etc_dir = ./etc
+# platform_log_dir = ./log
+# platform_tmp_dir = ./tmp
 security.allow_anonymous_user = on
 security.automatically_create_realms = off
 security.config_file = ${BONDY_ETC_DIR}/security_config.json
 shutdown.grace_period = 5s
-store.open_retries_delay = 2s
-store.open_retry_Limit = 30
-store.partitions = 16
-store.shard_by = prefix
-startup.wait_for_store_partitions = on
-startup.wait_for_store_hashtrees = on
-startup.wait_for_store_aae_exchange = off
-wamp.tcp.acceptors_pool_size = 200
-wamp.tcp.backlog = 1024
-wamp.tcp.enabled = on
-wamp.tcp.keepalive = on
-wamp.tcp.max_connections = 100000
-wamp.tcp.nodelay = on
-wamp.tcp.port = 18182
-wamp.tls.acceptors_pool_size = 200
-wamp.tls.backlog = 1024
-wamp.tls.cacertfile = ${BONDY_ETC_DIR}/cacert.pem
-wamp.tls.certfile = ${BONDY_ETC_DIR}/cert.pem
-wamp.tls.enabled = off
-wamp.tls.keepalive = on
-wamp.tls.keyfile = ${BONDY_ETC_DIR}/key.pem
-wamp.tls.max_connections = 100000
-wamp.tls.nodelay = on
-wamp.tls.port = 18185
+
+listeners.wamp_tcp.transport = tcp
+listeners.wamp_tcp.protocol = wamp_rawsocket
+listeners.wamp_tcp.port = 18182
+
+listeners.wamp_tcp.acceptors_pool_size = 200
+listeners.wamp_tcp.backlog = 1024
+listeners.wamp_tcp.keepalive = on
+listeners.wamp_tcp.max_connections = 100000
+listeners.wamp_tcp.nodelay = on
+## Lingering off. Stated explicitly because the default is 1s: `-1` is the
+## "do not linger" value, where `0` means abort the connection on close and
+## discard anything unsent.
+listeners.wamp_tcp.linger.timeout = -1
+
+listeners.wamp_tls.transport = tls
+listeners.wamp_tls.protocol = wamp_rawsocket
+listeners.wamp_tls.port = 18185
+
+listeners.wamp_tls.acceptors_pool_size = 200
+listeners.wamp_tls.backlog = 1024
+listeners.wamp_tls.tls.cacertfile = ${BONDY_ETC_DIR}/ssl/server/cacert.pem
+listeners.wamp_tls.tls.certfile = ${BONDY_ETC_DIR}/ssl/server/keycert.pem
+listeners.wamp_tls.tls.keyfile = ${BONDY_ETC_DIR}/ssl/server/key.pem
+listeners.wamp_tls.keepalive = on
+listeners.wamp_tls.max_connections = 100000
+listeners.wamp_tls.nodelay = on
+listeners.wamp_tls.tls.versions = 1.2,1.3
+listeners.wamp_tls.tls.verify = verify_none
+
+
+
+
+listeners.admin.websocket.compression_enabled = on
+listeners.admin_api_https.websocket.compression_enabled = on
+listeners.api_gateway_http.websocket.compression_enabled = on
+listeners.api_gateway_https.websocket.compression_enabled = on
+
+listeners.bridge_relay_tcp.transport = tcp
+listeners.bridge_relay_tcp.protocol = bridge_relay
+listeners.bridge_relay_tcp.port = 18192
+listeners.bridge_relay_tcp.enabled = off
+
+listeners.bridge_relay_tls.transport = tls
+listeners.bridge_relay_tls.protocol = bridge_relay
+listeners.bridge_relay_tls.port = 18193
+
+listeners.bridge_relay_tls.tls.cacertfile = ${BONDY_ETC_DIR}/ssl/server/cacert.pem
+listeners.bridge_relay_tls.tls.certfile = ${BONDY_ETC_DIR}/ssl/server/keycert.pem
+listeners.bridge_relay_tls.tls.keyfile = ${BONDY_ETC_DIR}/ssl/server/key.pem
+listeners.bridge_relay_tls.idle_timeout = 30s
+
+
+
+listeners.wamp_tcp.proxy_protocol = off
+listeners.wamp_tcp.proxy_protocol.mode = relaxed
+listeners.api_gateway_http.proxy_protocol = on
+listeners.api_gateway_http.proxy_protocol.mode = relaxed
+
+listeners.admin.proxy_protocol = on
+listeners.admin.proxy_protocol.mode = relaxed
+
+
+vm.io.dirty_scheduler.number = 128
+
+
+security.ticket.max_expiry_time = 30d
+security.ticket.expiry_time = 30d
+security.ticket.scope.local.persistence = on
+security.ticket.scope.sso.persistence = on
+security.ticket.scope.client_local.persistence = on
+security.ticket.scope.client_sso.persistence = on
+security.ticket.allow_not_found = on
+security.ticket.authmethods = all
+
+security.oidc.providers.oidc-mock.client_id=${OIDC_CLIENT_ID}
+security.oidc.providers.oidc-mock.client_secret=${OIDC_CLIENT_SECRET}
+security.oidc.providers.oidc-mock.redirect_path=/oidc/oidc-mock/callback
+security.oidc.providers.oidc-mock.login_path=/oidc/login
+
+
+## Distributed tracing: export spans to the monitoring stack Tempo
+## (monitoring/docker-compose.yml, OTLP/HTTP on the schema default
+## endpoint http://localhost:4318) and mint a W3C trace context at the
+## router boundary for CALLs whose caller attached none.
+tracing.otlp.enabled = on
+tracing.mint.enabled = on
+tracing.service_name = bondy-connect-node2

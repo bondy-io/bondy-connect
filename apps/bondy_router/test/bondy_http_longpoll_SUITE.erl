@@ -1,0 +1,454 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_http_longpoll_SUITE).
+-moduledoc """
+Test suite for HTTP-Longpoll transport infrastructure.
+
+Tests the longpoll transport at the Erlang API level: protocol initialisation,
+poll_receive blocking/timeout, message delivery via queue and sync replies,
+subprotocol validation, and encoding round-trips.
+""".
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
+-include("bondy.hrl").
+
+-compile([nowarn_export_all, export_all]).
+
+all() ->
+    [
+        subprotocol_validation,
+        encoding_roundtrip,
+        open_and_init_protocol,
+        poll_receive_empty_timeout,
+        poll_receive_queue_messages,
+        poll_receive_buffered_replies,
+        poll_receive_wakeup_on_enqueue,
+        poll_receive_sync_reply_wakeup,
+        close_transport,
+        send_unknown_transport,
+        queued_message_precedes_later_synchronous_reply,
+        open_refuses_a_non_object_body
+    ].
+
+init_per_suite(Config) ->
+    bondy_ct:start_bondy(),
+    Config.
+
+end_per_suite(Config) ->
+    {save_config, Config}.
+
+init_per_testcase(_TestCase, Config) ->
+    bondy_config:set([http_transport, queue, max_messages], 1000),
+    bondy_config:set([http_transport, queue, max_bytes], 10485760),
+    bondy_config:set([http_transport, queue, message_ttl], 300000),
+    bondy_config:set([http_transport, idle_timeout], 3600000),
+    Config.
+
+end_per_testcase(_TestCase, _Config) ->
+    ok.
+
+%% =============================================================================
+%% TEST CASES
+%% =============================================================================
+
+subprotocol_validation(_Config) ->
+    ?assertMatch(
+        {ok, {http_longpoll, text, json}},
+        bondy_wamp_protocol:validate_subprotocol({http_longpoll, text, json})
+    ),
+
+    ?assertMatch(
+        {error, invalid_subprotocol},
+        bondy_wamp_protocol:validate_subprotocol({http_longpoll, text, msgpack})
+    ).
+
+encoding_roundtrip(_Config) ->
+    Msg = #event{
+        subscription_id = 100,
+        publication_id = 200,
+        details = #{},
+        args = [<<"hello">>],
+        kwargs = undefined
+    },
+
+    Bin = bondy_wamp_encoding:encode(Msg, json),
+    ?assert(is_binary(Bin)),
+
+    %% Decode using the http_longpoll subprotocol (disable partial decode
+    %% so the args are fully decoded for comparison)
+    {[DecodedMsg], <<>>} = bondy_wamp_encoding:decode(
+        {http_longpoll, text, json}, Bin, [{partial_decode, false}]
+    ),
+    ?assertEqual(Msg, DecodedMsg).
+
+open_and_init_protocol(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<>>,
+    SessionId = bondy_session_id:new(),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+    ?assert(is_pid(Pid)),
+
+    Subprotocol = {http_longpoll, text, json},
+    Peer = {{127, 0, 0, 1}, 12345},
+    ?assertEqual(
+        ok,
+        bondy_http_transport_session:init_protocol(Pid, Subprotocol, Peer)
+    ),
+
+    ?assertEqual(json, bondy_http_transport_session:encoding(Pid)),
+
+    ok = bondy_http_transport_session:close(Pid).
+
+poll_receive_empty_timeout(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<>>,
+    SessionId = bondy_session_id:new(),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+    ok = bondy_http_transport_session:init_protocol(
+        Pid, {http_longpoll, text, json}, {{127, 0, 0, 1}, 12345}
+    ),
+
+    T0 = erlang:system_time(millisecond),
+    Result = bondy_http_transport_session:poll_receive(Pid, 200),
+    T1 = erlang:system_time(millisecond),
+
+    ?assertEqual({ok, {messages, []}}, Result),
+    %% Should have waited approximately 200ms
+    Elapsed = T1 - T0,
+    ?assert(Elapsed >= 150),
+
+    ok = bondy_http_transport_session:close(Pid).
+
+poll_receive_queue_messages(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<>>,
+    SessionId = bondy_session_id:new(),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+    ok = bondy_http_transport_session:init_protocol(
+        Pid, {http_longpoll, text, json}, {{127, 0, 0, 1}, 12345}
+    ),
+
+    Msg1 = make_event(1),
+    Msg2 = make_event(2),
+    ok = bondy_http_transport_queue:enqueue(TransportId, Msg1, #{}),
+    ok = bondy_http_transport_queue:enqueue(TransportId, Msg2, #{}),
+
+    Result = bondy_http_transport_session:poll_receive(Pid, 5000),
+    ?assertMatch({ok, {messages, [_ | _]}}, Result),
+
+    {ok, {messages, Msgs}} = Result,
+    ?assert(length(Msgs) >= 1),
+    ?assertEqual(Msg1, hd(Msgs)),
+
+    ok = bondy_http_transport_session:close(Pid).
+
+poll_receive_buffered_replies(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<>>,
+    SessionId = bondy_session_id:new(),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+    ok = bondy_http_transport_session:init_protocol(
+        Pid, {http_longpoll, text, json}, {{127, 0, 0, 1}, 12345}
+    ),
+
+    RealmTestUri = <<"com.leapsight.test.longpoll_buffering">>,
+    _ = bondy_realm:create(RealmTestUri),
+    ok = bondy_realm:disable_security(RealmTestUri),
+
+    HelloBin = bondy_wamp_encoding:encode(
+        #hello{
+            realm_uri = RealmTestUri,
+            details = #{
+                <<"roles">> => #{
+                    <<"caller">> => #{},
+                    <<"subscriber">> => #{}
+                }
+            }
+        },
+        json
+    ),
+
+    ok = bondy_http_transport_session:handle_client_message(Pid, HelloBin),
+
+    Result = bondy_http_transport_session:poll_receive(Pid, 5000),
+    ?assertMatch({ok, {replies, [_ | _]}}, Result),
+
+    {ok, {replies, [ReplyBin | _]}} = Result,
+    {[Decoded], <<>>} = bondy_wamp_encoding:decode(
+        {http_longpoll, text, json}, ReplyBin
+    ),
+    ?assert(is_record(Decoded, welcome) orelse is_record(Decoded, abort)),
+
+    ok = bondy_http_transport_session:close(Pid).
+
+poll_receive_wakeup_on_enqueue(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<>>,
+    SessionId = bondy_session_id:new(),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+    ok = bondy_http_transport_session:init_protocol(
+        Pid, {http_longpoll, text, json}, {{127, 0, 0, 1}, 12345}
+    ),
+
+    Self = self(),
+    Poller = spawn_link(fun() ->
+        Result = bondy_http_transport_session:poll_receive(Pid, 10000),
+        Self ! {poll_result, Result}
+    end),
+
+    %% Give the poller time to register its poll_from
+    timer:sleep(100),
+
+    Msg = make_event(42),
+    ok = bondy_http_transport_queue:enqueue(TransportId, Msg, #{}),
+    bondy_http_transport_session:notify_enqueue(TransportId),
+
+    receive
+        {poll_result, Result} ->
+            ?assertMatch({ok, {messages, [_ | _]}}, Result),
+            {ok, {messages, [ReceivedMsg | _]}} = Result,
+            ?assertEqual(Msg, ReceivedMsg)
+    after 5000 ->
+        exit(Poller, kill),
+        ct:fail("Poller did not receive message after enqueue notification")
+    end,
+
+    ok = bondy_http_transport_session:close(Pid).
+
+poll_receive_sync_reply_wakeup(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<>>,
+    SessionId = bondy_session_id:new(),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+    ok = bondy_http_transport_session:init_protocol(
+        Pid, {http_longpoll, text, json}, {{127, 0, 0, 1}, 12345}
+    ),
+
+    RealmTestUri = <<"com.leapsight.test.longpoll_sync_wakeup">>,
+    _ = bondy_realm:create(RealmTestUri),
+    ok = bondy_realm:disable_security(RealmTestUri),
+
+    Self = self(),
+    _Poller = spawn_link(fun() ->
+        Result = bondy_http_transport_session:poll_receive(Pid, 10000),
+        Self ! {poll_result, Result}
+    end),
+
+    %% Give the poller time to register its poll_from
+    timer:sleep(100),
+
+    HelloBin = bondy_wamp_encoding:encode(
+        #hello{
+            realm_uri = RealmTestUri,
+            details = #{
+                <<"roles">> => #{
+                    <<"caller">> => #{}
+                }
+            }
+        },
+        json
+    ),
+    ok = bondy_http_transport_session:handle_client_message(Pid, HelloBin),
+
+    receive
+        {poll_result, Result} ->
+            ?assertMatch({ok, {replies, [_ | _]}}, Result),
+            {ok, {replies, [ReplyBin | _]}} = Result,
+            {[Decoded], <<>>} = bondy_wamp_encoding:decode(
+                {http_longpoll, text, json}, ReplyBin
+            ),
+            ?assert(
+                is_record(Decoded, welcome) orelse is_record(Decoded, abort)
+            )
+    after 5000 ->
+        ct:fail("Poller did not receive sync reply wakeup")
+    end,
+
+    ok = bondy_http_transport_session:close(Pid).
+
+close_transport(_Config) ->
+    TransportId = make_transport_id(),
+    RealmUri = <<>>,
+    SessionId = bondy_session_id:new(),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, RealmUri, SessionId
+    ),
+
+    ok = bondy_http_transport_session:close(TransportId),
+    timer:sleep(100),
+
+    ?assertNot(erlang:is_process_alive(Pid)),
+    ?assertEqual(
+        undefined,
+        bondy_http_transport_session:whereis(TransportId)
+    ).
+
+send_unknown_transport(_Config) ->
+    FakeTransportId = <<"nonexistent-longpoll-transport">>,
+
+    ?assertEqual(
+        undefined,
+        bondy_http_transport_session:whereis(FakeTransportId)
+    ),
+
+    ?assertEqual(
+        ok,
+        bondy_http_transport_session:notify_enqueue(FakeTransportId)
+    ).
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+make_transport_id() ->
+    Bin = integer_to_binary(erlang:unique_integer([positive])),
+    <<"test-longpoll-transport-", Bin/binary>>.
+
+%% @private
+make_event(N) ->
+    #event{
+        subscription_id = 1,
+        publication_id = N,
+        details = #{},
+        args = [<<"payload-", (integer_to_binary(N))/binary>>],
+        kwargs = undefined
+    }.
+
+%% Two messages leave the router for one client: an EVENT the router delivered
+%% into `bondy_http_transport_queue' while nobody was polling, and — LATER — a
+%% reply the protocol produced synchronously while handling the client's own
+%% POST. A transport is a FIFO pipe, so the first poll must return the first
+%% one. Reachable in an established session: an inbound whose
+%% `bondy_router:forward/2' answers `{reply, M, _}' is answered inline by
+%% `bondy_wamp_protocol' (an ERROR for an unroutable call, a throttle
+%% rejection), while EVENTs for the same session arrive through the queue.
+queued_message_precedes_later_synchronous_reply(_Config) ->
+    RealmUri = <<"com.leapsight.test.longpoll_ordering">>,
+    _ = bondy_realm:create(RealmUri),
+    ok = bondy_realm:disable_security(RealmUri),
+
+    TransportId = make_transport_id(),
+    SessionId = bondy_session_id:new(),
+
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, <<>>, SessionId
+    ),
+    ok = bondy_http_transport_session:init_protocol(
+        Pid, {http_longpoll, text, json}, {{127, 0, 0, 1}, 12345}
+    ),
+
+    %% Establish, and take the WELCOME out of the way so the assertion below is
+    %% about the two messages this case is comparing and nothing else.
+    ok = bondy_http_transport_session:handle_client_message(
+        Pid, encode(hello(RealmUri))
+    ),
+    {ok, {replies, [_Welcome]}} =
+        bondy_http_transport_session:poll_receive(Pid, 5000),
+
+    %% FIRST: the router delivers an EVENT while no poll is in flight.
+    Event = #event{
+        subscription_id = 1,
+        publication_id = 1,
+        details = #{},
+        args = [<<"first">>],
+        kwargs = undefined
+    },
+    ok = bondy_http_transport_queue:enqueue(TransportId, Event, #{}),
+
+    %% SECOND: the client POSTs a CALL to a procedure nobody has registered.
+    %% The dealer answers ERROR inline, so the reply is produced here, after the
+    %% EVENT was queued.
+    ok = bondy_http_transport_session:handle_client_message(
+        Pid, encode(call(<<"com.example.no.such.procedure">>))
+    ),
+
+    First = bondy_http_transport_session:poll_receive(Pid, 5000),
+    Second = bondy_http_transport_session:poll_receive(Pid, 5000),
+
+    ?assertEqual(
+        [event, error],
+        [shape(First), shape(Second)],
+        "the EVENT was queued before the ERROR was produced"
+    ),
+
+    ok = bondy_http_transport_session:close(Pid).
+
+%% @private The record name behind whichever of the two result shapes came back.
+shape({ok, {messages, [M | _]}}) ->
+    element(1, M);
+shape({ok, {replies, [Bin | _]}}) ->
+    {[M], <<>>} = bondy_wamp_encoding:decode(
+        {http_longpoll, text, json}, Bin
+    ),
+    element(1, M).
+
+%% @private
+encode(M) ->
+    bondy_wamp_encoding:encode(M, json).
+
+%% @private
+hello(RealmUri) ->
+    #hello{
+        realm_uri = RealmUri,
+        details = #{
+            <<"roles">> => #{<<"caller">> => #{}, <<"subscriber">> => #{}}
+        }
+    }.
+
+%% @private
+call(Uri) ->
+    #call{request_id = 1, options = #{}, procedure_uri = Uri}.
+
+%% An open body must be a JSON object. A body that decodes to any other JSON
+%% value is refused like unparseable JSON, with a 400 `invalid_json`.
+open_refuses_a_non_object_body(_Config) ->
+    {ok, _} = application:ensure_all_started(gun),
+    {ok, Conn} = gun:open("127.0.0.1", 18080, #{protocols => [http]}),
+    {ok, _} = gun:await_up(Conn, 5000),
+    Refused = [
+        begin
+            Ref = gun:post(
+                Conn,
+                "/wamp/longpoll/open",
+                [{<<"content-type">>, <<"application/json">>}],
+                Body
+            ),
+            {response, nofin, Status, _} = gun:await(Conn, Ref, 5000),
+            {ok, Reply} = gun:await_body(Conn, Ref, 5000),
+            {Body, Status, json:decode(Reply)}
+        end
+     || Body <- [<<"[1]">>, <<"5">>, <<"\"text\"">>, <<"not json">>]
+    ],
+    ok = gun:close(Conn),
+    ?assertEqual(
+        [
+            {B, 400, #{<<"error">> => <<"invalid_json">>}}
+         || {B, _, _} <- Refused
+        ],
+        Refused
+    ).

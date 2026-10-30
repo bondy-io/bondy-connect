@@ -1,0 +1,1014 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2016 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_security_SUITE).
+-include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
+
+-include("bondy_security.hrl").
+-include("bondy_db_tables.hrl").
+
+-define(U1, <<"user_1">>).
+-define(U2, <<"user_2">>).
+-define(P1, <<"aWe11KeptSecret">>).
+
+-compile([nowarn_export_all, export_all]).
+
+all() ->
+    [
+        {group, api_client},
+        {group, resource_owner},
+        {group, user},
+        {group, oauth},
+        {group, tickets}
+    ].
+
+groups() ->
+    [
+        {api_client, [sequence], [
+            security_toggle,
+            create_groups,
+            api_client_add,
+            api_client_auth1,
+            api_client_update,
+            api_client_auth2,
+            api_client_delete
+        ]},
+        {resource_owner, [sequence], [
+            resource_owner_add,
+            resource_owner_auth1,
+            resource_owner_update,
+            resource_owner_change_password,
+            resource_owner_auth2,
+            resource_owner_auth3,
+            resource_owner_delete
+        ]},
+        {user, [sequence], [
+            user_add,
+            user_auth1,
+            user_update,
+            user_auth2,
+            user_auth3,
+            user_delete
+        ]},
+        {oauth, [sequence], [
+            password_token_crud_1,
+            issue_revoke_by_device_id,
+            issue_refresh_revoke_by_device_id,
+            %% Ownership first: the sweeps below partition their work by it, so
+            %% a broken primitive shows up as "ownership is broken" rather than
+            %% as a confusing "the sweep scanned nothing".
+            single_node_owns_every_realm,
+            cleanup_keeps_live_tokens,
+            cleanup_reaps_disabled_user_tokens,
+            reclaimer_sweep_reaps_via_jobs,
+            reclaimer_timer_path_sweeps_and_reschedules,
+            reclaimer_retries_sooner_when_the_job_queue_is_full
+        ]},
+        {tickets, [sequence], [
+            ticket_cleanup_reaps_expired_single_cell,
+            ticket_cleanup_prunes_expired_device_entries,
+            ticket_cleanup_reaps_disabled_user_tickets
+        ]}
+    ].
+
+init_per_suite(Config) ->
+    bondy_ct:start_bondy(),
+    RealmUri = <<"com.example.test.security">>,
+    Realm = add_realm(RealmUri),
+    [{realm_uri, RealmUri}, {realm, Realm} | Config].
+
+end_per_suite(Config) ->
+    {save_config, Config}.
+
+add_realm(RealmUri) ->
+    Config = #{
+        uri => RealmUri,
+        description => <<"A test realm">>,
+        authmethods => [
+            ?PASSWORD_AUTH, ?OAUTH2_AUTH
+        ],
+        security_enabled => true,
+        grants => [
+            #{
+                permissions => [
+                    <<"wamp.register">>,
+                    <<"wamp.unregister">>,
+                    <<"wamp.subscribe">>,
+                    <<"wamp.unsubscribe">>,
+                    <<"wamp.call">>,
+                    <<"wamp.cancel">>,
+                    <<"wamp.publish">>
+                ],
+                uri => <<"">>,
+                match => <<"prefix">>,
+                roles => <<"all">>
+            }
+        ],
+        users => [
+            #{
+                username => ?U1,
+                password => ?P1,
+                groups => [],
+                meta => #{}
+            },
+            #{
+                username => ?U2,
+                password => ?P1,
+                groups => [],
+                meta => #{}
+            }
+        ],
+        sources => [
+            #{
+                usernames => <<"all">>,
+                authmethod => ?PASSWORD_AUTH,
+                cidr => <<"0.0.0.0/0">>
+            },
+            #{
+                usernames => [?U2],
+                authmethod => ?PASSWORD_AUTH,
+                cidr => <<"198.162.0.0/16">>
+            }
+        ]
+    },
+    bondy_realm:create(Config).
+
+security_toggle(Config) ->
+    R = ?config(realm, Config),
+    Uri = bondy_realm:uri(R),
+    ok = bondy_realm:enable_security(R),
+
+    ?assertEqual(true, bondy_realm:is_security_enabled(R)),
+    ?assertEqual(enabled, bondy_realm:security_status(R)),
+
+    ok = bondy_realm:disable_security(R),
+
+    ?assertEqual(false, bondy_realm:is_security_enabled(Uri)),
+    ?assertEqual(disabled, bondy_realm:security_status(Uri)),
+
+    ok = bondy_realm:enable_security(R),
+
+    {save_config, Config}.
+
+%% =============================================================================
+%% API CLIENT
+%% =============================================================================
+
+create_groups(Config) ->
+    {security_toggle, Prev} = ?config(saved_config, Config),
+    Uri = ?config(realm_uri, Config),
+    Name = <<"group_a">>,
+    N = length(bondy_rbac_group:list(Uri)),
+
+    ?assertMatch(
+        {ok, _},
+        bondy_rbac_group:add(Uri, bondy_rbac_group:new(#{<<"name">> => Name}))
+    ),
+
+    ?assertMatch(
+        #{type := group, name := Name, groups := [], meta := #{}},
+        bondy_rbac_group:lookup(Uri, Name)
+    ),
+    ?assertEqual(N + 1, length(bondy_rbac_group:list(Uri))),
+
+    ?assertMatch(
+        {ok, _},
+        bondy_rbac_group:add(
+            Uri, bondy_rbac_group:new(#{<<"name">> => <<"api_clients">>})
+        )
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        bondy_rbac_group:add(
+            Uri, bondy_rbac_group:new(#{<<"name">> => <<"resource_owners">>})
+        )
+    ),
+
+    {save_config, Prev}.
+
+api_client_add(Config) ->
+    {create_groups, Prev} = ?config(saved_config, Config),
+    ClientId = bondy_router_utils:generate_fragment(48),
+    Secret = bondy_router_utils:generate_fragment(48),
+    Uri = ?config(realm_uri, Prev),
+    In = #{
+        <<"client_id">> => ClientId,
+        <<"client_secret">> => Secret
+    },
+    ?assertMatch(
+        {ok, #{type := user}},
+        bondy_oauth2_client:add(Uri, In)
+    ),
+
+    ?assertMatch(
+        {ok, #{type := user}},
+        bondy_rbac_user:lookup(Uri, ClientId)
+    ),
+
+    {save_config, [{client_id, ClientId}, {client_secret, Secret} | Prev]}.
+
+api_client_auth1(Config) ->
+    {api_client_add, Prev} = ?config(saved_config, Config),
+    Uri = ?config(realm_uri, Prev),
+    Id = ?config(client_id, Prev),
+    Secret = ?config(client_secret, Prev),
+    ok = authenticate(Uri, Id, Secret),
+
+    {save_config, Prev}.
+
+api_client_update(Config) ->
+    {api_client_auth1, Prev} = ?config(saved_config, Config),
+
+    RealmUri = ?config(realm_uri, Prev),
+    ClientId = ?config(client_id, Prev),
+
+    ?assertMatch(
+        {ok, #{
+            groups := [<<"api_clients">>],
+            username := _,
+            type := user
+        }},
+        bondy_oauth2_client:update(
+            RealmUri,
+            ClientId,
+            #{
+                <<"client_secret">> => <<"New-Password">>,
+                <<"meta">> => #{<<"foo">> => <<"bar">>}
+            }
+        )
+    ),
+
+    %% Updating password has no effect, we need to use the change password API
+    ?assertMatch(
+        {error, bad_signature},
+        do_authenticate(RealmUri, ClientId, <<"New-Password">>)
+    ),
+
+    {save_config, Prev}.
+
+api_client_auth2(Config) ->
+    {api_client_update, Prev} = ?config(saved_config, Config),
+    RealmUri = ?config(realm_uri, Prev),
+    ClientId = ?config(client_id, Prev),
+    NewSecret = <<"New-Password">>,
+
+    ok = bondy_rbac_user:change_password(RealmUri, ClientId, NewSecret),
+
+    ok = authenticate(RealmUri, ClientId, NewSecret),
+
+    {save_config, Prev}.
+
+api_client_delete(Config) ->
+    {api_client_auth2, Prev} = ?config(saved_config, Config),
+    ok = bondy_oauth2_client:remove(
+        ?config(realm_uri, Config), ?config(client_id, Prev)
+    ),
+    {save_config, Prev}.
+
+%% =============================================================================
+%% RESOURCE OWNER
+%% =============================================================================
+
+resource_owner_add(Config) ->
+    Username = <<"AlE">>,
+    R0 = #{
+        <<"username">> => Username,
+        <<"password">> => <<"ale">>,
+        <<"meta">> => #{<<"foo">> => <<"bar">>},
+        <<"groups">> => []
+    },
+
+    ?assertError(
+        #{code := invalid_value, key := <<"password">>},
+        bondy_oauth2_resource_owner:add(?config(realm_uri, Config), R0),
+        "password is too small"
+    ),
+    Password = <<"ale123456">>,
+    R1 = maps:put(<<"password">>, Password, R0),
+
+    ?assertMatch(
+        {ok, #{username := <<"ale">>}},
+        bondy_oauth2_resource_owner:add(?config(realm_uri, Config), R1)
+    ),
+
+    {save_config, [{username, Username}, {password, Password} | Config]}.
+
+resource_owner_auth1(Config) ->
+    {resource_owner_add, Prev} = ?config(saved_config, Config),
+    Uri = ?config(realm_uri, Prev),
+    Username = ?config(username, Prev),
+    Pass = ?config(password, Prev),
+
+    ok = authenticate(Uri, Username, Pass),
+    {save_config, Prev}.
+
+resource_owner_update(Config) ->
+    {resource_owner_auth1, Prev} = ?config(saved_config, Config),
+    RealmUri = ?config(realm_uri, Prev),
+    Username = ?config(username, Prev),
+    Pass = <<"New-Password">>,
+    {ok, #{groups := Gs}} = bondy_rbac_user:lookup(RealmUri, Username),
+    {ok, _} = bondy_oauth2_resource_owner:update(
+        RealmUri,
+        Username,
+        #{
+            <<"password">> => Pass,
+            <<"meta">> => #{<<"foo">> => <<"bar">>}
+        }
+    ),
+    {ok, #{groups := Gs}} = bondy_rbac_user:lookup(RealmUri, Username),
+    {save_config, Prev}.
+
+resource_owner_change_password(Config) ->
+    {resource_owner_update, Prev} = ?config(saved_config, Config),
+    RealmUri = ?config(realm_uri, Prev),
+    Username = ?config(username, Prev),
+    OldPass = ?config(password, Prev),
+    {ok, User1} = bondy_rbac_user:lookup(RealmUri, Username),
+    NewPass = <<"New-Password2">>,
+    ok = bondy_rbac_user:change_password(
+        RealmUri, Username, NewPass, OldPass
+    ),
+    {ok, User2} = bondy_rbac_user:lookup(RealmUri, Username),
+    true = User1 =/= User2,
+    {save_config, lists:keyreplace(password, 1, Prev, {password, NewPass})}.
+
+resource_owner_auth2(Config) ->
+    {resource_owner_change_password, Prev} = ?config(saved_config, Config),
+    Uri = ?config(realm_uri, Prev),
+    Username = ?config(username, Prev),
+    Pass = ?config(password, Prev),
+    ok = authenticate(Uri, Username, Pass),
+    {save_config, Prev}.
+
+resource_owner_auth3(Config) ->
+    {resource_owner_auth2, Prev} = ?config(saved_config, Config),
+    Uri = ?config(realm_uri, Prev),
+    Username = string:uppercase(?config(username, Prev)),
+    Pass = ?config(password, Prev),
+
+    ok = authenticate(Uri, Username, Pass),
+    {save_config, Prev}.
+
+resource_owner_delete(Config) ->
+    {resource_owner_auth3, Prev} = ?config(saved_config, Config),
+    ok = bondy_oauth2_resource_owner:remove(
+        ?config(realm_uri, Config), ?config(username, Prev)
+    ),
+    {save_config, Prev}.
+
+%% =============================================================================
+%% USER
+%% =============================================================================
+
+user_add(Config) ->
+    In = #{
+        <<"username">> => <<"AlE2">>,
+        <<"password">> => <<"ale123456">>,
+        <<"meta">> => #{<<"foo">> => <<"bar">>},
+        <<"groups">> => []
+    },
+
+    User = bondy_rbac_user:new(In),
+
+    ?assertEqual(
+        false,
+        bondy_password:is_type(bondy_rbac_user:password(User))
+    ),
+
+    ?assertEqual(
+        true,
+        is_function(bondy_rbac_user:password(User), 1)
+    ),
+
+    {ok, NewUser} = bondy_rbac_user:add(?config(realm_uri, Config), User),
+
+    ?assertEqual(
+        true,
+        bondy_password:is_type(bondy_rbac_user:password(NewUser))
+    ),
+
+    ?assertEqual(
+        #{
+            enabled => true,
+            sso_realm_uri => undefined,
+            groups => [],
+            authorized_keys => [],
+            has_authorized_keys => false,
+            has_password => true,
+            meta => #{<<"foo">> => <<"bar">>},
+            type => user,
+            username => <<"ale2">>,
+            version => <<"1.1">>
+        },
+        bondy_rbac_user:to_external(User)
+    ),
+
+    {save_config, [
+        {username, <<"AlE2">>},
+        {password, <<"ale123456">>}
+        | Config
+    ]}.
+
+user_auth1(Config) ->
+    {user_add, Prev} = ?config(saved_config, Config),
+    Uri = ?config(realm_uri, Prev),
+    Username = ?config(username, Prev),
+    Pass = ?config(password, Prev),
+    ok = authenticate(Uri, Username, Pass),
+    {save_config, Prev}.
+
+user_update(Config) ->
+    {user_auth1, Prev} = ?config(saved_config, Config),
+    Pass = <<"New-Password">>,
+    {ok, #{type := user}} = bondy_rbac_user:update(
+        ?config(realm_uri, Prev),
+        ?config(username, Prev),
+        #{
+            <<"password">> => Pass,
+            <<"meta">> => #{<<"foo">> => <<"bar2">>}
+        },
+        #{
+            update_credentials => true,
+            forward_credentials => true
+        }
+    ),
+    {save_config, lists:keyreplace(password, 1, Prev, {password, Pass})}.
+
+user_auth2(Config) ->
+    {user_update, Prev} = ?config(saved_config, Config),
+    Uri = ?config(realm_uri, Prev),
+    Username = ?config(username, Prev),
+    Pass = ?config(password, Prev),
+    ok = authenticate(Uri, Username, Pass),
+    {save_config, Prev}.
+
+user_auth3(Config) ->
+    {user_auth2, Prev} = ?config(saved_config, Config),
+    Uri = ?config(realm_uri, Prev),
+    Username = string:uppercase(?config(username, Prev)),
+    Pass = ?config(password, Prev),
+
+    ok = authenticate(Uri, Username, Pass),
+    {save_config, Prev}.
+
+user_delete(Config) ->
+    {user_auth3, Prev} = ?config(saved_config, Config),
+    ok = bondy_rbac_user:remove(
+        ?config(realm_uri, Config), ?config(username, Prev)
+    ),
+    {save_config, Prev}.
+
+%% =============================================================================
+%% OAUTH
+%% =============================================================================
+
+password_token_crud_1(Config) ->
+    Uri = ?config(realm_uri, Config),
+    ClientId = bondy_router_utils:generate_fragment(48),
+    Client = #{
+        <<"client_id">> => ClientId,
+        <<"client_secret">> => bondy_router_utils:generate_fragment(48)
+    },
+    {ok, _} = bondy_oauth2_client:add(Uri, Client),
+    U = <<"ale">>,
+    Roles = [],
+    R = #{
+        <<"username">> => U,
+        <<"password">> => <<"123456">>,
+        <<"meta">> => #{},
+        <<"groups">> => Roles
+    },
+    {ok, _} = bondy_oauth2_resource_owner:add(Uri, R),
+
+    SessionId = bondy_session_id:new(),
+    SourceIP = {127, 0, 0, 1},
+    {ok, AuthCtxt} = bondy_auth:init(SessionId, Uri, U, Roles, SourceIP),
+
+    Opts = #{client_id => ClientId},
+    {ok, Token0} = bondy_oauth_token:issue(password, AuthCtxt, Opts),
+    RToken0 = bondy_oauth_token:to_refresh_token(Token0),
+    Ts0 = maps:get(issued_at, Token0),
+
+    ?assertEqual(
+        {ok, Token0},
+        bondy_oauth_token:lookup(Uri, RToken0)
+    ),
+
+    %% issued_at is seconds
+    timer:sleep(2000),
+
+    {ok, Token1} = bondy_oauth_token:refresh(Uri, RToken0),
+    RToken1 = bondy_oauth_token:to_refresh_token(Token1),
+    Scope1 = bondy_oauth_token:authscope(Token1),
+    Ts1 = maps:get(issued_at, Token1),
+
+    ?assertEqual(
+        {error, not_found},
+        bondy_oauth_token:lookup(Uri, RToken0)
+    ),
+    ?assert(Token0 =/= Token1),
+    ?assert(RToken0 =/= RToken1),
+    ?assert(Ts0 < Ts1),
+
+    ?assertEqual(
+        {ok, Token1},
+        bondy_oauth_token:lookup(Uri, U, Scope1)
+    ),
+
+    ?assertEqual(
+        {ok, Token1},
+        bondy_oauth_token:lookup(Uri, RToken1)
+    ),
+
+    ?assertEqual(
+        ok,
+        bondy_oauth_token:revoke(Uri, RToken0),
+        "Revoke token should never fail, even if the token was already deleted"
+    ),
+
+    ?assertEqual(
+        ok,
+        bondy_oauth_token:revoke_all(Uri, U)
+    ),
+
+    ?assertEqual(
+        {error, not_found},
+        bondy_oauth_token:lookup(Uri, RToken1),
+        "Should have been revoked i.e. deleted"
+    ),
+    ?assertEqual(
+        ok,
+        bondy_oauth_token:revoke(Uri, RToken0),
+        "Revoke token should never fail, even if the token was already deleted"
+    ),
+    ?assertEqual(
+        ok,
+        bondy_oauth_token:revoke(Uri, RToken1),
+        "Revoke token should never fail, even if the token was already deleted"
+    ),
+
+    {save_config, [{client_id, ClientId}, {username, U} | Config]}.
+
+issue_revoke_by_device_id(Config) ->
+    {password_token_crud_1, Prev} = ?config(saved_config, Config),
+    Uri = ?config(realm_uri, Prev),
+    C = ?config(client_id, Prev),
+    U = ?config(username, Prev),
+    D = <<"1">>,
+    Roles = [],
+
+    SessionId = bondy_session_id:new(),
+    SourceIP = {127, 0, 0, 1},
+    {ok, AuthCtxt} = bondy_auth:init(SessionId, Uri, U, Roles, SourceIP),
+    Opts = #{client_device_id => D},
+    {ok, Token0} = bondy_oauth_token:issue(password, AuthCtxt, Opts),
+    RToken0 = bondy_oauth_token:to_refresh_token(Token0),
+
+    ?assertEqual(
+        {ok, Token0},
+        bondy_oauth_token:lookup(Uri, RToken0)
+    ),
+
+    ok = bondy_oauth_token:revoke(Uri, RToken0),
+
+    ?assertEqual(
+        {error, not_found},
+        bondy_oauth_token:lookup(Uri, RToken0)
+    ),
+    {save_config, [{client_id, C}, {username, U} | Config]}.
+
+issue_refresh_revoke_by_device_id(Config) ->
+    {issue_revoke_by_device_id, Prev} = ?config(saved_config, Config),
+    Uri = ?config(realm_uri, Prev),
+    U = ?config(username, Prev),
+    D = <<"1">>,
+    Roles = [],
+
+    SessionId = bondy_session_id:new(),
+    SourceIP = {127, 0, 0, 1},
+
+    {ok, AuthCtxt} = bondy_auth:init(SessionId, Uri, U, Roles, SourceIP),
+    Opts = #{client_device_id => D},
+    {ok, Token0} = bondy_oauth_token:issue(password, AuthCtxt, Opts),
+    RToken0 = bondy_oauth_token:to_refresh_token(Token0),
+    timer:sleep(2000),
+    {ok, Token1} = bondy_oauth_token:refresh(Uri, RToken0),
+    RToken1 = bondy_oauth_token:to_refresh_token(Token1),
+    {error, not_found} = bondy_oauth_token:lookup(Uri, RToken0),
+    ok = bondy_oauth_token:revoke(Uri, RToken1),
+    ?assertEqual(
+        {error, not_found},
+        bondy_oauth_token:lookup(Uri, RToken1)
+    ).
+
+%% The reaper must not be over-eager: a live token belonging to an enabled user
+%% has to survive a sweep untouched. This is the assertion that matters most —
+%% a cleanup that reaps too much silently logs every user out.
+cleanup_keeps_live_tokens(Config) ->
+    Uri = ?config(realm_uri, Config),
+    {U, RToken} = new_user_with_token(Uri, <<"cleanup_live">>),
+
+    Stats = bondy_oauth_token:cleanup(),
+    ?assertEqual([], maps:get(errors, Stats)),
+    ?assert(maps:get(scanned, Stats) >= 1),
+
+    ?assertMatch(
+        {ok, _},
+        bondy_oauth_token:lookup(Uri, RToken),
+        "A live token of an enabled user must survive cleanup"
+    ),
+    {save_config, [{cleanup_username, U} | Config]}.
+
+%% A token authenticates only while its user is both present and enabled, so
+%% disabling the user makes every token it holds dead weight. The whole cell
+%% goes, since `store_key/1` hashes the authid and therefore one cell holds
+%% exactly one user's tokens.
+cleanup_reaps_disabled_user_tokens(Config) ->
+    Uri = ?config(realm_uri, Config),
+    {U, RToken} = new_user_with_token(Uri, <<"cleanup_disabled">>),
+    ?assertMatch({ok, _}, bondy_oauth_token:lookup(Uri, RToken)),
+
+    ok = disable_without_lifecycle(Uri, U),
+    %% The sweep reclaims on this predicate and nothing else, so it is asserted
+    %% here as well: a disable that has not taken effect must be reported as
+    %% that, not as a sweep that failed to reclaim.
+    ?assertEqual(false, bondy_rbac_user:is_enabled(Uri, U)),
+    %% And the token is still there on the way in, which is what makes this a
+    %% test of the sweep rather than of the revocation.
+    ?assertMatch({ok, _}, bondy_oauth_token:lookup(Uri, RToken)),
+
+    Stats = bondy_oauth_token:cleanup(),
+    ?assertEqual([], maps:get(errors, Stats)),
+    %% Matched rather than asserted field by field so a failure prints the whole
+    %% map: `deactivated` alone cannot distinguish "the realm was never swept"
+    %% from "this user's cell was not among those scanned", and those have
+    %% different causes.
+    ?assertMatch(
+        #{deactivated := D, cells_cleared := C} when D >= 1 andalso C >= 1,
+        Stats
+    ),
+
+    ?assertEqual(
+        {error, not_found},
+        bondy_oauth_token:lookup(Uri, RToken),
+        "A disabled user's tokens must be reclaimed"
+    ).
+
+%% The residue lazy pruning cannot reach: a `client_id = all` ticket is ONE
+%% ticket per cell, keyed by `{Authid, RealmUri, DeviceId}`, so a cell whose key
+%% stops being used is never rewritten and no write-path prune can see it. This
+%% is the DEFAULT shape — everything issued without a `client_ticket`.
+ticket_cleanup_reaps_expired_single_cell(Config) ->
+    Uri = ?config(realm_uri, Config),
+    U = new_user(Uri, <<"ticket_expired">>),
+    Live = local_scope(Uri, all),
+    Dead = local_scope(Uri, <<"device_dead">>),
+
+    ok = bondy_ticket:store_ticket(Uri, U, claims(Uri, U, Live, live)),
+    ok = bondy_ticket:store_ticket(Uri, U, claims(Uri, U, Dead, expired)),
+    ?assertMatch({ok, _}, bondy_ticket:lookup(Uri, U, Live)),
+    ?assertMatch({ok, _}, bondy_ticket:lookup(Uri, U, Dead)),
+    Before = sweep_view(Uri),
+
+    Stats = bondy_ticket:cleanup(),
+    ?assertEqual([], maps:get(errors, Stats)),
+    ?assert(
+        maps:get(expired, Stats) >= 1,
+        Before#{stats => Stats, after_sweep => sweep_view(Uri)}
+    ),
+
+    ?assertEqual({error, not_found}, bondy_ticket:lookup(Uri, U, Dead)),
+    ?assertMatch(
+        {ok, _},
+        bondy_ticket:lookup(Uri, U, Live),
+        "An unexpired ticket must survive the sweep"
+    ).
+
+%% The other shape: a client-scoped cell is a per-device LIST, so an expired
+%% device entry is pruned from the cell while the cell itself survives.
+ticket_cleanup_prunes_expired_device_entries(Config) ->
+    Uri = ?config(realm_uri, Config),
+    U = new_user(Uri, <<"ticket_devices">>),
+    Client = <<"app_sweep">>,
+    Live = client_scope(Uri, Client, <<"device_live">>),
+    Dead = client_scope(Uri, Client, <<"device_dead">>),
+
+    ok = bondy_ticket:store_ticket(Uri, U, claims(Uri, U, Live, live)),
+    ok = bondy_ticket:store_ticket(Uri, U, claims(Uri, U, Dead, expired)),
+    ?assertMatch({ok, _}, bondy_ticket:lookup(Uri, U, Dead)),
+
+    Stats = bondy_ticket:cleanup(),
+    ?assertEqual([], maps:get(errors, Stats)),
+
+    ?assertEqual({error, not_found}, bondy_ticket:lookup(Uri, U, Dead)),
+    ?assertMatch(
+        {ok, _},
+        bondy_ticket:lookup(Uri, U, Live),
+        "Pruning one device's entry must not drop the cell"
+    ).
+
+%% `revoke_all/2` already runs on user disable, so this is the backstop for an
+%% event a node missed while partitioned or restarting — the sweep must reach
+%% the same conclusion independently.
+%%
+%% That revocation is asynchronous, so a disable that fires it leaves the sweep
+%% racing it for the same ticket. `disable_without_lifecycle/2` applies the
+%% disable the way a config apply or a replicated merge does: a node whose
+%% local revocation never ran.
+ticket_cleanup_reaps_disabled_user_tickets(Config) ->
+    Uri = ?config(realm_uri, Config),
+    U = new_user(Uri, <<"ticket_disabled">>),
+    Scope = local_scope(Uri, all),
+
+    ok = bondy_ticket:store_ticket(Uri, U, claims(Uri, U, Scope, live)),
+    ?assertMatch({ok, _}, bondy_ticket:lookup(Uri, U, Scope)),
+
+    ok = disable_without_lifecycle(Uri, U),
+    ?assertEqual(false, bondy_rbac_user:is_enabled(Uri, U)),
+    ?assertMatch({ok, _}, bondy_ticket:lookup(Uri, U, Scope)),
+
+    Stats = bondy_ticket:cleanup(),
+    ?assertEqual([], maps:get(errors, Stats)),
+    ?assertMatch(#{deactivated := D} when D >= 1, Stats),
+
+    ?assertEqual({error, not_found}, bondy_ticket:lookup(Uri, U, Scope)).
+
+%% A scope with `client_id = all` — the default shape, one ticket per cell.
+%% What `bondy_ticket:cleanup/0` decides from: whether it sweeps the realm at
+%% all, and which cells it lists there.
+sweep_view(Uri) ->
+    Table = bondy_namespace_catalog:table(?BONDY_DB_TICKET_TAB),
+    #{
+        auth_realm => lists:member(Uri, bondy_realm:auth_realm_uris()),
+        is_owner => bondy_router_peer:is_owner(Uri),
+        peers => partisan:nodes(),
+        cells => bondy_db:list(Table, Uri)
+    }.
+
+local_scope(Uri, DeviceId) ->
+    #{realm => Uri, client_id => all, device_id => DeviceId}.
+
+%% A client-scoped scope — a per-device list in one cell.
+client_scope(Uri, ClientId, DeviceId) ->
+    #{realm => Uri, client_id => ClientId, device_id => DeviceId}.
+
+claims(Uri, Authid, Scope, Liveness) ->
+    Now = erlang:system_time(second),
+    ExpiresAt =
+        case Liveness of
+            live -> Now + 3600;
+            %% Well clear of the leeway is_expired/2 applies.
+            expired -> Now - 3600
+        end,
+    #{
+        authrealm => Uri,
+        authid => Authid,
+        scope => Scope,
+        expires_at => ExpiresAt
+    }.
+
+new_user(Uri, U) ->
+    R = #{
+        <<"username">> => U,
+        <<"password">> => <<"123456">>,
+        <<"meta">> => #{},
+        <<"groups">> => []
+    },
+    {ok, _} = bondy_oauth2_resource_owner:add(Uri, R),
+    U.
+
+%% Ownership must hold on a cluster of one. `bondy_router_peer:lrw_nodes/2` selects over a
+%% candidate set that INCLUDES the local node — `partisan:nodes()`, like
+%% `erlang:nodes/1`, excludes it, so a set built from that alone answers `[]` on
+%% a single-node cluster. Ownership built on that would answer `false`
+%% everywhere and no realm would ever be swept, silently, with every test of the
+%% sweep itself still passing.
+single_node_owns_every_realm(Config) ->
+    Uri = ?config(realm_uri, Config),
+    Self = partisan:node(),
+
+    ?assertEqual([Self], bondy_router_peer:lrw_nodes(Uri, 1)),
+    ?assert(bondy_router_peer:is_owner(Uri)),
+
+    %% Whatever the key, the only node owns it — no key may route to nobody.
+    lists:foreach(
+        fun(N) ->
+            Key = <<"com.example.realm.", (integer_to_binary(N))/binary>>,
+            ?assertEqual([Self], bondy_router_peer:lrw_nodes(Key, 1)),
+            ?assert(bondy_router_peer:is_owner(Key))
+        end,
+        lists:seq(1, 25)
+    ).
+
+%% The whole wiring end to end: the scheduler enqueues onto `bondy_jobs`, a job
+%% worker runs the sweep, and the sweep reclaims. Deliberately goes through
+%% `bondy_reclaimer:sweep/0` rather than calling `cleanup/0` directly, so a
+%% break anywhere in that chain — supervision, enqueue, the fun it builds — is
+%% caught rather than assumed.
+reclaimer_sweep_reaps_via_jobs(Config) ->
+    Uri = ?config(realm_uri, Config),
+    {U, RToken} = new_user_with_token(Uri, <<"cleanup_via_jobs">>),
+    ?assertMatch({ok, _}, bondy_oauth_token:lookup(Uri, RToken)),
+
+    ok = bondy_rbac_user:disable(Uri, U),
+
+    awaiting_ticket_sweep(fun() ->
+        ok = bondy_reclaimer:sweep(),
+
+        %% Asynchronous by design — the sweep runs on a job worker, not here.
+        wait_until(
+            fun() ->
+                {error, not_found} =:= bondy_oauth_token:lookup(Uri, RToken)
+            end,
+            reclaimed_via_jobs
+        )
+    end).
+
+%% The SCHEDULED path, which `reclaimer_sweep_reaps_via_jobs` does not reach:
+%% `sweep/0` enters at `handle_cast`, so it exercises neither `schedule/1`,
+%% the jitter in `next_interval/0`, nor the `handle_info({timeout, ...})`
+%% clause. A mistake in any of those would mean the sweeps NEVER fire on their
+%% own — silently, with every other reclamation test still green.
+%%
+%% Driven by delivering the timer message with the server's REAL ref rather than
+%% by waiting on wall-clock, so it is deterministic and costs no sleep.
+reclaimer_timer_path_sweeps_and_reschedules(Config) ->
+    Uri = ?config(realm_uri, Config),
+    {U, RToken} = new_user_with_token(Uri, <<"cleanup_via_timer">>),
+    ok = bondy_rbac_user:disable(Uri, U),
+    ?assertMatch({ok, _}, bondy_oauth_token:lookup(Uri, RToken)),
+
+    %% `init/1` must have armed a timer at all — this is the assertion that
+    %% would have caught a reclaimer that never scheduled anything.
+    {state, Ref0} = sys:get_state(bondy_reclaimer),
+    ?assert(is_reference(Ref0)),
+
+    Remaining = erlang:read_timer(Ref0),
+    ?assert(is_integer(Remaining) andalso Remaining > 0),
+
+    %% Jitter may only bring a sweep FORWARD, never push it out.
+    Interval = bondy_config:get([security, reclamation, interval], 21600000),
+    ?assert(
+        Remaining =< Interval,
+        "Jitter must only ever subtract from the configured interval"
+    ),
+
+    awaiting_ticket_sweep(fun() ->
+        bondy_reclaimer ! {timeout, Ref0, scheduled_sweep},
+
+        wait_until(
+            fun() ->
+                {error, not_found} =:= bondy_oauth_token:lookup(Uri, RToken)
+            end,
+            reclaimed_by_timer
+        )
+    end),
+
+    %% ...and it must RE-ARM, or reclamation would happen exactly once per boot.
+    wait_until(
+        fun() ->
+            case sys:get_state(bondy_reclaimer) of
+                {state, Ref} -> is_reference(Ref) andalso Ref =/= Ref0;
+                _ -> false
+            end
+        end,
+        reclaimer_rescheduled
+    ).
+
+%% A round the job queue refuses must be reported, and must not then wait the
+%% full interval before trying again. `bondy_reclaimer` reads what
+%% `bondy_jobs` answers; discarding it would let a full queue skip reclamation
+%% with no log until the next attempt — and the queue is fullest under load.
+%%
+%% `bondy_jobs` is mocked rather than genuinely filled: the real queue holds
+%% roughly six hundred jobs per worker.
+reclaimer_retries_sooner_when_the_job_queue_is_full(_Config) ->
+    {state, Ref0} = sys:get_state(bondy_reclaimer),
+    ?assert(is_reference(Ref0)),
+
+    ok = meck:new(bondy_jobs, [passthrough]),
+
+    try
+        %% Arity 1 only, which is the arity the reclaimer uses and the only
+        %% caller of it; everything else in the node keeps the real function.
+        ok = meck:expect(bondy_jobs, enqueue, fun(_Fun) -> {error, full} end),
+
+        bondy_reclaimer ! {timeout, Ref0, scheduled_sweep},
+
+        ok = wait_until(
+            fun() ->
+                case sys:get_state(bondy_reclaimer) of
+                    {state, R} -> is_reference(R) andalso R =/= Ref0;
+                    _ -> false
+                end
+            end,
+            reclaimer_rescheduled_after_shed
+        ),
+
+        %% Both sweeps were offered. Giving up after the first refusal would
+        %% leave the second permanently unattempted whenever the first was
+        %% unlucky.
+        ?assertEqual(
+            length([oauth_tokens, tickets]),
+            meck:num_calls(bondy_jobs, enqueue, 1)
+        ),
+
+        %% Minutes, not hours: the point of noticing is to come back sooner.
+        {state, Ref} = sys:get_state(bondy_reclaimer),
+        Remaining = erlang:read_timer(Ref),
+        ?assert(is_integer(Remaining)),
+        ?assert(
+            Remaining =< timer:minutes(5),
+            "A shed round must be retried sooner than the configured interval"
+        )
+    after
+        ok = meck:unload(bondy_jobs)
+    end.
+
+%% @private
+%% Disables a user the way a declarative config apply does: the cell is written,
+%% no lifecycle side-effect fires.
+%%
+%% `bondy_rbac_user:disable/2` publishes `{[bondy, user, updated], ...}`, which
+%% `bondy_event_wamp_publisher` handles ASYNCHRONOUSLY by revoking the user's
+%% tickets and tokens. A sweep invoked straight after that disable races the
+%% handler; this helper reproduces a node whose local revocation never ran.
+disable_without_lifecycle(RealmUri, Username) ->
+    {ok, _} = bondy_rbac_user:update(
+        RealmUri, Username, #{enabled => false}, #{declarative => true}
+    ),
+    ok.
+
+%% @private
+%% A reclamation round queues the ticket sweep beside the token sweep these
+%% cases wait on. Left running, it can overlap the `tickets` group's own
+%% `bondy_ticket:cleanup/0` and reap the cell that case counts. `meck` records
+%% a passthrough call once it has returned, so the wait ends with the sweep.
+awaiting_ticket_sweep(Fun) ->
+    ok = meck:new(bondy_ticket, [passthrough]),
+    try
+        Result = Fun(),
+        ok = meck:wait(bondy_ticket, cleanup, [], 30000),
+        Result
+    after
+        ok = meck:unload(bondy_ticket)
+    end.
+
+%% @private
+wait_until(Fun, Tag) ->
+    wait_until(Fun, Tag, erlang:monotonic_time(millisecond) + 10000).
+
+%% @private
+wait_until(Fun, Tag, Deadline) ->
+    case Fun() of
+        true ->
+            ok;
+        _ ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                true ->
+                    error({wait_timeout, Tag});
+                false ->
+                    timer:sleep(100),
+                    wait_until(Fun, Tag, Deadline)
+            end
+    end.
+
+%% A fresh resource owner plus one issued password token, returned as
+%% `{Username, RefreshToken}`.
+new_user_with_token(Uri, U) ->
+    R = #{
+        <<"username">> => U,
+        <<"password">> => <<"123456">>,
+        <<"meta">> => #{},
+        <<"groups">> => []
+    },
+    {ok, _} = bondy_oauth2_resource_owner:add(Uri, R),
+
+    SessionId = bondy_session_id:new(),
+    SourceIP = {127, 0, 0, 1},
+    {ok, AuthCtxt} = bondy_auth:init(SessionId, Uri, U, [], SourceIP),
+    {ok, Token} = bondy_oauth_token:issue(password, AuthCtxt, #{}),
+    {U, bondy_oauth_token:to_refresh_token(Token)}.
+
+authenticate(Uri, Username, Secret) ->
+    Result = do_authenticate(Uri, Username, Secret),
+    ?assertMatch({ok, _, _}, Result),
+    ok.
+
+do_authenticate(Uri, Username, Secret) ->
+    SessionId = bondy_session_id:new(),
+    Roles = [],
+    SourceIP = {127, 0, 0, 1},
+
+    {ok, AuthCtxt} = bondy_auth:init(SessionId, Uri, Username, Roles, SourceIP),
+
+    ?assertEqual(
+        true,
+        lists:member(?PASSWORD_AUTH, bondy_auth:available_methods(AuthCtxt))
+    ),
+    bondy_auth:authenticate(?PASSWORD_AUTH, Secret, #{}, AuthCtxt).

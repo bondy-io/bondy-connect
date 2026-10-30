@@ -4,6 +4,9 @@
 %% =============================================================================
 
 -module(bondy_regulator_sup).
+-moduledoc """
+Top supervisor for the `bondy_regulator` application.
+""".
 
 -behaviour(supervisor).
 
@@ -16,7 +19,6 @@
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
-
 init([]) ->
     SupFlags = #{
         strategy => one_for_all,
@@ -24,6 +26,26 @@ init([]) ->
         period => 10
     },
     ChildSpecs = [
+        %% Node load monitor (run-queue sampler behind busy/0). No
+        %% dependency relationship with the rate limiting pair below.
+        #{
+            id => bondy_regulator_load,
+            start => {bondy_regulator_load, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [bondy_regulator_load]
+        },
+        %% Node memory monitor (usage-vs-limit sampler behind high/0). Same
+        %% standing as the load monitor: independent of the pair below.
+        #{
+            id => bondy_regulator_memory,
+            start => {bondy_regulator_memory, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [bondy_regulator_memory]
+        },
         #{
             id => bondy_regulator_rate_limit,
             start => {bondy_regulator_rate_limit, start_link, []},
@@ -31,8 +53,16 @@ init([]) ->
             shutdown => 5000,
             type => worker,
             modules => [bondy_regulator_rate_limit]
+        },
+        %% Keyed + GC'd layer over the buckets above (owns its registry ETS).
+        %% Started after the bucket store it depends on (one_for_all order).
+        #{
+            id => bondy_rate_limiter,
+            start => {bondy_rate_limiter, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [bondy_rate_limiter]
         }
     ],
     {ok, {SupFlags, ChildSpecs}}.
-
-%% internal functions

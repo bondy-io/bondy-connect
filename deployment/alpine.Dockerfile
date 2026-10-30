@@ -1,12 +1,19 @@
-# syntax=docker/dockerfile:1.3
+# syntax=docker/dockerfile:1.6
 
 # ===========================================================================
 # Build stage 1
 # ===========================================================================
 
-FROM erlang:27.3.4-alpine AS builder
+FROM erlang:29.1.2-alpine AS builder
 
-# Install build dependencies
+# The base image bundles rebar3 3.27.0; the build uses 3.28.0.
+ADD --chmod=755 --checksum=sha256:5a28b1cca082d3b023ec0f5df9d9f9d52557036c6f2a21c1ffa11b93a984dd42 \
+    https://github.com/erlang/rebar3/releases/download/3.28.0/rebar3 \
+    /usr/local/bin/rebar3
+
+# Build dependencies. snappy-dev is removed with RocksDB (its only consumer);
+# build-base/cmake/git/patch stay for the surviving native NIFs — notably
+# crc32cer, whose cmake build fetches and patches google/crc32c at build time.
 RUN --mount=type=cache,id=apk,sharing=locked,target=/var/cache/apk \
     ln -s /var/cache/apk /etc/apk/cache && \
     apk add --no-cache \
@@ -18,11 +25,13 @@ RUN --mount=type=cache,id=apk,sharing=locked,target=/var/cache/apk \
         patch \
         ncurses \
         openssl \
-        snappy-dev \
         jq \
         curl \
         bash \
         nano
+
+# google/crc32c 1.1.2 ships a pre-3.5 CMakeLists; give modern cmake a policy floor.
+ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 
 WORKDIR /bondy/src
 
@@ -41,7 +50,10 @@ RUN rebar3 as docker tar && \
 # Build stage 2
 # ===========================================================================
 
-FROM alpine:3.20 as runner
+# Keep this Alpine version >= the erlang:*-alpine builder base (musl ABI must be
+# equal-or-newer, or the stage-1 NIFs fail to load). `erlang:29.1.2-alpine`
+# reports 3.24.2 in /etc/alpine-release.
+FROM alpine:3.24.2 as runner
 
 # We define defaults
 # We assume you have DNS. Erlang will take the FQDN and generate
@@ -74,11 +86,29 @@ ENV HOME "/bondy"
 # We install the following required packages:
 # - openssl: required by Erlang crypto application
 # We setup the bondy group and user and the /bondy dir
-# We also create the /bondy/etc dir to avoid an issue when deploying in K8s
-# where the permissions are not assigned to the directory and Bondy will not
-# have permission to write.
+#
+# The four VOLUME paths (etc, data, log, tmp) MUST exist in the image and be
+# owned by `bondy` BEFORE the VOLUME instruction below. Docker creates a missing
+# mountpoint as root:root 0755 at container-create time, and this image runs as
+# the unprivileged `bondy` user — so an image without them boots into
+# `filelib:ensure_path/1` failing on `/bondy/data/bondy_db/main` (surfaced by
+# `bondy_namespace_catalog` as `{badmatch,{error,enoent}}`; ensure_path/1 reports
+# the underlying EACCES as `enoent`). When the mountpoint DOES exist, Docker
+# seeds the anonymous volume from it and carries its ownership over. Creating
+# /bondy/etc also avoids a K8s deployment issue where the directory is otherwise
+# not writable by Bondy.
+#
+# `/bondy/run` is created here for the opposite reason: it holds the internal
+# admin listener's Unix domain socket and must stay on the container's own
+# filesystem, so it is deliberately NOT a VOLUME (see the VOLUME line below).
+# It still has to be created and chowned here — `/bondy` itself is root:root
+# 0755, so the `bondy` uid cannot create a child of it at runtime.
+#
+# `apk upgrade` picks up Alpine security updates, the CA bundle among them,
+# rather than the versions frozen in the base layer.
 RUN --mount=type=cache,id=apk,sharing=locked,target=/var/cache/apk \
     ln -s /var/cache/apk /etc/apk/cache \
+    && apk upgrade --no-cache \
     && apk add --no-cache \
         libstdc++  \
         bash procps iproute2 net-tools nano ncurses openssl \
@@ -89,8 +119,8 @@ RUN --mount=type=cache,id=apk,sharing=locked,target=/var/cache/apk \
         --ingroup bondy \
         --home /bondy \
         --shell /bin/bash bondy \
-    && mkdir -p /bondy/etc \
-    && chown bondy:bondy /bondy/etc
+    && mkdir -p /bondy/etc /bondy/data /bondy/log /bondy/tmp /bondy/run \
+    && chown bondy:bondy /bondy/etc /bondy/data /bondy/log /bondy/tmp /bondy/run
 
 WORKDIR /bondy
 USER bondy:bondy
@@ -118,6 +148,14 @@ EXPOSE 18086/tcp
 
 # The pre_start script will hardcode the following paths i.e. ignoring the
 # user-defined environment variables (BONDY_*_DIR)
+#
+# `/bondy/run` is NOT in this list and must not be added to it. It holds the
+# internal admin listener's Unix domain socket, and several filesystems an
+# operator can legitimately mount reject an AF_UNIX bind with ENOTSUP (NFS,
+# SMB/CIFS, 9p, some FUSE CSI drivers, gVisor's gofer). Declaring it a VOLUME
+# invites exactly the mount that breaks the node's control endpoint. With a
+# read-only root filesystem, mount an emptyDir/tmpfs there instead — both
+# accept the bind.
 VOLUME ["/bondy/etc", "/bondy/data", "/bondy/tmp", "/bondy/log"]
 
-ENTRYPOINT ["bondy", "foreground"]
+ENTRYPOINT ["bondy-connect", "foreground"]

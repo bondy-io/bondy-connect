@@ -1,0 +1,494 @@
+%% =============================================================================
+%% SPDX-FileCopyrightText: 2023 - 2026 Leapsight
+%% SPDX-License-Identifier: Apache-2.0
+%% =============================================================================
+
+-module(bondy_mst_pack_manifest).
+
+-include("bondy_mst.hrl").
+-include("bondy_mst_pack.hrl").
+
+-moduledoc #{format => "text/markdown"}.
+-moduledoc """
+Per-instance pack-store manifest with atomic rename semantics.
+
+The manifest is the single source of truth for which packs are live
+in an instance's pack-store directory; on every open the page
+store reads it to decide which `.pack` / `.idx` files to map,
+and on every state change (seal, GC, set-root) it is rewritten
+atomically so an interrupted update can never expose a partial
+view.
+
+## On-disk format
+
+A sequence of `file:consult/1`-readable Erlang terms, one per
+line, for human debuggability:
+
+```erlang
+{manifest_version, 1}.
+{instance_id, <<\"registry-shard-17\">>}.
+{hash_algo, sha256}.
+{current_root, <<32 bytes>>}.       %% or `undefined`
+{sealed_packs, [42, 43, 45, 46]}.   %% live pack ids, ascending
+{deleted_through, 41}.               %% no sealed id =< this exists
+{incoming_pack, present}.            %% present | absent
+{schema_version, 1}.
+{created_at, 1715520000000}.
+{last_compacted_at, 1715522400000}.
+```
+
+The format mirrors the WAL manifest (`bondy_log_manifest`).
+Forward-compat: unknown fields parsed from disk are tolerated
+and dropped; missing required fields produce a typed parse
+error.
+
+Terms are written with `~tw`, so a raw binary such as `current_root`
+never renders as a string, and UTF-8 encoded, because `file:consult/1`
+reads UTF-8. A root with bytes in 160..255 reads back intact
+(`encode_survives_high_byte_roots_test_`,
+`write_read_survives_high_byte_root_test_`).
+
+## Durability (write/2)
+
+`write/2` replaces the manifest with `bondy_mst_io:write_file_atomic/2` and
+has its error contract.
+
+## Field semantics
+
+- `sealed_packs` — strictly ascending list of live pack ids.
+  The page-store opens each in turn for the read path; lookups
+  iterate newest-first (largest id first) so recently-written
+  pages are found in fewer probes.
+- `deleted_through` — a watermark; no sealed pack id ≤ this
+  value exists in `sealed_packs`. After GC retires pack 42, the
+  manifest reflects `sealed_packs := old_list \\ [42]` AND
+  `deleted_through := max(old_deleted_through, 42)`.
+- `current_root` — the MST root the writer last `set_root`'d to.
+  The pack store persists the root only here.
+- `incoming_pack` — `present` when `incoming.pack` exists with
+  content; `absent` otherwise. The page store consults this on
+  open to decide whether to scan + truncate the incoming pack.
+
+## Purity boundary
+
+This module performs file I/O (read, write, rename, fsync). The
+encode / decode of terms is pure and exposed for testing; the
+read / write functions touch the filesystem.
+""".
+
+-record(?MODULE, {
+    manifest_version = ?BONDY_MST_PACK_MANIFEST_VERSION :: pos_integer(),
+    instance_id :: binary(),
+    hash_algo :: atom(),
+    current_root :: hash() | undefined,
+    sealed_packs = [] :: [non_neg_integer()],
+    deleted_through = 0 :: non_neg_integer(),
+    incoming_pack = absent :: present | absent,
+    schema_version = 1 :: pos_integer(),
+    created_at :: non_neg_integer(),
+    last_compacted_at :: non_neg_integer()
+}).
+
+-type t() :: #?MODULE{}.
+-type parse_error() ::
+    {missing_field, atom()}
+    | {bad_manifest_version, term()}
+    | {bad_instance_id, term()}
+    | {bad_hash_algo, term()}
+    | {bad_current_root, term()}
+    | {bad_sealed_packs, term()}
+    | {bad_deleted_through, term()}
+    | {bad_incoming_pack, term()}
+    | not_proplist.
+
+-export_type([t/0]).
+-export_type([parse_error/0]).
+
+-export([new/2]).
+-export([read/1]).
+-export([write/2]).
+
+%% Pure codec — exported for testing
+-export([encode/1]).
+-export([decode/1]).
+
+-export([instance_id/1]).
+-export([hash_algo/1]).
+-export([current_root/1]).
+-export([sealed_packs/1]).
+-export([deleted_through/1]).
+-export([incoming_pack/1]).
+-export([created_at/1]).
+-export([last_compacted_at/1]).
+-export([manifest_version/1]).
+
+-export([with_current_root/2]).
+-export([add_sealed_pack/2]).
+-export([remove_sealed_packs/2]).
+-export([with_incoming_pack/2]).
+-export([with_last_compacted_at/2]).
+
+-export([path/1]).
+
+%% =============================================================================
+%% API — lifecycle
+%% =============================================================================
+
+-doc """
+Constructs a fresh manifest for a new pack-store instance.
+
+`InstanceId` is the user-supplied identifier (the same one
+`bondy_oplog_instance` uses). `HashAlgo` is one of the algorithms
+supported by `bondy_mst_pack_codec` (currently only `sha256`).
+
+The fresh manifest carries no sealed packs, no current root,
+and `incoming_pack = absent`.
+""".
+-spec new(InstanceId :: binary(), HashAlgo :: atom()) -> t().
+
+new(InstanceId, HashAlgo) when
+    is_binary(InstanceId),
+    byte_size(InstanceId) > 0,
+    is_atom(HashAlgo)
+->
+    Now = erlang:system_time(millisecond),
+    #?MODULE{
+        instance_id = InstanceId,
+        hash_algo = HashAlgo,
+        current_root = undefined,
+        sealed_packs = [],
+        deleted_through = 0,
+        incoming_pack = absent,
+        created_at = Now,
+        last_compacted_at = Now
+    }.
+
+-doc """
+Reads and parses the manifest at `Dir`. Returns `{ok, T}` or
+`{error, Reason}`.
+
+`Reason` is either an I/O error from `file:consult/1` (missing
+file, permission, etc.) or a parse error from `decode/1`.
+""".
+-spec read(Dir :: file:filename_all()) ->
+    {ok, t()} | {error, term()}.
+
+read(Dir) ->
+    Path = path(Dir),
+    case file:consult(Path) of
+        {ok, Terms} ->
+            case decode(Terms) of
+                {ok, _} = OK -> OK;
+                {error, R} -> unreadable(Path, R)
+            end;
+        {error, enoent} = E ->
+            %% NOT wrapped: `enoent` is the fresh-instance case and
+            %% `bondy_mst_pack_writer:load_or_create_manifest/3` branches on
+            %% it to create the first manifest. Classifying it would turn
+            %% every first open into a hard failure.
+            E;
+        {error, R} ->
+            unreadable(Path, R)
+    end.
+
+%% @private
+%% A manifest that exists but cannot be used — an I/O error, or terms that
+%% fail `decode/1`. Named with its path because this error becomes the raise
+%% from `bondy_mst_pack_store:open_writer/4`, which is the whole of what an
+%% operator sees when a node will not boot; a bare
+%% `{4, file_io_server, invalid_unicode}` identifies neither the instance nor
+%% the file to act on.
+%%
+%% Classified HERE rather than at a caller: `read/1` has three of them
+%% (`bondy_mst_pack_writer`, `bondy_mst_pack_recovery`,
+%% `bondy_mst_pack_reader`), and classifying at one left the other two
+%% reporting the same condition in the original bare shape.
+unreadable(Path, Reason) ->
+    {error, {unreadable, Path, Reason}}.
+
+-doc "Replaces the manifest in `Dir` with `Manifest`; see the moduledoc.".
+-spec write(Dir :: file:filename_all(), t()) ->
+    ok | {error, term()}.
+
+write(Dir, #?MODULE{} = Manifest) ->
+    bondy_mst_io:write_file_atomic(path(Dir), encode(Manifest)).
+
+%% =============================================================================
+%% API — pure codec
+%% =============================================================================
+
+-doc """
+Encodes a manifest to its on-disk binary representation. Pure;
+useful for tests and for callers that want to inspect the
+proposed bytes before committing them.
+""".
+-spec encode(t()) -> binary().
+
+encode(#?MODULE{} = M) ->
+    Terms = [
+        {manifest_version, M#?MODULE.manifest_version},
+        {instance_id, M#?MODULE.instance_id},
+        {hash_algo, M#?MODULE.hash_algo},
+        {current_root, M#?MODULE.current_root},
+        {sealed_packs, M#?MODULE.sealed_packs},
+        {deleted_through, M#?MODULE.deleted_through},
+        {incoming_pack, M#?MODULE.incoming_pack},
+        {schema_version, M#?MODULE.schema_version},
+        {created_at, M#?MODULE.created_at},
+        {last_compacted_at, M#?MODULE.last_compacted_at}
+    ],
+    consult_encode(Terms).
+
+%% @private
+%% The bytes of a `file:consult/1` file, one term per line, UTF-8 encoded
+%% (see the moduledoc). `bondy_connect_consult:encode/1` does the same, but
+%% this library builds standalone and cannot depend on `bondy_connect_lib`.
+consult_encode(Terms) ->
+    unicode:characters_to_binary([io_lib:format("~tw.~n", [T]) || T <- Terms]).
+
+-doc """
+Decodes a list of `file:consult/1`-style terms into a manifest
+record. Validates required fields, type-checks each known field,
+tolerates unknown fields for forward compatibility.
+""".
+-spec decode(list()) -> {ok, t()} | {error, parse_error()}.
+
+decode(Terms) when is_list(Terms) ->
+    case to_map(Terms) of
+        {ok, Map} ->
+            try
+                ManifestVersion = required(manifest_version, Map),
+                validate_manifest_version(ManifestVersion),
+                InstanceId = required(instance_id, Map),
+                validate_instance_id(InstanceId),
+                HashAlgo = required(hash_algo, Map),
+                validate_hash_algo(HashAlgo),
+                CurrentRoot = required(current_root, Map),
+                validate_current_root(CurrentRoot),
+                SealedPacks = required(sealed_packs, Map),
+                validate_sealed_packs(SealedPacks),
+                DeletedThrough = maps:get(deleted_through, Map, 0),
+                validate_deleted_through(DeletedThrough),
+                Incoming = maps:get(incoming_pack, Map, absent),
+                validate_incoming_pack(Incoming),
+                SchemaVersion = maps:get(schema_version, Map, 1),
+                CreatedAt = maps:get(created_at, Map, 0),
+                LastCompactedAt = maps:get(last_compacted_at, Map, CreatedAt),
+                {ok, #?MODULE{
+                    manifest_version = ManifestVersion,
+                    instance_id = InstanceId,
+                    hash_algo = HashAlgo,
+                    current_root = CurrentRoot,
+                    sealed_packs = SealedPacks,
+                    deleted_through = DeletedThrough,
+                    incoming_pack = Incoming,
+                    schema_version = SchemaVersion,
+                    created_at = CreatedAt,
+                    last_compacted_at = LastCompactedAt
+                }}
+            catch
+                throw:{error, _} = E -> E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+%% =============================================================================
+%% API — accessors
+%% =============================================================================
+
+-spec manifest_version(t()) -> pos_integer().
+manifest_version(#?MODULE{manifest_version = V}) -> V.
+
+-spec instance_id(t()) -> binary().
+instance_id(#?MODULE{instance_id = V}) -> V.
+
+-spec hash_algo(t()) -> atom().
+hash_algo(#?MODULE{hash_algo = V}) -> V.
+
+-spec current_root(t()) -> hash() | undefined.
+current_root(#?MODULE{current_root = V}) -> V.
+
+-spec sealed_packs(t()) -> [non_neg_integer()].
+sealed_packs(#?MODULE{sealed_packs = V}) -> V.
+
+-spec deleted_through(t()) -> non_neg_integer().
+deleted_through(#?MODULE{deleted_through = V}) -> V.
+
+-spec incoming_pack(t()) -> present | absent.
+incoming_pack(#?MODULE{incoming_pack = V}) -> V.
+
+-spec created_at(t()) -> non_neg_integer().
+created_at(#?MODULE{created_at = V}) -> V.
+
+-spec last_compacted_at(t()) -> non_neg_integer().
+last_compacted_at(#?MODULE{last_compacted_at = V}) -> V.
+
+%% =============================================================================
+%% API — setters
+%% =============================================================================
+
+-doc """
+Returns a manifest with `current_root` set to `Root` (a 32-byte
+binary or `undefined`).
+""".
+-spec with_current_root(t(), hash() | undefined) -> t().
+
+with_current_root(#?MODULE{} = M, undefined) ->
+    M#?MODULE{current_root = undefined};
+with_current_root(#?MODULE{} = M, Root) when is_binary(Root) ->
+    M#?MODULE{current_root = Root}.
+
+-doc """
+Adds a sealed pack id to `sealed_packs`. The pack id must be
+strictly greater than every existing entry (sealed packs are
+created monotonically). Returns the manifest with the new pack
+appended.
+""".
+-spec add_sealed_pack(t(), non_neg_integer()) -> t().
+
+add_sealed_pack(#?MODULE{sealed_packs = []} = M, PackId) when
+    is_integer(PackId), PackId >= 0
+->
+    M#?MODULE{sealed_packs = [PackId]};
+add_sealed_pack(#?MODULE{sealed_packs = Packs} = M, PackId) when
+    is_integer(PackId), PackId > 0
+->
+    Last = lists:last(Packs),
+    case PackId > Last of
+        true ->
+            M#?MODULE{sealed_packs = Packs ++ [PackId]};
+        false ->
+            error({non_monotone_pack_id, PackId, Last})
+    end.
+
+-doc """
+Removes the given pack ids from `sealed_packs` and advances
+`deleted_through` to `max(deleted_through, max(Retired))`.
+
+Pack ids that aren't currently in `sealed_packs` are ignored
+(idempotent — the caller may pass a closed-set of retired ids
+without filtering).
+""".
+-spec remove_sealed_packs(t(), [non_neg_integer()]) -> t().
+
+remove_sealed_packs(#?MODULE{} = M, []) ->
+    M;
+remove_sealed_packs(
+    #?MODULE{sealed_packs = Packs, deleted_through = DT} = M,
+    Retired
+) when is_list(Retired) ->
+    RetiredSet = sets:from_list(Retired),
+    Remaining = [P || P <- Packs, not sets:is_element(P, RetiredSet)],
+    NewDT =
+        case Retired of
+            [] -> DT;
+            _ -> max(DT, lists:max(Retired))
+        end,
+    M#?MODULE{sealed_packs = Remaining, deleted_through = NewDT}.
+
+-spec with_incoming_pack(t(), present | absent) -> t().
+
+with_incoming_pack(#?MODULE{} = M, present) ->
+    M#?MODULE{incoming_pack = present};
+with_incoming_pack(#?MODULE{} = M, absent) ->
+    M#?MODULE{incoming_pack = absent}.
+
+-spec with_last_compacted_at(t(), non_neg_integer()) -> t().
+
+with_last_compacted_at(#?MODULE{} = M, T) when is_integer(T), T >= 0 ->
+    M#?MODULE{last_compacted_at = T}.
+
+%% =============================================================================
+%% API — file paths
+%% =============================================================================
+
+-spec path(file:filename_all()) -> file:filename_all().
+path(Dir) ->
+    filename:join(Dir, ?BONDY_MST_PACK_MANIFEST_FILENAME).
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
+
+%% @private
+to_map(Terms) ->
+    try
+        {ok,
+            lists:foldl(
+                fun
+                    ({K, V}, Acc) when is_atom(K) ->
+                        Acc#{K => V};
+                    (Other, _Acc) ->
+                        throw({not_proplist, Other})
+                end,
+                #{},
+                Terms
+            )}
+    catch
+        throw:{not_proplist, _} ->
+            {error, not_proplist}
+    end.
+
+%% @private
+required(Key, Map) ->
+    case maps:find(Key, Map) of
+        {ok, V} -> V;
+        error -> throw({error, {missing_field, Key}})
+    end.
+
+%% @private
+validate_manifest_version(V) when is_integer(V), V >= 1 -> ok;
+validate_manifest_version(V) -> throw({error, {bad_manifest_version, V}}).
+
+%% @private
+validate_instance_id(V) when is_binary(V), byte_size(V) > 0 -> ok;
+validate_instance_id(V) -> throw({error, {bad_instance_id, V}}).
+
+%% @private
+%% v1 ships only sha256; reject anything else loudly so a misconfigured
+%% deploy doesn't silently open the wrong store. New algorithms will
+%% bump `manifest_version` so a forward-compatible reader can recognise
+%% them.
+validate_hash_algo(sha256) -> ok;
+validate_hash_algo(V) -> throw({error, {bad_hash_algo, V}}).
+
+%% @private
+validate_current_root(undefined) ->
+    ok;
+validate_current_root(V) when
+    is_binary(V), byte_size(V) =:= ?BONDY_MST_PACK_HASH_BYTES
+->
+    ok;
+validate_current_root(V) ->
+    throw({error, {bad_current_root, V}}).
+
+%% @private
+%% Must be a strictly ascending list of non-negative integers. Empty
+%% list is the fresh-store state.
+validate_sealed_packs([]) ->
+    ok;
+validate_sealed_packs([First | _] = L) when is_integer(First), First >= 0 ->
+    case is_strictly_ascending(L) of
+        true -> ok;
+        false -> throw({error, {bad_sealed_packs, L}})
+    end;
+validate_sealed_packs(V) ->
+    throw({error, {bad_sealed_packs, V}}).
+
+%% @private
+is_strictly_ascending([_]) ->
+    true;
+is_strictly_ascending([A, B | Rest]) when is_integer(B), A < B ->
+    is_strictly_ascending([B | Rest]);
+is_strictly_ascending(_) ->
+    false.
+
+%% @private
+validate_deleted_through(V) when is_integer(V), V >= 0 -> ok;
+validate_deleted_through(V) -> throw({error, {bad_deleted_through, V}}).
+
+%% @private
+validate_incoming_pack(present) -> ok;
+validate_incoming_pack(absent) -> ok;
+validate_incoming_pack(V) -> throw({error, {bad_incoming_pack, V}}).

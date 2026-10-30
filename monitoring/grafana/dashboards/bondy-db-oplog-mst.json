@@ -1,0 +1,4146 @@
+{
+  "uid": "bondy-db-oplog-mst",
+  "title": "Bondy \u2014 bondy_db / oplog / MST",
+  "description": "Storage & replication stack plus router, WAMP, HTTP and BEAM VM: Partisan cluster state, AAE frontier convergence with per-pair drill-down, WAL, applier, core substrate, MST page store.",
+  "tags": [
+    "bondy",
+    "bondy_db",
+    "oplog",
+    "mst"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 16,
+  "refresh": "10s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "node",
+        "label": "Node",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "bondy-prometheus"
+        },
+        "query": {
+          "query": "label_values(up{job=\"bondy\"}, node)",
+          "refId": "var-node"
+        },
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "sort": 1,
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "Applier faults",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "bondy-prometheus"
+        },
+        "enable": true,
+        "iconColor": "red",
+        "expr": "sum(increase(bondy_oplog_applier_faults_total[1m])) > 0",
+        "titleFormat": "Applier fault"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 34,
+      "type": "row",
+      "title": "Write path \u2014 instances & WAL",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Appends vs applied (per node)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node) (rate(bondy_oplog_instance_appends_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "appends {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (node) (rate(bondy_oplog_applier_applied_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "applied {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (node) (rate(bondy_oplog_applier_rejected_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "rejected {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Sustained applied < appends means the applier is falling behind."
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Replication progress \u2014 frontier seq total (per node)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node) (bondy_oplog_instance_frontier_seq_total{node=~\"$node\"})",
+          "legendFormat": "{{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Monotone; a persistent gap between nodes is replication lag."
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Backpressure & fault event rates",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node) (rate(bondy_oplog_instance_backpressure_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "instance bp {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (node) (rate(bondy_oplog_overlay_backpressure_drops_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "overlay drops {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (reason) (rate(bondy_oplog_wal_full_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "wal_full {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum by (kind) (rate(bondy_oplog_applier_faults_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "fault {{kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "E",
+          "expr": "sum by (outcome) (rate(bondy_oplog_remote_appends_total{node=~\"$node\",outcome!=\"ok\"}[$__rate_interval]))",
+          "legendFormat": "remote {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Everything here should normally be zero."
+    },
+    {
+      "id": 38,
+      "type": "state-timeline",
+      "title": "WAL hard backpressure (per node)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (node) (bondy_oplog_wal_backpressure{node=~\"$node\"})",
+          "legendFormat": "{{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "maxDataPoints": 300,
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "ok",
+                  "color": "green",
+                  "index": 0
+                },
+                "0": {
+                  "text": "BACKPRESSURE",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 70,
+            "spanNulls": false
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "rowHeight": 0.85,
+        "alignValue": "center",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "description": "Red bands: at least one WAL writer on the node is refusing appends (max_total_wal_size / max_live_segments)."
+    },
+    {
+      "id": 39,
+      "type": "bargauge",
+      "title": "Live overlay size (top 10 shards)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(10, bondy_oplog_instance_live_size{node=~\"$node\"})",
+          "legendFormat": "{{node}} {{instance_id}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "continuous-BlPu"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "valueMode": "color",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "description": "Unapplied events buffered in the write overlay, right now."
+    },
+    {
+      "id": 40,
+      "type": "bargauge",
+      "title": "WAL size (top 10 shards)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(10, bondy_oplog_wal_size_bytes{node=~\"$node\"})",
+          "legendFormat": "{{node}} {{instance_id}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "color": {
+            "mode": "continuous-BlPu"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "valueMode": "color",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "WAL append throughput (per node)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 17
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node) (rate(bondy_oplog_wal_appended_bytes_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "{{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "Bps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "WAL fsyncs (per mode)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 17
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (mode) (rate(bondy_oplog_wal_fsyncs_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "{{mode}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 43,
+      "type": "heatmap",
+      "title": "WAL fsync duration",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 17
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (le) (rate(bondy_oplog_wal_fsync_duration_microseconds_bucket{node=~\"$node\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "mode": "scheme",
+          "scheme": "Spectral",
+          "steps": 48,
+          "reverse": true
+        },
+        "yAxis": {
+          "unit": "\u00b5s",
+          "decimals": 0
+        },
+        "rowsFrame": {
+          "layout": "auto"
+        },
+        "tooltip": {
+          "mode": "single",
+          "showColorScale": true
+        },
+        "legend": {
+          "show": true
+        },
+        "exemplars": {
+          "color": "rgba(255,0,255,0.7)"
+        }
+      }
+    },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "WAL totals (per node)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 25
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node) (bondy_oplog_wal_size_bytes{node=~\"$node\"})",
+          "legendFormat": "size {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 45,
+      "type": "timeseries",
+      "title": "WAL health (max across shards)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 25
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (node) (bondy_oplog_wal_head_lag_milliseconds{node=~\"$node\"})",
+          "legendFormat": "head lag ms {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (node) (bondy_oplog_wal_live_segments{node=~\"$node\"})",
+          "legendFormat": "live segments {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "max by (node) (bondy_oplog_wal_pending_fsync_bytes{node=~\"$node\"})",
+          "legendFormat": "pending fsync B {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 46,
+      "type": "timeseries",
+      "title": "Write\u2192readable latency (max across shards)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 25
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max({__name__=\"bondy_oplog_write_readable_latency_microseconds\",quantile=\"p50\",node=~\"$node\"})",
+          "legendFormat": "p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max({__name__=\"bondy_oplog_write_readable_latency_microseconds\",quantile=\"p95\",node=~\"$node\"})",
+          "legendFormat": "p95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "max({__name__=\"bondy_oplog_write_readable_latency_microseconds\",quantile=\"p99\",node=~\"$node\"})",
+          "legendFormat": "p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "\u00b5s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 47,
+      "type": "bargauge",
+      "title": "Write\u2192readable p99 (top 10 shards)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 33
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(10, bondy_oplog_write_readable_latency_microseconds{node=~\"$node\",quantile=\"p99\"})",
+          "legendFormat": "{{node}} {{instance_id}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "\u00b5s",
+          "min": 0,
+          "color": {
+            "mode": "continuous-BlPu"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "valueMode": "color",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 148,
+      "type": "timeseries",
+      "title": "WAL consumer lag \u2014 drain backlog (top 10 shards)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 33
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(10, bondy_oplog_wal_consumer_lag_bytes{node=~\"$node\"})",
+          "legendFormat": "{{node}} {{instance_id}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Bytes appended to a shard's WAL but not yet committed by its applier. A steady zero is healthy; a plateau or climb while the node reports converged means the drain is wedged or starved \u2014 the bondy_oplog_drain_stalled alarm fires on the stuck node (see Active alarms)."
+    },
+    {
+      "id": 149,
+      "type": "timeseries",
+      "title": "Reclamation stalled (per shard, by reason)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 33
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node, instance_id, reason) (rate(bondy_oplog_reclamation_stalled_total{node=~\"$node\"}[$__rate_interval])) > 0",
+          "legendFormat": "{{node}} {{instance_id}} {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Shards whose reclamation tick could not certify causal stability, by reason. idle = this replica's tree is empty (fully compacted or never written) - the steady state of a converged quiescent shard; benign, never logged. unconfirmed = a member has no confirmed sync root while this replica HOLDS events - actionable: the named member is down or gone (retire it deliberately if permanent). no_frontier = members confirmed but no local key is covered by every confirmed root - typically a stale confirmed root from a down member."
+    },
+    {
+      "id": 48,
+      "type": "row",
+      "title": "Applier pipeline",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "panels": []
+    },
+    {
+      "id": 49,
+      "type": "heatmap",
+      "title": "Stage duration (all stages)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 42
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (le) (rate(bondy_oplog_applier_batch_duration_microseconds_bucket{node=~\"$node\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "mode": "scheme",
+          "scheme": "Spectral",
+          "steps": 48,
+          "reverse": true
+        },
+        "yAxis": {
+          "unit": "\u00b5s",
+          "decimals": 0
+        },
+        "rowsFrame": {
+          "layout": "auto"
+        },
+        "tooltip": {
+          "mode": "single",
+          "showColorScale": true
+        },
+        "legend": {
+          "show": true
+        },
+        "exemplars": {
+          "color": "rgba(255,0,255,0.7)"
+        }
+      }
+    },
+    {
+      "id": 50,
+      "type": "timeseries",
+      "title": "Stage duration p95 (per stage)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 42
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(bondy_oplog_applier_batch_duration_microseconds_bucket{node=~\"$node\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "\u00b5s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "Stage throughput (items/s)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 42
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (stage) (rate(bondy_oplog_applier_batch_items_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "{{stage}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 52,
+      "type": "timeseries",
+      "title": "MST install & compaction duration p95",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 50
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(bondy_oplog_instance_mst_install_duration_microseconds_bucket{node=~\"$node\"}[$__rate_interval])))",
+          "legendFormat": "mst install",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(bondy_oplog_compaction_duration_microseconds_bucket{node=~\"$node\"}[$__rate_interval])))",
+          "legendFormat": "compaction",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "\u00b5s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 53,
+      "type": "timeseries",
+      "title": "Compactions & GC scheduler",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 50
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node) (rate(bondy_oplog_compactions_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "compactions {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum by (node) (rate(bondy_oplog_compaction_holds_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "held {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (scheduler, event) (rate(bondy_oplog_gc_scheduler_events_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "{{scheduler}} {{event}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(bondy_oplog_gc_scheduler_inflight{node=~\"$node\"})",
+          "legendFormat": "gc in flight",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 54,
+      "type": "timeseries",
+      "title": "Sweeps, publications & reaping",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 50
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(bondy_oplog_applier_sweep_cells_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "sweep {{result}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(bondy_oplog_applier_published_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "published",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(bondy_oplog_applier_origins_reaped_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "origins reaped",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 55,
+      "type": "row",
+      "title": "Core substrate \u2014 reads, cache & registry",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 58
+      },
+      "panels": []
+    },
+    {
+      "id": 56,
+      "type": "timeseries",
+      "title": "Point reads (per namespace)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 59
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (namespace) (rate(bondy_oplog_core_reads_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "{{namespace}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 57,
+      "type": "timeseries",
+      "title": "Range reads (per namespace)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 59
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (namespace) (rate(bondy_oplog_core_ranges_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "{{namespace}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 58,
+      "type": "timeseries",
+      "title": "Cache hit ratio (per namespace)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 59
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg by (namespace) (bondy_oplog_core_cache_hit_ratio{node=~\"$node\"})",
+          "legendFormat": "{{namespace}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 59,
+      "type": "timeseries",
+      "title": "Cache hits vs misses",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 67
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(bondy_oplog_core_cache_hits_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "hits",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(bondy_oplog_core_cache_misses_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "misses",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 60,
+      "type": "timeseries",
+      "title": "Pub/sub subscribers (per namespace)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 67
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (namespace) (bondy_oplog_core_subscribers{node=~\"$node\"})",
+          "legendFormat": "{{namespace}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 61,
+      "type": "timeseries",
+      "title": "Registry size & memory (per node)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 67
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (node) (bondy_registry_size{node=~\"$node\"})",
+          "legendFormat": "size {{node}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (node) (bondy_registry_memory{node=~\"$node\"})",
+          "legendFormat": "memory (bytes) {{node}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Registry substrate size (approximate entry count) and memory, from bondy_registry:info/0 at scrape time. (The old bondy_registry_trie_* names came from a collector that was never registered \u2014 dead since authoring.)"
+    },
+    {
+      "id": 62,
+      "type": "row",
+      "title": "Leveled projection store (LSM)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 75
+      },
+      "panels": []
+    },
+    {
+      "id": 63,
+      "type": "timeseries",
+      "title": "Penciller work backlog (max per node)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 76
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (node) (bondy_leveled_penciller_backlog{node=~\"$node\"})",
+          "legendFormat": "{{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "The LSM write-stall signal: sustained backlog means compaction cannot keep up with the write rate."
+    },
+    {
+      "id": 64,
+      "type": "state-timeline",
+      "title": "Penciller pending work",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 76
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (node, kind) (bondy_leveled_penciller_pending{node=~\"$node\"})",
+          "legendFormat": "{{node}} {{kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "maxDataPoints": 300,
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "pending",
+                  "color": "yellow",
+                  "index": 0
+                },
+                "0": {
+                  "text": "idle",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 70,
+            "spanNulls": false
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "rowHeight": 0.85,
+        "alignValue": "center",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "description": "L0 flush / manifest change pending on any bookie of the node."
+    },
+    {
+      "id": 65,
+      "type": "bargauge",
+      "title": "SST files per LSM level",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 76
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (level) (bondy_leveled_level_files{node=~\"$node\"})",
+          "legendFormat": "L{{level}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "continuous-BlPu"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "valueMode": "color",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "description": "File distribution across ledger levels (all bookies)."
+    },
+    {
+      "id": 66,
+      "type": "timeseries",
+      "title": "Bookie caches (max per node)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 84
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (node) (bondy_leveled_ledger_cache_size{node=~\"$node\"})",
+          "legendFormat": "ledger cache {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (node) (bondy_leveled_penciller_cache_size{node=~\"$node\"})",
+          "legendFormat": "penciller L0 {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 67,
+      "type": "timeseries",
+      "title": "Journal state",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 84
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (node) (bondy_leveled_active_journal_files{node=~\"$node\"})",
+          "legendFormat": "active files {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "min by (node) (bondy_leveled_journal_compaction_score{node=~\"$node\"})",
+          "legendFormat": "compaction score {{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 68,
+      "type": "timeseries",
+      "title": "Sampled fetches by resolution level",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 84
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (level) (bondy_leveled_fetches{node=~\"$node\"})",
+          "legendFormat": "{{level}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Where reads resolve: mem/0/1 = cache-warm; 2/3/lower = deep, read-amplified fetches."
+    },
+    {
+      "id": 69,
+      "type": "timeseries",
+      "title": "Mean op time (per op, max across bookies)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 92
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (op) (bondy_leveled_mean_op_time_microseconds{node=~\"$node\"})",
+          "legendFormat": "{{op}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "\u00b5s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Sampled (10% of ops) GET/HEAD/PUT stage means."
+    },
+    {
+      "id": 70,
+      "type": "row",
+      "title": "MST & page store",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 100
+      },
+      "panels": []
+    },
+    {
+      "id": 71,
+      "type": "timeseries",
+      "title": "MST merges",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 101
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(bondy_mst_merges_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(bondy_mst_merges_abandoned_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "abandoned",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 72,
+      "type": "heatmap",
+      "title": "MST merge duration",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 101
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (le) (rate(bondy_mst_merge_duration_microseconds_bucket{node=~\"$node\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "mode": "scheme",
+          "scheme": "Spectral",
+          "steps": 48,
+          "reverse": true
+        },
+        "yAxis": {
+          "unit": "\u00b5s",
+          "decimals": 0
+        },
+        "rowsFrame": {
+          "layout": "auto"
+        },
+        "tooltip": {
+          "mode": "single",
+          "showColorScale": true
+        },
+        "legend": {
+          "show": true
+        },
+        "exemplars": {
+          "color": "rgba(255,0,255,0.7)"
+        }
+      }
+    },
+    {
+      "id": 73,
+      "type": "timeseries",
+      "title": "Page store ops",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 101
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (op) (rate(bondy_mst_page_store_ops_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "{{op}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 74,
+      "type": "timeseries",
+      "title": "Page store throughput",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 109
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (op) (rate(bondy_mst_page_store_bytes_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "{{op}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "Bps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 75,
+      "type": "timeseries",
+      "title": "Pack seals (per kind)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 109
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(bondy_mst_seals_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "{{kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "seal_incoming = full synchronous seal; seal_roll = cheap synchronous half of an async seal."
+    },
+    {
+      "id": 76,
+      "type": "timeseries",
+      "title": "Pack seal duration p95 (per kind)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 109
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(bondy_mst_seal_duration_microseconds_bucket{node=~\"$node\"}[$__rate_interval])))",
+          "legendFormat": "{{kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "\u00b5s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 77,
+      "type": "timeseries",
+      "title": "Space reclaimed",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 117
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(bondy_mst_page_store_gc_freed_bytes_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "page store gc",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(bondy_oplog_wal_retention_freed_bytes_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "wal retention",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "Bps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 78,
+      "type": "timeseries",
+      "title": "CRDT gossip (broadcast)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 117
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (direction) (rate(bondy_mst_broadcast_bytes_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "{{direction}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "Bps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 79,
+      "type": "status-history",
+      "title": "Integrity events (any cell red = investigate)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 117
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(bondy_oplog_wal_scrub_corruption_total{node=~\"$node\"}[$__interval]))",
+          "legendFormat": "scrub corruption",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(increase(bondy_mst_page_store_recoveries_total{node=~\"$node\",result!=\"ok\"}[$__interval]))",
+          "legendFormat": "pack recovery failed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(increase(bondy_mst_pack_idx_rebuilds_total{node=~\"$node\",result!=\"ok\"}[$__interval]))",
+          "legendFormat": "idx rebuild failed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(increase(bondy_oplog_wal_recoveries_total{node=~\"$node\"}[$__interval]))",
+          "legendFormat": "wal recovery",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "E",
+          "expr": "sum(increase(bondy_oplog_applier_faults_total{node=~\"$node\"}[$__interval]))",
+          "legendFormat": "applier fault",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "maxDataPoints": 60,
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 80
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "rowHeight": 0.85,
+        "colWidth": 0.9,
+        "showValue": "never",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "description": "Discrete integrity events over time. All rows should stay green."
+    },
+    {
+      "id": 80,
+      "type": "row",
+      "title": "Secondary indexes",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 125
+      },
+      "panels": []
+    },
+    {
+      "id": 81,
+      "type": "timeseries",
+      "title": "Flush throughput (per index)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 126
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (namespace, index) (rate(bondy_oplog_secondary_flush_ops_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "{{namespace}}/{{index}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 82,
+      "type": "heatmap",
+      "title": "Flush duration",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 126
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (le) (rate(bondy_oplog_secondary_flush_duration_microseconds_bucket{node=~\"$node\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "mode": "scheme",
+          "scheme": "Spectral",
+          "steps": 48,
+          "reverse": true
+        },
+        "yAxis": {
+          "unit": "\u00b5s",
+          "decimals": 0
+        },
+        "rowsFrame": {
+          "layout": "auto"
+        },
+        "tooltip": {
+          "mode": "single",
+          "showColorScale": true
+        },
+        "legend": {
+          "show": true
+        },
+        "exemplars": {
+          "color": "rgba(255,0,255,0.7)"
+        }
+      }
+    },
+    {
+      "id": 83,
+      "type": "timeseries",
+      "title": "Saturation & rebuilds",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 126
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (namespace, index) (rate(bondy_oplog_secondary_saturated_dropped_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "dropped {{namespace}}/{{index}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (namespace, index) (rate(bondy_oplog_secondary_rebuilds_total{node=~\"$node\"}[$__rate_interval]))",
+          "legendFormat": "rebuild {{namespace}}/{{index}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": true,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 150,
+      "type": "row",
+      "title": "WAL \u2014 throughput, durability & maintenance",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 134
+      },
+      "panels": []
+    },
+    {
+      "id": 151,
+      "type": "timeseries",
+      "title": "WAL throughput (by instance)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "Frames and operations appended, and the bytes they carried. Ops per append is the batching factor: a flat ops line with a rising appends line means batches are getting smaller.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 135
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_wal_appends_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "appends {{instance_id}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_wal_appended_ops_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "ops {{instance_id}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 152,
+      "type": "timeseries",
+      "title": "WAL durability \u2014 fsync bytes & blocked callers",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "Bytes made durable, against callers parked waiting for that to happen. Waiters standing above zero means append latency is being paid by the caller, not absorbed by the batch.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 135
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_wal_fsync_bytes_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "fsync B/s {{instance_id}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (bondy_oplog_wal_waiters{node=~\"$node\"})",
+          "legendFormat": "waiters {{instance_id}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 153,
+      "type": "timeseries",
+      "title": "WAL maintenance \u2014 rotations, retention & scrub",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "Segment lifecycle. Retention deletions should track rotations; if they stop while rotations continue, the log is growing without bound. Scrub runs read frames back to verify them.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 143
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_wal_rotations_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "rotations {{instance_id}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_wal_retention_deleted_segments_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "segments deleted {{instance_id}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_wal_scrub_runs_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "scrub runs {{instance_id}}",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_wal_scrub_frames_checked_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "frames checked {{instance_id}}",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 154,
+      "type": "timeseries",
+      "title": "WAL codec \u2014 compression ratio",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "Bytes in against bytes out through the WAL codec, plus the operation count. Output over input IS the compression ratio; the two lines converging means compression has stopped paying.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 143
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_wal_codec_input_bytes_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "in B/s {{instance_id}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_wal_codec_output_bytes_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "out B/s {{instance_id}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_wal_codec_ops_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "codec ops {{instance_id}}",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 155,
+      "type": "stat",
+      "title": "WAL bytes truncated by recovery",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "Bytes discarded at open because the tail could not be verified - a torn write from an unclean stop. Non-zero after a crash is expected; non-zero on a clean boot is not.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 151
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum(increase(bondy_oplog_wal_recovery_truncated_bytes_total{node=~\"$node\"}[1h])) or vector(0)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 156,
+      "type": "row",
+      "title": "MST \u2014 GC, page store & seal",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 155
+      },
+      "panels": []
+    },
+    {
+      "id": 157,
+      "type": "timeseries",
+      "title": "MST GC & page-store reclamation",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "GC runs against what they actually reclaimed. Runs climbing while packs retired and pages dropped stay flat means GC is finding nothing to free.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 156
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (result) (rate(bondy_mst_gc_runs_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "mst gc runs {{result}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_mst_page_store_gc_runs_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "page-store gc runs {{instance_id}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_mst_page_store_gc_packs_retired_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "packs retired {{instance_id}}",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_mst_page_store_gc_pages_dropped_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "pages dropped {{instance_id}}",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 158,
+      "type": "timeseries",
+      "title": "MST seal & broadcast",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "Records and bytes written by the sealing worker, and the broadcasts the tree emitted. Seal is off the hot path; a stall shows here before it shows as page-store growth.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 156
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_mst_seal_records_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "seal records {{instance_id}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_mst_seal_bytes_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "seal B/s {{instance_id}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (direction) (rate(bondy_mst_broadcasts_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "broadcasts {{direction}}",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 159,
+      "type": "row",
+      "title": "Applier, instances & core substrate",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 164
+      },
+      "panels": []
+    },
+    {
+      "id": 160,
+      "type": "timeseries",
+      "title": "Applier \u2014 events, replays & skips",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "Events applied, cells re-presented by replay, publications skipped, and validator refreshes. Replayed cells rising without applied events rising is the applier doing work that lands nowhere.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 165
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_apply_events_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "applied {{instance_id}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_applier_replayed_cells_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "replayed cells {{instance_id}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_applier_publish_skipped_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "publish skipped {{instance_id}}",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (outcome) (rate(bondy_oplog_applier_validator_refreshes_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "validator refresh {{outcome}}",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 161,
+      "type": "timeseries",
+      "title": "Instance state \u2014 lifecycle, frontier origins & MST installs",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "Lifecycle code per instance (pre_bootstrap vs live), how many origins each applied frontier carries, and items installed into the MST. Origins only ever grows; a jump means a new writer appeared.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 165
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (bondy_oplog_instance_lifecycle_code{node=~\"$node\"})",
+          "legendFormat": "lifecycle {{instance_id}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (bondy_oplog_instance_frontier_origins{node=~\"$node\"})",
+          "legendFormat": "origins {{instance_id}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (instance_id) (rate(bondy_oplog_instance_mst_install_items_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "mst installs {{instance_id}}",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 162,
+      "type": "timeseries",
+      "title": "Core substrate \u2014 read & range throughput",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "Reads and range scans per second across the substrate. Freshness lag moved to its own panel: it is measured in milliseconds and does not belong on a throughput axis.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 173
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum(bondy_oplog_core_read_rps{node=~\"$node\"})",
+          "legendFormat": "read rps",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum(bondy_oplog_core_range_rps{node=~\"$node\"})",
+          "legendFormat": "range rps",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 163,
+      "type": "timeseries",
+      "title": "Write-to-readable latency p95 (by instance)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "How long a committed write takes to become readable. This is the number an application notices; WAL fsync latency is only one term in it.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 173
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "\u00b5s",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, instance_id) (rate(bondy_oplog_write_readable_latency_us_bucket{node=~\"$node\"}[5m])))",
+          "legendFormat": "p95 {{instance_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 164,
+      "type": "timeseries",
+      "title": "Bootstrap duration p95 & origin retirements",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "Time a catalogue or snapshot bootstrap takes, and origins retired from the frontier. Retirement is what lets a departed writer stop pinning truncation.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 181
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "\u00b5s",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(bondy_oplog_bootstrap_duration_microseconds_bucket{node=~\"$node\"}[5m])))",
+          "legendFormat": "bootstrap p95 {{outcome}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "expr": "sum by (outcome) (rate(bondy_oplog_retirements_total{node=~\"$node\"}[5m]))",
+          "legendFormat": "retirements {{outcome}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 165,
+      "type": "timeseries",
+      "title": "AE freshness lag (max per namespace)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bondy-prometheus"
+      },
+      "description": "Time since each namespace's PRIMARY shards were last AE-bumped, which is the value the auth fence compares against auth_max_lag: bondy_auth -> bondy_db:ensure_fresh/2 -> bondy_oplog_core:ensure_fresh/2, which iterates primary_shards_for/1. The AE heartbeat bumps these on every successful sync round, so they stay flat on an idle cluster with no writes at all - a rising line means AE itself has stopped, not that traffic stopped.\n\nSecondary index shards are deliberately excluded: nothing bumps their atomic, and they are written from the same cell apply as their primary so they carry no freshness of their own. Use bondy_oplog_core_ae_lag_milliseconds for the per-shard, per-index view.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 189
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bondy-prometheus"
+          },
+          "refId": "A",
+          "expr": "max by (namespace) (bondy_oplog_core_freshness_lag_max_milliseconds{node=~\"$node\"})",
+          "legendFormat": "{{namespace}}"
+        }
+      ]
+    }
+  ],
+  "links": [
+    {
+      "title": "Cluster Sync / AAE",
+      "url": "/d/bondy-cluster-sync",
+      "type": "link",
+      "icon": "external link",
+      "targetBlank": false,
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "asDropdown": false
+    },
+    {
+      "title": "Cluster Overview",
+      "type": "link",
+      "tags": [],
+      "url": "/d/bondy-cluster-overview",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true
+    },
+    {
+      "title": "Router / WAMP",
+      "type": "link",
+      "url": "/d/bondy-router-wamp",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true
+    },
+    {
+      "title": "Runtime / BEAM",
+      "type": "link",
+      "url": "/d/bondy-runtime-beam",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true
+    },
+    {
+      "title": "MCP Gateway",
+      "type": "link",
+      "url": "/d/bondy-mcp",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true
+    }
+  ]
+}

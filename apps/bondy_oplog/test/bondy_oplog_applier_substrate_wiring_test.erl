@@ -1,0 +1,198 @@
+%% =============================================================================
+%% End-to-end tests for the applier's substrate read-side wiring.
+%%
+%% Verifies:
+%%   - `publish_ns` + `publish_fun` opts forward verified events to
+%%     `bondy_oplog_core:publish/4`; subscribers receive matching events.
+%%   - `publish_fun` returning `skip` suppresses delivery without
+%%     wedging the applier.
+%%   - A commit leaves the AE counters of the instance's `ae_targets` at
+%%     the "infinitely stale" sentinel: only an anti-entropy round confirms
+%%     freshness (`bondy_oplog_sync_ae_bump_test`,
+%%     `proofs/quint/specs/AuthFence.qnt`).
+%%   - Defaults (no opts) leave the publish wire a strict no-op.
+%% =============================================================================
+
+-module(bondy_oplog_applier_substrate_wiring_test).
+
+-include_lib("eunit/include/eunit.hrl").
+
+setup() ->
+    {ok, _} = application:ensure_all_started(bondy_db),
+    ok.
+
+cleanup(_) ->
+    [bondy_oplog:stop_instance(I) || I <- bondy_oplog:list_instances()],
+    [
+        bondy_oplog_core_registry:unregister(NS, primary, 0)
+     || NS <- bondy_oplog_core_registry:namespaces()
+    ],
+    ok.
+
+wiring_test_() ->
+    {setup, fun setup/0, fun cleanup/1, [
+        fun publish_default_is_noop/0,
+        fun publish_forwards_events_to_subscribers/0,
+        fun publish_skip_suppresses_delivery/0,
+        fun publish_partial_opts_are_rejected/0,
+        fun commit_does_not_bump_ae_targets/0
+    ]}.
+
+%% =============================================================================
+%% Publish wiring
+%% =============================================================================
+
+publish_default_is_noop() ->
+    Id = mk_id(),
+    NS = ns_of(Id),
+    {ok, SubRef} = bondy_oplog_core:subscribe(NS, all),
+    {ok, _} = bondy_oplog_test_projection:start_instance(Id),
+    _ = bondy_oplog:append(Id, {set, 1, <<"v">>}),
+    ok = bondy_oplog_test_projection:drain(Id),
+    ?assertEqual(no_message, recv_one(50)),
+    ok = bondy_oplog_core:unsubscribe(SubRef),
+    ok = bondy_oplog:stop_instance(Id).
+
+publish_forwards_events_to_subscribers() ->
+    Id = mk_id(),
+    NS = ns_of(Id),
+    {ok, SubRef} = bondy_oplog_core:subscribe(NS, all),
+    Fun = fun(E) ->
+        Op = bondy_oplog_event:op(E),
+        {derived_key_of(Op), Op}
+    end,
+    {ok, _} = bondy_oplog_test_projection:start_instance(Id, #{
+        applier => #{
+            publish_ns => NS,
+            publish_fun => Fun
+        }
+    }),
+    _ = bondy_oplog:append(Id, {set, 1, <<"alpha">>}),
+    _ = bondy_oplog:append(Id, {set, 2, <<"beta">>}),
+    %% Drain so `apply_batch` has run for both events and therefore
+    %% publish has fired.
+    ok = bondy_oplog_test_projection:drain(Id),
+    Msgs = collect_messages(2, 1000),
+    [{NS_A, K_A, _Hlc_A, Op_A}, {NS_B, K_B, _Hlc_B, Op_B}] = Msgs,
+    ?assertEqual(NS, NS_A),
+    ?assertEqual(NS, NS_B),
+    ?assertEqual(<<"key:1">>, K_A),
+    ?assertEqual(<<"key:2">>, K_B),
+    ?assertEqual({set, 1, <<"alpha">>}, Op_A),
+    ?assertEqual({set, 2, <<"beta">>}, Op_B),
+    ok = bondy_oplog_core:unsubscribe(SubRef),
+    ok = bondy_oplog:stop_instance(Id).
+
+publish_skip_suppresses_delivery() ->
+    Id = mk_id(),
+    NS = ns_of(Id),
+    {ok, SubRef} = bondy_oplog_core:subscribe(NS, all),
+    Fun = fun(E) ->
+        case bondy_oplog_event:op(E) of
+            {set, _, _} = Op -> {<<"k">>, Op};
+            {clear, _} -> skip
+        end
+    end,
+    {ok, _} = bondy_oplog_test_projection:start_instance(Id, #{
+        applier => #{
+            publish_ns => NS,
+            publish_fun => Fun
+        }
+    }),
+    _ = bondy_oplog:append(Id, {set, 1, <<"a">>}),
+    _ = bondy_oplog:append(Id, {clear, 2}),
+    _ = bondy_oplog:append(Id, {set, 3, <<"b">>}),
+    ok = bondy_oplog_test_projection:drain(Id),
+    Msgs = collect_messages(2, 1000),
+    Ops = [Op || {_NS, _K, _H, Op} <- Msgs],
+    ?assertEqual([{set, 1, <<"a">>}, {set, 3, <<"b">>}], Ops),
+    ?assertEqual(no_message, recv_one(50)),
+    ok = bondy_oplog_core:unsubscribe(SubRef),
+    ok = bondy_oplog:stop_instance(Id).
+
+publish_partial_opts_are_rejected() ->
+    %% `publish_ns` without `publish_fun` is rejected at applier init.
+    Id = mk_id(),
+    NS = ns_of(Id),
+    Result = bondy_oplog_test_projection:start_instance(Id, #{
+        applier => #{publish_ns => NS}
+    }),
+    %% The dynamic supervisor returns the start_link error; here we
+    %% just assert it isn't `ok` and isn't silently swallowed.
+    ?assertMatch({error, _}, Result),
+    %% No instance to stop on the error path.
+    case bondy_oplog:list_instances() of
+        L -> false = lists:member(Id, L)
+    end,
+    ok.
+
+commit_does_not_bump_ae_targets() ->
+    Id = mk_id(),
+    NS = ns_of(Id),
+    ok = register_shard(NS, 0),
+    {ok, _} = bondy_oplog_test_projection:start_instance(Id, #{
+        applier => #{ae_targets => [{NS, primary, 0}], commit_every => 1}
+    }),
+    _ = bondy_oplog:append(Id, {set, 1, <<"v">>}),
+    ok = bondy_oplog_test_projection:drain(Id),
+    ok = bondy_oplog:stop_instance(Id),
+    ?assertEqual(
+        sentinel(), bondy_oplog_core_registry:last_ae_at(NS, primary, 0)
+    ),
+    ok = bondy_oplog_core_registry:unregister(NS, primary, 0).
+
+%% =============================================================================
+%% Helpers
+%% =============================================================================
+
+mk_id() ->
+    list_to_binary(
+        "wiring_" ++
+            integer_to_list(erlang:unique_integer([positive, monotonic]))
+    ).
+
+ns_of(Id) when is_binary(Id) ->
+    binary_to_atom(<<"ns_", Id/binary>>, utf8).
+
+register_shard(NS, Shard) ->
+    register_shard(NS, primary, Shard).
+
+register_shard(NS, Index, Shard) ->
+    bondy_oplog_core_registry:register(NS, Index, Shard, #{
+        shard_count => 1,
+        cache_adapter => bondy_oplog_cache_ets,
+        cache_handle => undefined,
+        projection_adapter => bondy_oplog_projection_adapter,
+        projection_handle => undefined,
+        fold_module => lww_register,
+        overlay => disabled
+    }).
+
+sentinel() ->
+    %% Matches `bondy_oplog_core_registry`'s "infinitely stale" sentinel.
+    -(1 bsl 62).
+
+derived_key_of({set, H, _V}) ->
+    iolist_to_binary(["key:", integer_to_list(H)]);
+derived_key_of({clear, H}) ->
+    iolist_to_binary(["key:", integer_to_list(H)]).
+
+collect_messages(N, TimeoutMs) ->
+    collect_messages(N, TimeoutMs, []).
+
+collect_messages(0, _Timeout, Acc) ->
+    lists:reverse(Acc);
+collect_messages(N, Timeout, Acc) ->
+    receive
+        {bondy_oplog_core_event, NS, K, H, Op} ->
+            collect_messages(N - 1, Timeout, [{NS, K, H, Op} | Acc])
+    after Timeout ->
+        lists:reverse(Acc)
+    end.
+
+recv_one(Timeout) ->
+    receive
+        {bondy_oplog_core_event, _, _, _, _} = M -> M
+    after Timeout ->
+        no_message
+    end.
