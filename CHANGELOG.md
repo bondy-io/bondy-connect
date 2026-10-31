@@ -11,6 +11,7 @@
 * A user whose password was stored before the 1.2 password format (`1.0` or `1.1` records, as a legacy backup import carries them) was offered WAMP-CRA, and the challenge crashed the connection. Such a password now serves the `password` method and the OAuth2 password grant only; changing it stores the current format, which WAMP-CRA and WAMP-SCRAM accept.
 * A refused WAMP authentication is logged at `info` as "WAMP authentication failed", with the reason, the authid, the method being answered and the requested methods; the realm and source IP are in the log metadata. The client still receives the generic `wamp.error.authentication_failed`.
 * Partisan 6.3.2. A node that crashed and returned on a new address, such as a Kubernetes StatefulSet pod recreated with a new IP, left its previous address in the cluster membership, and every node kept retrying it. The previous address is now pruned, and the returning node is not reported down when it is. See the [Partisan changelog](https://github.com/lasp-lang/partisan/blob/v6.3.2/CHANGELOG.md).
+* The master-realm hardening warnings and the default admin password warning no longer contain internal review identifiers ("(D-1)", "(D-2)"). A log alert that matched them needs updating.
 
 ## 1.0.0
 

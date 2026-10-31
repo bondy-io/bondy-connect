@@ -2131,7 +2131,7 @@ remediate_legacy_anon(#realm{uri = Uri} = Realm) ->
     _ = update(Uri, #{<<"authmethods">> => NewMethods}),
     ?LOG_WARNING(#{
         description =>
-            "Master realm hardening (D-2): removed anonymous authentication from "
+            "Master realm hardening: removed anonymous authentication from "
             "the master realm. Anonymous clients can no longer connect to the "
             "administrative control plane.",
         realm => Uri
@@ -2151,14 +2151,14 @@ remediate_legacy_anon(#realm{uri = Uri} = Realm) ->
         ok ->
             ?LOG_WARNING(#{
                 description =>
-                    "Master realm hardening (D-2): revoked the anonymous wamp.* "
+                    "Master realm hardening: revoked the anonymous wamp.* "
                     "grant on the master realm.",
                 realm => Uri
             });
         {error, Reason} ->
             ?LOG_WARNING(#{
                 description =>
-                    "Master realm hardening (D-2): could not auto-revoke the "
+                    "Master realm hardening: could not auto-revoke the "
                     "anonymous master-realm grant; remove it manually.",
                 realm => Uri,
                 reason => Reason
@@ -2179,7 +2179,7 @@ maybe_warn_legacy_admin_password(#realm{uri = Uri}) ->
                             ?LOG_WARNING(#{
                                 description =>
                                     "The master realm 'admin' user still uses the "
-                                    "legacy default password 'bondy-admin' (D-1). "
+                                    "legacy default password 'bondy-admin'. "
                                     "Rotate it immediately via "
                                     "'security.admin_user.password' or the admin "
                                     "API.",
