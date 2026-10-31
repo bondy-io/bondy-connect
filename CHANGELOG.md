@@ -6,6 +6,7 @@
 
 ### New Features
 * The `bondy_auth_fence_closed` alarm (critical) is raised when the authentication freshness fence has refused every new authentication for longer than `db.aae.fence.alarm` (default `5m`, `0` disables), and cleared when it admits again. It does not affect readiness. See [Database options](doc/guides/configuration/database_options.md).
+* Alpine Linux images are published again, for `linux/amd64` and `linux/arm64`, as `<version>-alpine` (`leapsight/bondy-connect:1.0.1-alpine`, `ghcr.io/bondy-io/bondy-connect:1.0.1-alpine`). The image without a suffix, and `latest`, stay on Debian.
 
 ### Fixes
 * A user whose password was stored before the 1.2 password format (`1.0` or `1.1` records, as a legacy backup import carries them) was offered WAMP-CRA, and the challenge crashed the connection. Such a password now serves the `password` method and the OAuth2 password grant only; changing it stores the current format, which WAMP-CRA and WAMP-SCRAM accept.

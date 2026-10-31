@@ -167,6 +167,7 @@ default listeners:
 
 The images are built for `linux/amd64` and `linux/arm64`. They are published as
 `leapsight/bondy-connect:<version>` and `ghcr.io/bondy-io/bondy-connect:<version>`.
+From 1.0.1, each version also has an Alpine Linux image, `<version>-alpine`.
 
 ### Building from source
 
