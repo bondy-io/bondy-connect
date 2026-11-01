@@ -8,7 +8,7 @@
 the API gateway `is_authorized/3` per-scheme fail-closed logic.
 
 Only an endpoint declaring an EMPTY security map is served anonymously; every
-declared-but-unenforced scheme (`basic`, `oidc`, `api_key`) and any unknown
+declared-but-unenforced scheme (`basic`, `api_key`) and any unknown
 scheme must fail closed instead of falling through to anonymous access.
 """.
 
@@ -23,9 +23,6 @@ ia(Security) ->
 
 basic_fails_closed_test() ->
     ?assertMatch({false, _, _}, ia(#{<<"type">> => <<"basic">>})).
-
-oidc_fails_closed_test() ->
-    ?assertMatch({false, _, _}, ia(#{<<"type">> => <<"oidc">>})).
 
 api_key_fails_closed_test() ->
     ?assertMatch({false, _, _}, ia(#{<<"type">> => <<"api_key">>})).

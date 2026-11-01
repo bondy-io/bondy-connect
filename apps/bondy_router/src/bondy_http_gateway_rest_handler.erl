@@ -91,6 +91,7 @@ The status is derived from the error's URI by
     local_operator => true,
     is_anonymous => boolean(),
     authid => binary() | undefined,
+    authroles => [binary()],
     encoding => binary() | json | msgpack,
     proxy_protocol => bondy_http_proxy_protocol:t(),
     source_ip => inet:ip_address()
@@ -456,18 +457,68 @@ is_authorized(_, Req, #{security := #{<<"type">> := <<"api_key">>}} = St) ->
         request => Req
     }),
     {false, Req, St};
-is_authorized(_, Req, #{security := #{<<"type">> := Type}} = St) when
-    Type == <<"basic">> orelse Type == <<"oidc">>
-->
-    %% `basic` and `oidc` are first-class schemes in the spec parser but
-    %% have NO runtime enforcement here. They MUST fail closed — falling through
-    %% to the anonymous branch below would serve the endpoint unauthenticated
-    %% even though the operator declared it protected.
+is_authorized(
+    Method, Req0, #{security := #{<<"type">> := <<"oidc">>}} = St0
+) ->
+    %% The checks a WAMP session opened with the same cookie gets
+    %% (`bondy_wamp_protocol`'s cookie clause): the realm's methods through
+    %% `bondy_auth`, scope and issuer through the `cookie` method.
+    RealmUri = maps:get(realm_uri, St0),
+    SourceIP = maps:get(source_ip, St0),
+
+    try
+        Claims = ticket_cookie_claims(RealmUri, Req0),
+        ok = check_csrf(Method, Req0),
+        Authid = maps:get(authid, Claims),
+        Authroles = maps:get(authroles, Claims, []),
+        Ctxt0 =
+            case
+                bondy_auth:init(
+                    bondy_session_id:new(),
+                    RealmUri,
+                    Authid,
+                    Authroles,
+                    SourceIP,
+                    #{claims => Claims}
+                )
+            of
+                {ok, InitCtxt} -> InitCtxt;
+                {error, InitReason} -> throw(InitReason)
+            end,
+        case bondy_auth:authenticate(?WAMP_COOKIE_AUTH, Claims, #{}, Ctxt0) of
+            {ok, _, Ctxt1} ->
+                St1 = St0#{
+                    is_anonymous => false,
+                    authid => Authid,
+                    authroles => bondy_auth:roles(Ctxt1)
+                },
+                {true, Req0, St1};
+            {error, Reason} ->
+                throw(Reason)
+        end
+    catch
+        throw:csrf_validation_failed ->
+            Req1 = set_resp_headers(eval_headers(Req0, St0), Req0),
+            Response = #{
+                <<"body">> => #{<<"code">> => <<"csrf_validation_failed">>},
+                <<"headers">> => #{}
+            },
+            {stop, reply(?HTTP_FORBIDDEN, json, Response, Req1), St0};
+        throw:EReason ->
+            Req1 = set_resp_headers(eval_headers(Req0, St0), Req0),
+            Req2 = reply_auth_error(
+                EReason, <<"Cookie">>, RealmUri, json, Req1
+            ),
+            {stop, Req2, St0}
+    end;
+is_authorized(_, Req, #{security := #{<<"type">> := <<"basic">>}} = St) ->
+    %% `basic` parses but has no runtime enforcement, so it fails closed:
+    %% the anonymous branch below would serve a route declared protected.
     ?LOG_WARNING(#{
         description =>
             "Denying request: the endpoint's HTTP security scheme is not "
             "enforced at runtime (fail-closed).",
-        type => Type,
+        type => <<"basic">>,
         request => Req
     }),
     {false, Req, St};
@@ -489,6 +540,35 @@ is_authorized(_, Req, #{security := Security} = St) ->
         request => Req
     }),
     {false, Req, St}.
+
+%% @private
+%% Only the cookie the OIDC authorization code flow sets: a browser sends it
+%% unasked, which is why `check_csrf/2` guards every unsafe method.
+ticket_cookie_claims(RealmUri, Req) ->
+    Cookies = bondy_http_utils:safe_parse_cookies(Req),
+    case bondy_http_utils:find_ticket_cookie(RealmUri, Cookies) of
+        {value, {_, Ticket}} when Ticket =/= <<>> ->
+            case bondy_ticket:verify(Ticket) of
+                {ok, Claims} -> Claims;
+                {error, Reason} -> throw(Reason)
+            end;
+        {value, {_, <<>>}} ->
+            throw(invalid_credentials);
+        false ->
+            throw(invalid_credentials)
+    end.
+
+%% @private
+check_csrf(Method, _) when
+    Method == <<"GET">> orelse Method == <<"HEAD">> orelse
+        Method == <<"OPTIONS">>
+->
+    ok;
+check_csrf(_, Req) ->
+    case bondy_http_utils:validate_csrf(Req) of
+        ok -> ok;
+        {error, forbidden} -> throw(csrf_validation_failed)
+    end.
 
 %% @private
 authenticate(Token, Ctxt0, Req0, St0) ->
@@ -1181,6 +1261,8 @@ authid(St) ->
     maps:get(authid, St).
 
 %% @private
+authroles(#{authroles := Roles}) ->
+    Roles;
 authroles(#{api_context := #{<<"security">> := #{<<"groups">> := Groups}}}) ->
     Groups;
 authroles(_) ->
