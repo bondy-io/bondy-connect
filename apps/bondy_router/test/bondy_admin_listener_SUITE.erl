@@ -87,7 +87,8 @@ all() ->
         admin_api_csrf_checks_the_authenticating_realms_pair,
         named_source_matches_an_authid_in_any_case,
         user_grant_applies_to_an_authid_in_any_case,
-        wamp_cookie_session_user_grant_applies_to_an_authid_in_any_case
+        wamp_cookie_session_user_grant_applies_to_an_authid_in_any_case,
+        wamp_cookie_session_checks_a_wamp_ticket_under_ticket
     ].
 
 init_per_suite(Config) ->
@@ -884,6 +885,107 @@ wamp_cookie_session_user_grant_applies_to_an_authid_in_any_case(_Config) ->
 on_call(_Arg, _KWArgs, _Details) ->
     {ok, #{}, [], #{}}.
 
+%% A WAMP session opened over long-poll with a ticket from `bondy.ticket.issue`
+%% in the cookie needs `cookie` and `ticket`: it is aborted until a source
+%% allows `ticket`.
+wamp_cookie_session_checks_a_wamp_ticket_under_ticket(_Config) ->
+    Realm = ~"com.example.admin_suite.wamp_ticket_cookie",
+    User = ~"walter",
+    _ = bondy_realm:create(#{
+        uri => Realm,
+        authmethods => [?WAMP_COOKIE_AUTH, ?WAMP_TICKET_AUTH, ?WAMP_CRA_AUTH],
+        security_enabled => true,
+        sources => [
+            #{
+                usernames => ~"all",
+                authmethod => ?WAMP_COOKIE_AUTH,
+                cidr => ~"127.0.0.0/8",
+                meta => #{}
+            }
+        ],
+        users => [#{username => User, password => ~"walter-secret"}],
+        grants => [
+            #{
+                permissions => [~"bondy.issue"],
+                uri => ~"",
+                match => ~"prefix",
+                roles => ~"all"
+            }
+        ]
+    }),
+    Session = bondy_session:new(Realm, #{
+        peer => {{127, 0, 0, 1}, 0},
+        authrealm => Realm,
+        authid => User,
+        authmethod => ?WAMP_CRA_AUTH,
+        security_enabled => true,
+        authroles => [],
+        roles => #{caller => #{}}
+    }),
+    true = ets:insert(
+        bondy_session:table(bondy_session:external_id(Session)), Session
+    ),
+    {ok, _, Claims} = bondy_ticket:issue(Session, #{}),
+    Before = element(1, longpoll_hello(Realm, Claims)),
+    {ok, _} = bondy_rbac_source:add(Realm, #{
+        ~"usernames" => ~"all",
+        ~"authmethod" => ?WAMP_TICKET_AUTH,
+        ~"cidr" => ~"127.0.0.0/8",
+        ~"meta" => #{}
+    }),
+    ?assertEqual(
+        {abort, welcome}, {Before, element(1, longpoll_hello(Realm, Claims))}
+    ).
+
+%% Opens a long-poll WAMP session on `Realm` with `Claims` as the cookie's
+%% ticket claims and returns the reply to its HELLO. An ABORT stops the
+%% session, which hands the reply to a waiting poller first, so the poller is
+%% started before the HELLO is sent.
+longpoll_hello(Realm, Claims) ->
+    TransportId = iolist_to_binary([
+        "admin-suite-",
+        integer_to_binary(erlang:unique_integer([positive]))
+    ]),
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, Realm, bondy_session_id:new()
+    ),
+    ok = bondy_http_transport_session:init_protocol(
+        Pid, {http_longpoll, text, json}, {{127, 0, 0, 1}, 12345}
+    ),
+    ok = bondy_http_transport_session:set_auth_claims(Pid, Claims),
+    Ref = monitor(process, Pid),
+    Self = self(),
+    _ = spawn_link(fun() ->
+        Self ! {hello_reply, bondy_http_transport_session:poll_receive(Pid, 5000)}
+    end),
+    timer:sleep(100),
+    ok = bondy_http_transport_session:handle_client_message(
+        Pid,
+        bondy_wamp_encoding:encode(
+            #hello{
+                realm_uri = Realm,
+                details = #{~"roles" => #{~"caller" => #{}}}
+            },
+            json
+        )
+    ),
+    Reply =
+        receive
+            {hello_reply, Polled} -> polled_message(Polled)
+        after 5000 -> ct:fail(no_hello_reply)
+        end,
+    case Reply of
+        #abort{} ->
+            receive
+                {'DOWN', Ref, process, Pid, normal} -> ok
+            after 5000 -> ct:fail(session_not_stopped)
+            end;
+        #welcome{} ->
+            true = demonitor(Ref, [flush]),
+            ok = bondy_http_transport_session:close(Pid)
+    end,
+    Reply.
+
 %% Opens a long-poll WAMP session on the master realm with the claims of a
 %% roleless OIDC ticket for `Authid`, calls `Procedure` once, and returns the
 %% session's authid and the reply's message type.
@@ -925,15 +1027,15 @@ longpoll_exchange(Pid, Message) ->
     ok = bondy_http_transport_session:handle_client_message(
         Pid, bondy_wamp_encoding:encode(Message, json)
     ),
-    case bondy_http_transport_session:poll_receive(Pid, 5000) of
-        {ok, {messages, [Reply]}} ->
-            Reply;
-        {ok, {replies, [Bin]}} ->
-            {[Reply], <<>>} = bondy_wamp_encoding:decode(
-                {http_longpoll, text, json}, Bin
-            ),
-            Reply
-    end.
+    polled_message(bondy_http_transport_session:poll_receive(Pid, 5000)).
+
+polled_message({ok, {messages, [Message]}}) ->
+    Message;
+polled_message({ok, {replies, [Bin]}}) ->
+    {[Message], <<>>} = bondy_wamp_encoding:decode(
+        {http_longpoll, text, json}, Bin
+    ),
+    Message.
 
 admin_ticket(Authid) ->
     {ok, Ticket, _} = bondy_oidc_ticket:issue(

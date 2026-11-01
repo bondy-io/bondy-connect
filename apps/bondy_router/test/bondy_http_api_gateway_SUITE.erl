@@ -627,11 +627,11 @@ unenforced_schemes_answer_unauthorized_test(_) ->
     ],
     ?assertEqual([{~"basic", 401}, {~"api_key", 401}], Statuses).
 
-%% An `oidc` route takes only a ticket from the OIDC login flow as its cookie.
-%% A ticket obtained with `bondy.ticket.issue` is refused there. The two
-%% tickets name different users: a user's second ticket in a realm replaces
-%% the first.
-oidc_scheme_refuses_a_wamp_ticket_as_the_cookie_test(_) ->
+%% A ticket in the cookie of an `oidc` route needs `cookie` and its own
+%% method. A ticket from `bondy.ticket.issue` is refused until a source allows
+%% `ticket`. The two tickets name different users: a user's second ticket in a
+%% realm replaces the first.
+oidc_scheme_checks_a_wamp_ticket_cookie_under_ticket_test(_) ->
     Realm = ~"com.example.test.oidc_cookie_kind",
     Api = ~"com.example.test.oidc_cookie_kind.api",
     Proc = ~"com.example.test.oidc_cookie_kind.thing",
@@ -718,15 +718,22 @@ oidc_scheme_refuses_a_wamp_ticket_as_the_cookie_test(_) ->
             ])}
     end,
     Url = <<"http://localhost:18080/oidc_cookie_kind/v1.0/thing">>,
+    Statuses = fun() ->
+        {
+            http_status(get, Url, [Cookie(OidcTicket)], <<>>),
+            http_status(get, Url, [Cookie(WampTicket)], <<>>)
+        }
+    end,
     try
         _ = bondy_http_gateway:rebuild_dispatch_tables(),
-        ?assertEqual(
-            {200, 401},
-            {
-                http_status(get, Url, [Cookie(OidcTicket)], <<>>),
-                http_status(get, Url, [Cookie(WampTicket)], <<>>)
-            }
-        )
+        Before = Statuses(),
+        {ok, _} = bondy_rbac_source:add(Realm, #{
+            ~"usernames" => ~"all",
+            ~"authmethod" => ~"ticket",
+            ~"cidr" => ~"127.0.0.0/8",
+            ~"meta" => #{}
+        }),
+        ?assertEqual({{200, 401}, {200, 200}}, {Before, Statuses()})
     after
         bondy_http_gateway:delete(Api)
     end.

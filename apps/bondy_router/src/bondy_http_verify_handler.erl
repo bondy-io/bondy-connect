@@ -46,10 +46,10 @@ Signature, expiry and revocation, via `bondy_ticket:verify/1` or
   below — still exists
 - the realm still allows connections
 - for access tokens, the `token_version` gate in `bondy_auth_oauth2`
-- the realm's `authmethods` and sources allow, from the caller's address, the
-  method a session would authenticate the credential with: `cookie` for a
-  ticket the OIDC flow issued, `ticket` for any other ticket, `oauth2` for an
-  access token (`credential_is_subject_to_the_realms_sources`)
+- the realm's `authmethods` and sources admit, from the caller's address, the
+  credential's own method, and `cookie` as well when the credential came in
+  the ticket cookie (`bondy_auth:check_credential/3`,
+  `credential_is_subject_to_the_realms_sources`)
 
 Without the user, realm and `token_version` checks a ticket would keep opening
 the gate after the user was disabled or removed, until it expired.
@@ -157,7 +157,7 @@ handle(_, Req, _) ->
 %% @private
 do_verify(RealmUri, Req) ->
     try
-        Credential = credential(RealmUri, Req),
+        {Carrier, Credential} = credential(RealmUri, Req),
         Credential =/= undefined orelse throw(no_credential),
 
         Identity =
@@ -172,7 +172,7 @@ do_verify(RealmUri, Req) ->
 
         ok = check_principal(RealmUri, Identity),
         ok = check_realm(RealmUri),
-        ok = check_method(RealmUri, Identity, Req),
+        ok = check_method(RealmUri, Carrier, Identity, Req),
 
         {ok, Identity}
     catch
@@ -206,22 +206,22 @@ credential(RealmUri, Req) ->
         undefined ->
             header_or_cookie_credential(RealmUri, Req);
         Token ->
-            Token
+            {header, Token}
     end.
 
 %% @private
 header_or_cookie_credential(RealmUri, Req) ->
     case cowboy_req:header(?TICKET_HEADER, Req, undefined) of
         Ticket when is_binary(Ticket), Ticket =/= <<>> ->
-            Ticket;
+            {header, Ticket};
         _ ->
             Cookies = bondy_http_utils:safe_parse_cookies(Req),
 
             case bondy_http_utils:find_ticket_cookie(RealmUri, Cookies) of
                 {value, {_, Value}} when is_binary(Value), Value =/= <<>> ->
-                    Value;
+                    {cookie, Value};
                 _ ->
-                    undefined
+                    {cookie, undefined}
             end
     end.
 
@@ -345,12 +345,9 @@ check_realm(RealmUri) ->
     ok.
 
 %% @private
-%% `bondy_auth` decides, from the realm's methods and sources and the method's
-%% requirements, as it does for a WAMP session opened with the cookie.
 check_method(
-    RealmUri, #{authid := Authid, authroles := Roles} = Identity, Req
+    RealmUri, Carrier, #{authid := Authid, authroles := Roles} = Identity, Req
 ) ->
-    Method = authmethod(Identity),
     case
         bondy_auth:init(
             bondy_session_id:new(),
@@ -362,24 +359,13 @@ check_method(
         )
     of
         {ok, Ctxt} ->
-            [Method] =:= bondy_auth:available_methods([Method], Ctxt) orelse
-                throw(no_authmethod),
-            ok;
+            case bondy_auth:check_credential(Carrier, Identity, Ctxt) of
+                ok -> ok;
+                {error, Reason} -> throw(Reason)
+            end;
         {error, Reason} ->
             throw(Reason)
     end.
-
-%% @private
-%% The method each kind of credential is checked under, whatever carried it
-%% (`bondy_http_verify_SUITE:credential_is_subject_to_the_realms_sources`).
-authmethod(#{authmethod := ?OAUTH2_AUTH}) ->
-    ?OAUTH2_AUTH;
-authmethod(#{authmethod := ?OIDCRP_AUTH}) ->
-    ?WAMP_COOKIE_AUTH;
-authmethod(#{authmethod := Method}) when
-    Method =/= ?OAUTH2_AUTH, Method =/= ?OIDCRP_AUTH
-->
-    ?WAMP_TICKET_AUTH.
 
 %% @private
 source_ip(Req) ->

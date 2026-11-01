@@ -519,8 +519,8 @@ authenticate_bearer(Req0, St0) ->
 %% @private
 authenticate_ticket_cookie(Method, Req0, St0) ->
     %% The checks a WAMP session opened with the same cookie gets
-    %% (`bondy_wamp_protocol`'s cookie clause): the realm's methods through
-    %% `bondy_auth`, scope and issuer through the `cookie` method.
+    %% (`bondy_wamp_protocol`'s cookie clause): the credential's method and
+    %% `cookie` through `bondy_auth`, scope and issuer through `cookie`.
     RealmUri = maps:get(realm_uri, St0),
     SourceIP = maps:get(source_ip, St0),
 
@@ -543,6 +543,10 @@ authenticate_ticket_cookie(Method, Req0, St0) ->
                 {ok, InitCtxt} -> InitCtxt;
                 {error, InitReason} -> throw(InitReason)
             end,
+        case bondy_auth:check_credential(cookie, Claims, Ctxt0) of
+            ok -> ok;
+            {error, CheckReason} -> throw(CheckReason)
+        end,
         case bondy_auth:authenticate(?WAMP_COOKIE_AUTH, Claims, #{}, Ctxt0) of
             {ok, _, Ctxt1} ->
                 St1 = St0#{

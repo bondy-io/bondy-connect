@@ -130,11 +130,13 @@ session is opened:
 - the realm still allows connections
 - for access tokens, the `token_version` gate
 - the realm's `authmethods` and sources allow, from the caller's address, the
-  method a WAMP session authenticates the credential with: `cookie` for a
-  ticket the OIDC login flow issued, however it is sent; `ticket` for a ticket
-  from `bondy.ticket.issue`; `oauth2` for an access token. As for a session,
-  `ticket` and `oauth2` also need a user with a password, and an OIDC user
-  without a local record is matched only by sources assigned to `all`
+  credential's own method: `oidcrp` for a ticket the OIDC login flow issued,
+  `ticket` for any other ticket, `oauth2` for an access token. A credential
+  sent in the ticket cookie also needs `cookie`. As for a session, `ticket`
+  and `oauth2` also need a user with a password, and an OIDC user without a
+  local record is matched only by sources assigned to `all`. Until a later
+  release, `cookie` alone still admits an OIDC ticket, and Bondy logs a
+  deprecation warning once per realm on each node
 
 > #### Sources see NGINX's address unless the listener trusts it {: .warning}
 >
