@@ -13,6 +13,7 @@
 * A refused WAMP authentication is logged at `info` as "WAMP authentication failed", with the reason, the authid, the method being answered and the requested methods; the realm and source IP are in the log metadata. The client still receives the generic `wamp.error.authentication_failed`.
 * Partisan 6.3.2. A node that crashed and returned on a new address, such as a Kubernetes StatefulSet pod recreated with a new IP, left its previous address in the cluster membership, and every node kept retrying it. The previous address is now pruned, and the returning node is not reported down when it is. See the [Partisan changelog](https://github.com/lasp-lang/partisan/blob/v6.3.2/CHANGELOG.md).
 * The master-realm hardening warnings and the default admin password warning no longer contain internal review identifiers ("(D-1)", "(D-2)"). A log alert that matched them needs updating.
+* The warning that the master realm `admin` user still has the legacy password `bondy-admin` said to rotate it with `security.admin_user.password`. That key only sets the password when the master realm is created, so it has no effect on an existing install. The warning now says to call `bondy.user.change_password`.
 
 ## 1.0.0
 

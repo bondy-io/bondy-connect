@@ -177,6 +177,27 @@ Logged at **notice** by the node that served `bondy.cluster.leave`, after the
 survey found every remaining member answering and ready and the node was
 removed. A removal the survey judges unsafe is refused and is not logged here.
 
+## WAMP authentication failed
+
+```
+description => "WAMP authentication failed"
+```
+
+| Field | Value |
+| --- | --- |
+| `reason` | Why the authentication was refused, for example `bad_signature`, `invalid_nonce`, `temporarily_unavailable` (the [authentication freshness fence](../configuration/database_options.md#authentication-freshness-fence)) or `{no_such_user, Authid}`. |
+| `authid` | The authid the client presented, or `undefined`. |
+| `authmethod` | The method being answered, or `undefined` when the refusal came before one was chosen. |
+| `authmethods` | The methods the client requested in its `HELLO`. |
+
+The logger metadata carries `realm`, when the realm exists, and `peername`.
+
+Logged at **info** by the session process whenever it refuses a WAMP
+authentication. The client receives only the generic
+`wamp.error.authentication_failed`, or `wamp.error.unavailable` for a fence
+refusal, so this record is where the reason is kept.
+`bondy_wamp_protocol_SUITE`: `an_authentication_failure_logs_its_reason`.
+
 ## See also
 
 - [Metrics](metrics.md)

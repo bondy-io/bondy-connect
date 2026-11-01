@@ -22,7 +22,8 @@ all() ->
         no_anonymous_authmethod,
         admin_grant_is_scoped,
         migration_removes_legacy_anon_and_is_idempotent,
-        hardening_warnings_name_no_review_ids
+        hardening_warnings_name_no_review_ids,
+        legacy_password_warning_names_change_password
     ].
 
 init_per_suite(Config) ->
@@ -128,6 +129,38 @@ hardening_warnings_name_no_review_ids(_Config) ->
     ?assertEqual(3, length(Descriptions), Descriptions),
     ?assertEqual(
         [], [D || D <- Descriptions, string:find(D, "(D-") =/= nomatch]
+    ).
+
+%% The legacy-password warning fires for a realm that already exists, so it
+%% must name `bondy.user.change_password`, not the configuration key that
+%% seeds the password of a new master realm.
+legacy_password_warning_names_change_password(_Config) ->
+    Uri = ?MASTER_REALM_URI,
+    ok = bondy_rbac_user:change_password(Uri, ~"admin", ~"bondy-admin"),
+
+    #{level := Primary} = logger:get_primary_config(),
+    ok = logger:set_primary_config(level, all),
+    ok = logger:add_handler(?MODULE, ?MODULE, #{config => #{pid => self()}}),
+    try
+        ok = bondy_realm:harden_master_realm()
+    after
+        ok = logger:remove_handler(?MODULE),
+        ok = logger:set_primary_config(level, Primary)
+    end,
+
+    Descriptions = hardening_warnings([]),
+    [Warning] = [
+        D
+     || D <- Descriptions, string:find(D, "bondy-admin") =/= nomatch
+    ],
+    ?assertNotEqual(nomatch, string:find(Warning, "bondy.user.change_password")),
+    ?assertEqual(
+        [],
+        [
+            D
+         || D <- Descriptions,
+            string:find(D, "security.admin_user.password") =/= nomatch
+        ]
     ).
 
 hardening_warnings(Acc) ->

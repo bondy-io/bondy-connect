@@ -35,6 +35,19 @@ or WAMP-SCRAM: a challenge needs data such a record does not hold. Changing
 the password (`bondy.user.change_password`) stores it in the current format.
 `bondy_auth_password_SUITE`: `legacy_password_offers_password_not_cra`.
 
+The import also writes the backup's master-realm `admin` user, old password
+included, over the one this release created at first boot
+(`bondy_rbac_user:import_legacy/3` stores each legacy user record as is).
+`security.admin_user.password` does not help here: Bondy reads it only when it
+creates the master realm. If the old password is the former default
+`bondy-admin`, every boot logs a warning until it is changed. Change it after
+the import with `bondy.user.change_password` on `com.leapsight.bondy`.
+
+When the import finishes, a record it did not write is counted by reason in
+one `notice`, "Import skipped some legacy records by reason". Step 7 of
+[Upgrading to 1.0.0](https://developer.bondy.io/guides/deployment/upgrading_to_1_0_0)
+lists the reasons.
+
 The full procedure — backing up on the old deployment, confirming it
 finished, copying the file, and importing it — is
 [Upgrading to 1.0.0](https://developer.bondy.io/guides/deployment/upgrading_to_1_0_0).

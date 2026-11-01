@@ -2180,9 +2180,8 @@ maybe_warn_legacy_admin_password(#realm{uri = Uri}) ->
                                 description =>
                                     "The master realm 'admin' user still uses the "
                                     "legacy default password 'bondy-admin'. "
-                                    "Rotate it immediately via "
-                                    "'security.admin_user.password' or the admin "
-                                    "API.",
+                                    "Change it now by calling "
+                                    "'bondy.user.change_password' on this realm.",
                                 realm => Uri,
                                 username => <<"admin">>
                             }),
