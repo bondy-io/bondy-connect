@@ -84,7 +84,8 @@ all() ->
         the_generated_conf_names_no_instance,
         oidc_provider_keys_render,
         oidc_provider_without_issuer_is_left_out,
-        oidc_provider_with_a_non_http_issuer_is_left_out
+        oidc_provider_with_a_non_http_issuer_is_left_out,
+        refresh_token_limit_is_a_token_count
     ].
 
 init_per_suite(Config) ->
@@ -1012,6 +1013,28 @@ render(Config, Lines) ->
     Conf = cuttlefish_conf:file(File),
     cuttlefish_generator:map(Schema, Conf).
 
+%% `oauth2.refresh_token.limit' is the number of tokens a user may hold
+%% (`bondy_oauth_token_store_SUITE' sets the same application key as a count).
+refresh_token_limit_is_a_token_count(Config) ->
+    Observed = [
+        {Line, max_tokens_per_user(Config, Line)}
+     || Line <- [
+            [],
+            ["oauth2.refresh_token.limit = 40\n"],
+            ["oauth2.refresh_token.limit = 25KB\n"],
+            ["oauth2.refresh_token.limit = 0\n"]
+        ]
+    ],
+    ?assertMatch(
+        [
+            {[], {ok, 25}},
+            {_, {ok, 40}},
+            {_, {refused, _}},
+            {_, {refused, _}}
+        ],
+        Observed
+    ).
+
 %% Renders and returns `bondy_router.listeners', failing the case if the render
 %% itself failed.
 inventory(Config, Lines) ->
@@ -1093,4 +1116,13 @@ walk_up(Dir, N) ->
                 Dir -> false;
                 Parent -> walk_up(Parent, N - 1)
             end
+    end.
+
+max_tokens_per_user(Config, Lines) ->
+    case render(Config, Lines) of
+        {error, Phase, _} ->
+            {refused, Phase};
+        AppEnv when is_list(AppEnv) ->
+            Router = proplists:get_value(bondy_router, AppEnv, []),
+            {ok, key_value:get([oauth2, max_tokens_per_user], Router)}
     end.

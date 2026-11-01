@@ -73,6 +73,7 @@ all() ->
         listener_scope_http_budget_is_enforced,
         realm_scope_http_budget_is_enforced,
         oauth2_draws_from_the_auth_class,
+        refused_requests_draw_from_the_budget,
         the_ready_probe_follows_a_blocking_alarm,
         registry_routes_read_the_named_realm,
         admin_local_is_not_locked_out_by_rbac,
@@ -339,6 +340,26 @@ oauth2_draws_from_the_auth_class(_) ->
     after
         ok = bondy_config:set([security, rate_limit], undefined)
     end.
+
+%% Requests that authentication refuses must still spend the budget, or a flood
+%% of missing or bad credentials is never throttled. A 429 among statuses that
+%% are otherwise 401 shows the throttle saw a refused request.
+refused_requests_draw_from_the_budget(_) ->
+    Observed = [
+        {Kind, refused_burst(Class, Request)}
+     || {Kind, Class, Request} <- [
+            {no_token, http, fun() -> get_path(?ADMIN, ?ADMIN_API_PATH) end},
+            {bad_token, http, fun() ->
+                get_path(?ADMIN, ?ADMIN_API_PATH, ~"not-a-jwt")
+            end},
+            {bad_client, auth, fun() -> bad_client_token_request() end}
+        ]
+    ],
+    ?assertEqual(
+        [{no_token, true}, {bad_token, true}, {bad_client, true}],
+        [{Kind, lists:member(429, Statuses)} || {Kind, Statuses} <- Observed],
+        Observed
+    ).
 
 %% =============================================================================
 %% HELPERS
@@ -1226,3 +1247,34 @@ uds_get(Path, Target) ->
         end,
     ok = gen_tcp:close(Sock),
     Status.
+
+%% Six rapid requests with only `Class` enabled at one token a second and a
+%% capacity of two; returns their statuses.
+refused_burst(Class, Request) ->
+    ok = bondy_config:set([security, rate_limit], #{
+        enabled => true,
+        Class => #{rate => 1, capacity => 2}
+    }),
+    try
+        [
+            begin
+                {ok, Status, _, _} = Request(),
+                Status
+            end
+         || _ <- lists:seq(1, 6)
+        ]
+    after
+        ok = bondy_config:set([security, rate_limit], undefined)
+    end.
+
+bad_client_token_request() ->
+    hackney:request(
+        post,
+        url(?ADMIN, "/oauth/token"),
+        [
+            {~"content-type", ~"application/x-www-form-urlencoded"},
+            {~"authorization", <<"Basic ", (base64:encode(~"nobody:wrong"))/binary>>}
+        ],
+        ~"grant_type=client_credentials",
+        []
+    ).
