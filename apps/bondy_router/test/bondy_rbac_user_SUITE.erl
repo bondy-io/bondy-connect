@@ -34,6 +34,7 @@ all() ->
         update_groups,
         add_group,
         remove_group,
+        membership_procedures_reply_after_commit,
         remove_user,
         remove_refuses_a_linked_sso_user,
         update_reports_a_missing_sso_user,
@@ -492,6 +493,42 @@ remove_group(_) ->
         bondy_rbac_user:groups(bondy_rbac_user:fetch(?SSO_REALM_URI, ?SSOU1))
     ).
 
+%% The eight `bondy.user.*` and `bondy.group.*` membership procedures, through
+%% `bondy_wamp_api:handle_call/2`. The bondy_docs WAMP API reference documents
+%% no results for any of them, so each must answer an empty RESULT once its
+%% change is stored. The case records every reply, crash included, and the
+%% stored group lists before asserting, so one run shows all eight.
+membership_procedures_reply_after_commit(_) ->
+    R = ~"com.example.test.membership_api",
+    _ = bondy_realm:create(R),
+    ok = lists:foreach(
+        fun(G) -> ok = add_group(R, G) end, [~"m_a", ~"m_b", ~"m_c", ~"m_d"]
+    ),
+    ok = add_member(R, ~"m_user", []),
+    Steps = [
+        {?BONDY_USER_ADD_GROUP, [~"m_user", ~"m_a"], user, [~"m_a"]},
+        {?BONDY_USER_ADD_GROUPS, [~"m_user", [~"m_b", ~"m_c"]], user, [
+            ~"m_a", ~"m_b", ~"m_c"
+        ]},
+        {?BONDY_USER_REMOVE_GROUP, [~"m_user", ~"m_a"], user, [~"m_b", ~"m_c"]},
+        {?BONDY_USER_REMOVE_GROUPS, [~"m_user", [~"m_b"]], user, [~"m_c"]},
+        {?BONDY_GROUP_ADD_GROUP, [~"m_d", ~"m_a"], group, [~"m_a"]},
+        {?BONDY_GROUP_ADD_GROUPS, [~"m_d", [~"m_b", ~"m_c"]], group, [
+            ~"m_a", ~"m_b", ~"m_c"
+        ]},
+        {?BONDY_GROUP_REMOVE_GROUP, [~"m_d", ~"m_a"], group, [~"m_b", ~"m_c"]},
+        {?BONDY_GROUP_REMOVE_GROUPS, [~"m_d", [~"m_b"]], group, [~"m_c"]}
+    ],
+    Observed = [
+        {Proc, api_reply(Proc, [R | Args]), stored_groups(Kind, R, hd(Args))}
+     || {Proc, Args, Kind, _} <- Steps
+    ],
+    Expected = [
+        {Proc, {result, undefined}, Groups}
+     || {Proc, _, _, Groups} <- Steps
+    ],
+    ?assertEqual(Expected, Observed).
+
 remove_user(_) ->
     _Local = bondy_rbac_user:fetch(?REALM1_URI, ?LU1),
     _SSO1 = bondy_rbac_user:fetch(?REALM1_URI, ?SSOU1),
@@ -866,3 +903,18 @@ add_member(RealmUri, Username, Groups) ->
     }),
     {ok, _} = bondy_rbac_user:add(RealmUri, User),
     ok.
+
+api_reply(Proc, Args) ->
+    Ctxt = bondy_context:local_context(?MASTER_REALM_URI),
+    M = bondy_wamp_message:call(1, #{}, Proc, Args),
+    try bondy_wamp_api:handle_call(M, Ctxt) of
+        {reply, #result{args = A}} -> {result, A};
+        {reply, #error{error_uri = Uri}} -> {error, Uri}
+    catch
+        error:Reason -> {crashed, Reason}
+    end.
+
+stored_groups(user, RealmUri, Name) ->
+    user_groups(RealmUri, Name);
+stored_groups(group, RealmUri, Name) ->
+    lists:sort(bondy_rbac_group:groups(bondy_rbac_group:fetch(RealmUri, Name))).
