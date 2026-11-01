@@ -534,6 +534,22 @@ rules() ->
             {drop, progressive_why()}},
 
         %% ---------------------------------------------------------------------
+        %% Removed OIDC provider keys
+        %% ---------------------------------------------------------------------
+        {{match, ["security", "oidc", "providers", "enabled"]},
+            {drop, "nothing ever read it. OIDC providers are configured on"
+                " the realm, in `info.oidc_providers'; the remaining"
+                " `security.oidc.providers.<id>.*' keys are reserved for a"
+                " node registry of providers and are not used yet."}},
+        {{match, ["security", "oidc", "providers", "$id", "login_path"]},
+            {drop, "nothing ever read it. The login route comes from the API"
+                " Gateway specification: `<base_path>/oidc/login'."}},
+        {{match, ["security", "oidc", "providers", "$id", "redirect_path"]},
+            {drop, "nothing ever read it. The callback route comes from the"
+                " API Gateway specification:"
+                " `<base_path>/oidc/<provider>/callback'."}},
+
+        %% ---------------------------------------------------------------------
         %% oplog.* -> db.* (the rename this release shipped)
         %% ---------------------------------------------------------------------
         {{match, ["oplog", "catalog"]},
@@ -2506,8 +2522,11 @@ tmp_dir() ->
 %% stopped being read with the global carrier blocks. The corpus holds no
 %% `wamp.sse.*' or `wamp.longpoll.*' key, so those blocks' removal moves this
 %% number not at all -- their rules are covered by the rule table check instead.
+%%
+%% 105 includes `security.oidc.providers.oidc-mock.login_path' and
+%% `.redirect_path', which the corpus sets and no schema maps.
 -define(DIRTY_REF, "8dd090bf^").
--define(DIRTY_EXPECTED, 103).
+-define(DIRTY_EXPECTED, 105).
 
 selftest(SchemaDirs0) ->
     SchemaDirs = resolve_schema_dirs(SchemaDirs0),

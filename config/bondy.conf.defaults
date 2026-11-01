@@ -178,7 +178,6 @@ security.automatically_create_realms = off
 security.master_key.encoding = base64
 security.master_key.id = 1
 security.master_key.provider = none
-security.oidc.providers.enabled = off
 security.password.cra.kdf = pbkdf2
 security.password.max_length = 254
 security.password.min_length = 6
