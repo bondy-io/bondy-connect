@@ -18,6 +18,7 @@ is decided before any request is served.
 -include_lib("stdlib/include/assert.hrl").
 
 -include("bondy_security.hrl").
+-include_lib("oidcc/include/oidcc_token.hrl").
 
 -compile([nowarn_export_all, export_all]).
 
@@ -82,6 +83,7 @@ groups() ->
             credential_is_subject_to_the_realms_sources,
             oidcrp_admits_the_oidc_credential_and_cookie_carries_it,
             cookie_admits_an_oidc_credential_with_a_deprecation_warning,
+            oidc_login_requires_the_realm_to_admit_oidcrp,
             malformed_credentials_never_500,
             deleted_realm_never_500,
             post_is_not_allowed
@@ -492,6 +494,93 @@ cookie_admits_an_oidc_credential_with_a_deprecation_warning(_) ->
             add_loopback_source(Realm, ?WAMP_COOKIE_AUTH, Statuses)
         end)
     ).
+
+%% The OIDC login issues the ticket cookie only when the realm admits `oidcrp`
+%% for the user from the caller's address, and creates no user before then.
+%% The provider is mocked: the code exchange returns an ID token naming the
+%% user, and userinfo fails, so the ID token's claims are used.
+oidc_login_requires_the_realm_to_admit_oidcrp(_) ->
+    Realm = ~"com.example.verify.login",
+    User = ~"lucia",
+    _ = bondy_realm:create(#{
+        uri => Realm,
+        authmethods => [?OIDCRP_AUTH, ?WAMP_COOKIE_AUTH],
+        security_enabled => true,
+        info => #{
+            ~"oidc_providers" => #{
+                ?PROVIDER => #{
+                    ~"issuer" => ~"http://127.0.0.1:1",
+                    ~"client_id" => ~"client",
+                    ~"client_secret" => ~"secret",
+                    ~"redirect_uri" => ~"http://127.0.0.1:18080/cb",
+                    ~"auto_provision" => true
+                }
+            }
+        }
+    }),
+    ok = load_spec(<<Realm/binary, ".api">>, Realm, <<"/vlogin/v1.0">>),
+    ok = await_route("/vlogin/v1.0/oidc/verify", 50),
+    Callback = fun() ->
+        StateToken = bondy_router_utils:uuid(),
+        ok = bondy_oidc_state:new(
+            StateToken,
+            ~"nonce",
+            ~"verifier",
+            ?PROVIDER,
+            Realm,
+            ~"http://127.0.0.1/app",
+            ~"web",
+            ~"device"
+        ),
+        {ok, Status, _, Ref} = hackney:request(
+            get,
+            api_url(
+                "/vlogin/v1.0/oidc/" ++ binary_to_list(?PROVIDER) ++
+                    "/callback?code=c&state=" ++ binary_to_list(StateToken)
+            ),
+            [],
+            <<>>,
+            []
+        ),
+        {ok, _} = hackney:body(Ref),
+        Status
+    end,
+    Mocked = [oidcc_token, oidcc_userinfo, bondy_oidc_provider],
+    ok = meck:new(Mocked, [passthrough, no_link]),
+    try
+        ok = meck:expect(oidcc_token, retrieve, fun(_, _, _) ->
+            {ok, #oidcc_token{
+                id = #oidcc_token_id{
+                    token = ~"id-token",
+                    claims = #{~"sub" => User, ~"preferred_username" => User}
+                },
+                access = none,
+                refresh = none,
+                scope = []
+            }}
+        end),
+        ok = meck:expect(oidcc_userinfo, retrieve, fun(_, _, _) ->
+            {error, mocked}
+        end),
+        ok = meck:expect(bondy_oidc_provider, get_client_context, fun(_, _) ->
+            {ok, client_context}
+        end),
+        ok = meck:expect(bondy_oidc_provider, get_refresh_jwks_fun, fun(_, _) ->
+            {error, mocked}
+        end),
+        Refused = Callback(),
+        Provisioned = bondy_rbac_user:lookup(Realm, User),
+        {Admitted, Warnings} = legacy_cookie_warnings(Realm, fun() ->
+            add_loopback_source(Realm, ?OIDCRP_AUTH, Callback)
+        end),
+        ?assertEqual(
+            {403, {error, not_found}, 302, 0},
+            {Refused, Provisioned, Admitted, Warnings}
+        ),
+        ?assertMatch({ok, _}, bondy_rbac_user:lookup(Realm, User))
+    after
+        ok = meck:unload(Mocked)
+    end.
 
 oidc_ticket_accepted_when_user_is_externally_managed(_) ->
     %% The provider is configured without `auto_provision`, so the subject the

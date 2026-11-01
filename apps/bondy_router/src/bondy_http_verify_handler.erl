@@ -206,14 +206,14 @@ credential(RealmUri, Req) ->
         undefined ->
             header_or_cookie_credential(RealmUri, Req);
         Token ->
-            {header, Token}
+            {direct, Token}
     end.
 
 %% @private
 header_or_cookie_credential(RealmUri, Req) ->
     case cowboy_req:header(?TICKET_HEADER, Req, undefined) of
         Ticket when is_binary(Ticket), Ticket =/= <<>> ->
-            {header, Ticket};
+            {direct, Ticket};
         _ ->
             Cookies = bondy_http_utils:safe_parse_cookies(Req),
 

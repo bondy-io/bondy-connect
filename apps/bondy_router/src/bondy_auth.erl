@@ -353,26 +353,29 @@ admits(Method, #{admitted_methods := Admitted}) when is_binary(Method) ->
 
 -doc """
 Checks that the realm admits a credential presented outside a WAMP HELLO, a
-Bondy ticket or an OAuth2 access token, given its verified claims.
+Bondy ticket, an OAuth2 access token or the identity an OIDC login
+established, given its verified claims.
 
 The credential is checked under its own method, read from its `authmethod`
 claim: `oidcrp` for an identity from the OIDC login flow, `oauth2` for an
-access token, and `ticket` for any other ticket. A credential carried in a
-cookie also needs `cookie`, the WAMP transport-level method.
+access token, and `ticket` for any other ticket. `Carrier` is `cookie` for a
+credential that arrived in a cookie, which also needs `cookie`, the WAMP
+transport-level method, and `direct` for one that reached Bondy any other
+way: a request header, or the OIDC login's exchange with the provider.
 
 `cookie` also admits an OIDC credential the realm does not admit under
 `oidcrp`. That use is deprecated: Bondy logs a warning the first time it
 happens for a realm on a node.
 """.
 -spec check_credential(
-    Carrier :: cookie | header, Claims :: map(), Ctxt :: context()
+    Carrier :: cookie | direct, Claims :: map(), Ctxt :: context()
 ) -> ok | {error, no_authmethod}.
 
 check_credential(Carrier, #{authmethod := Authmethod}, Ctxt) when
-    (Carrier == cookie orelse Carrier == header) andalso is_binary(Authmethod)
+    (Carrier == cookie orelse Carrier == direct) andalso is_binary(Authmethod)
 ->
     Method = credential_method(Authmethod),
-    Carried = Carrier == header orelse admits(?WAMP_COOKIE_AUTH, Ctxt),
+    Carried = Carrier == direct orelse admits(?WAMP_COOKIE_AUTH, Ctxt),
 
     case Carried andalso admits_credential(Method, Ctxt) of
         true -> ok;
