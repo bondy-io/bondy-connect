@@ -177,20 +177,7 @@ do_verify(RealmUri, Req) ->
         {ok, Identity}
     catch
         throw:Reason ->
-            {error, Reason};
-        Class:Reason:Stacktrace ->
-            %% Nothing may escape as a 5xx: a proxy cannot act on one, and an
-            %% unauthenticated caller must not be able to provoke crash reports.
-            %% Reachable when the realm is removed after the dispatch table was
-            %% compiled, since the realm and user lookups then raise.
-            ?LOG_WARNING(#{
-                description => "Error while verifying credential",
-                realm_uri => RealmUri,
-                class => Class,
-                reason => Reason,
-                stacktrace => Stacktrace
-            }),
-            {error, invalid}
+            {error, Reason}
     end.
 
 %% -----------------------------------------------------------------------------
@@ -230,21 +217,16 @@ header_or_cookie_credential(RealmUri, Req) ->
 %% Bondy ticket carries `authrealm` and `scope`, an access token carries `aud`
 %% and `kid`. This runs on unverified input and only picks the verifier — both
 %% verifiers re-read and check the signature themselves, so nothing here is
-%% trusted. `jose_jwt:peek/1` decodes JSON through the adapter `jose` selects
-%% at runtime, so its error space has no fixed set of shapes.
+%% trusted.
 classify(Credential) ->
-    try jose_jwt:peek(Credential) of
-        {jose_jwt, #{~"authrealm" := R, ~"scope" := _}} when is_binary(R) ->
+    case bondy_oauth_jwt:decode(Credential) of
+        {ok, #{~"authrealm" := R, ~"scope" := _}} when is_binary(R) ->
             ticket;
-        {jose_jwt, #{~"aud" := A, ~"kid" := _}} when is_binary(A) ->
+        {ok, #{~"aud" := A, ~"kid" := _}} when is_binary(A) ->
             oauth2;
-        {jose_jwt, #{}} ->
-            unknown
-    catch
-        %% The reason can carry fragments of the credential, so it is not
-        %% logged.
-        error:_Reason ->
-            ?LOG_DEBUG(#{description => "Credential is not a decodable JWT"}),
+        {ok, #{}} ->
+            unknown;
+        {error, invalid} ->
             unknown
     end.
 

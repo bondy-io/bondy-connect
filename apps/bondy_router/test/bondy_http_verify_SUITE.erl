@@ -660,7 +660,8 @@ malformed_credentials_never_500(_) ->
         [{<<"authorization">>, <<"Bearer a.b.c">>}],
         [{<<"authorization">>, <<"Bearer eyJhbGciOiJub25lIn0.W10.">>}],
         [{<<"cookie">>, <<"=x">>}],
-        [{<<"x-bondy-ticket">>, <<"not-a-jwt">>}]
+        [{<<"x-bondy-ticket">>, <<"not-a-jwt">>}],
+        cookie_header(?REALM, <<"not-a-jwt">>)
     ],
     lists:foreach(
         fun(Headers) ->
@@ -670,18 +671,38 @@ malformed_credentials_never_500(_) ->
         Cases
     ).
 
+%% A route outlives its realm until the dispatch table is rebuilt, so a request
+%% can reach the verify route of a realm that was deleted. Every credential is
+%% refused with 401, never a 5xx, which a proxy cannot act on.
 deleted_realm_never_500(_) ->
-    %% Routes outlive their realm: the dispatch table is compiled ahead of
-    %% time, so a request can arrive for a realm that has since been removed.
-    %% The realm and user lookups raise in that case and must not surface as a
-    %% 5xx, which a proxy cannot act on.
-    Transient = <<"com.example.verify.transient">>,
-    ok = ensure_realm(Transient),
-    ok = ensure_user(Transient, ?USER),
-    {ok, JWT, _} = issue_ticket(Transient, ?USER),
-    ok = bondy_realm:delete(Transient, #{force => true}),
-    {Status, _, _} = get_verify(cookie_header(Transient, JWT)),
-    ?assertEqual(401, Status).
+    Realm = ~"com.example.verify.transient",
+    Path = "/vtransient/v1.0/oidc/verify",
+    ok = carrier_realm(
+        Realm,
+        [?OIDCRP_AUTH, ?WAMP_COOKIE_AUTH, ?OAUTH2_AUTH],
+        <<"/vtransient/v1.0">>
+    ),
+    ok = await_route(Path, 50),
+    {ok, _} = bondy_rbac_user:add(
+        Realm,
+        bondy_rbac_user:new(#{username => ~"tess", password => ~"tess-Passw0rd"})
+    ),
+    {ok, OidcTicket, _} = issue_ticket(Realm, ~"tom"),
+    {ok, Ctxt} = bondy_auth:init(
+        bondy_session_id:new(), Realm, ~"tess", all, {127, 0, 0, 1}
+    ),
+    {ok, Token} = bondy_oauth_token:issue(password, Ctxt, #{}),
+    {ok, {AccessToken, _}} = bondy_oauth_token:to_access_token(Token),
+    ok = bondy_realm:delete(Realm, #{force => true}),
+    Statuses = [
+        element(1, get_verify(Path, H))
+     || H <- [
+            cookie_header(Realm, OidcTicket),
+            [{~"x-bondy-ticket", OidcTicket}],
+            [{~"authorization", <<"Bearer ", AccessToken/binary>>}]
+        ]
+    ],
+    ?assertEqual([401, 401, 401], Statuses).
 
 post_is_not_allowed(_) ->
     {ok, Status, _, _} = hackney:request(
