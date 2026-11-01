@@ -21,6 +21,7 @@
 -include_lib("kernel/include/file.hrl").
 -include_lib("stdlib/include/assert.hrl").
 -include("bondy.hrl").
+-include("bondy_security.hrl").
 
 -export([all/0]).
 -export([init_per_suite/1]).
@@ -47,6 +48,11 @@
 %% (`priv/specs/bondy_admin_api.json`). Its version's `base_path` is
 %% `/[v1.0]` — an optional Cowboy segment — so the unprefixed form routes.
 -define(ADMIN_API_PATH, "/realms").
+%% An administrator the Admin API cases authenticate as, and a realm holding a
+%% user of the same name, whose tokens the master realm must refuse.
+-define(OPERATOR, ~"adminsplit-operator").
+-define(OPERATOR_PASS, ~"adminsplit-Passw0rd").
+-define(FOREIGN_REALM, ~"com.example.adminsplit.foreign").
 
 all() ->
     [
@@ -62,12 +68,15 @@ all() ->
         the_ready_probe_follows_a_blocking_alarm,
         registry_routes_read_the_named_realm,
         admin_local_is_not_locked_out_by_rbac,
-        only_admin_local_routes_run_as_the_local_operator
+        only_admin_local_routes_run_as_the_local_operator,
+        admin_api_requires_a_master_realm_bearer_token,
+        admin_api_listeners_mount_the_oauth2_endpoints
     ].
 
 init_per_suite(Config) ->
     bondy_ct:start_bondy(),
     ok = load_stored_spec(),
+    ok = add_operator(),
     Config.
 
 end_per_suite(Config) ->
@@ -196,9 +205,11 @@ admin_local_socket_is_bound_and_serves(_Config) ->
 %% it — a hook drawing from any other class would never see a 429 here.
 %% Statuses are not asserted before exhaustion: the `{http, 127.0.0.1}`
 %% bucket is shared with any other suite in a run, so only "rapid
-%% requests trip 429" and "off means served" are contract.
+%% requests trip 429" and "off means served" are contract. Cowboy calls
+%% `rate_limited` after `is_authorized`, so this case and the next two
+%% authenticate: a request without a token is refused before any budget.
 http_requests_are_rate_limited(_) ->
-    {ok, Before, _, _} = get_path(?ADMIN, ?ADMIN_API_PATH),
+    {ok, Before, _, _} = get_path(?ADMIN, ?ADMIN_API_PATH, operator_token()),
     ?assertNotEqual(429, Before),
     ok = bondy_config:set([security, rate_limit], #{
         enabled => true,
@@ -206,7 +217,7 @@ http_requests_are_rate_limited(_) ->
     }),
     try
         Results = [
-            get_path(?ADMIN, ?ADMIN_API_PATH)
+            get_path(?ADMIN, ?ADMIN_API_PATH, operator_token())
          || _ <- lists:seq(1, 6)
         ],
         {ok, Last, Headers, _} = lists:last(Results),
@@ -217,7 +228,7 @@ http_requests_are_rate_limited(_) ->
     end,
     %% Off again: the same source IP serves immediately — the verdict is
     %% config-driven, no depleted bucket outlives the feature.
-    {ok, After, _, _} = get_path(?ADMIN, ?ADMIN_API_PATH),
+    {ok, After, _, _} = get_path(?ADMIN, ?ADMIN_API_PATH, operator_token()),
     ?assertNotEqual(429, After).
 
 %% The LISTENER scope of the rate-limit chain, on the wire: with the
@@ -233,7 +244,7 @@ listener_scope_http_budget_is_enforced(_) ->
     ),
     try
         Results = [
-            get_path(?ADMIN, ?ADMIN_API_PATH)
+            get_path(?ADMIN, ?ADMIN_API_PATH, operator_token())
          || _ <- lists:seq(1, 6)
         ],
         {ok, Last, Headers, _} = lists:last(Results),
@@ -243,7 +254,7 @@ listener_scope_http_budget_is_enforced(_) ->
         ok = bondy_config:set([?ADMIN, rate_limit], undefined),
         ok = bondy_config:set([security, rate_limit], undefined)
     end,
-    {ok, After, _, _} = get_path(?ADMIN, ?ADMIN_API_PATH),
+    {ok, After, _, _} = get_path(?ADMIN, ?ADMIN_API_PATH, operator_token()),
     ?assertNotEqual(429, After).
 
 %% NODE and LISTENER scopes entirely off, a budget in the REALM's own
@@ -262,7 +273,7 @@ realm_scope_http_budget_is_enforced(_) ->
     }),
     try
         Results = [
-            get_path(?ADMIN, ?ADMIN_API_PATH)
+            get_path(?ADMIN, ?ADMIN_API_PATH, operator_token())
          || _ <- lists:seq(1, 6)
         ],
         {ok, Last, Headers, _} = lists:last(Results),
@@ -272,7 +283,7 @@ realm_scope_http_budget_is_enforced(_) ->
         _ = bondy_realm:update(Master, #{rate_limit => undefined}),
         ok = bondy_config:set([security, rate_limit], undefined)
     end,
-    {ok, After, _, _} = get_path(?ADMIN, ?ADMIN_API_PATH),
+    {ok, After, _, _} = get_path(?ADMIN, ?ADMIN_API_PATH, operator_token()),
     ?assertNotEqual(429, After).
 
 %% The OAuth2 endpoints draw from the `auth` class — the shared per-IP
@@ -314,6 +325,71 @@ oauth2_draws_from_the_auth_class(_) ->
 %% =============================================================================
 %% HELPERS
 %% =============================================================================
+
+%% The operator is configured as an operator would: `oauth2` added to the
+%% master realm's methods, and a loopback `oauth2` source for the user.
+add_operator() ->
+    Master = ?MASTER_REALM_URI,
+    Methods = bondy_realm:authmethods(Master),
+    _ = bondy_realm:update(Master, #{
+        ~"authmethods" => lists:usort([?OAUTH2_AUTH | Methods])
+    }),
+    ok = add_oauth2_user(Master, [~"bondy.administrators"]),
+    _ = bondy_realm:create(#{
+        uri => ?FOREIGN_REALM,
+        authmethods => [?OAUTH2_AUTH, ?PASSWORD_AUTH]
+    }),
+    ok = add_oauth2_user(?FOREIGN_REALM, []).
+
+add_oauth2_user(Uri, Groups) ->
+    {ok, _} = bondy_rbac_user:add(
+        Uri,
+        bondy_rbac_user:new(#{
+            username => ?OPERATOR,
+            password => ?OPERATOR_PASS,
+            groups => Groups
+        })
+    ),
+    {ok, _} = bondy_rbac_source:add(Uri, #{
+        ~"usernames" => [?OPERATOR],
+        ~"authmethod" => ?OAUTH2_AUTH,
+        ~"cidr" => ~"127.0.0.0/8",
+        ~"meta" => #{}
+    }),
+    ok.
+
+operator_token() ->
+    issue_token(?MASTER_REALM_URI).
+
+issue_token(Uri) ->
+    {ok, Ctxt} = bondy_auth:init(
+        bondy_session_id:new(), Uri, ?OPERATOR, all, {127, 0, 0, 1}
+    ),
+    {ok, Token} = bondy_oauth_token:issue(password, Ctxt, #{}),
+    {ok, {JWT, _}} = bondy_oauth_token:to_access_token(Token),
+    JWT.
+
+get_path(Listener, Path, JWT) ->
+    hackney:request(
+        get,
+        url(Listener, Path),
+        [{~"authorization", <<"Bearer ", JWT/binary>>}],
+        <<>>,
+        []
+    ).
+
+post_path(Listener, Path) ->
+    hackney:request(
+        post,
+        url(Listener, Path),
+        [{~"content-type", ~"application/x-www-form-urlencoded"}],
+        <<>>,
+        []
+    ).
+
+url(Listener, Path) ->
+    {ok, #{bind := {port, Port}}} = bondy_listener_manager:listener(Listener),
+    iolist_to_binary(["http://127.0.0.1:", integer_to_list(Port), Path]).
 
 admin_local_path() ->
     {ok, #{transport := uds, bind := {path, Path}}} =
@@ -382,9 +458,9 @@ load_stored_spec() ->
 %% The Admin API calls its procedures from the master realm. A `wamp.*` meta
 %% procedure reads only the caller's realm, so these routes reach a tenant
 %% realm's registry only through the realm-first `bondy.*` procedures. The
-%% request is anonymous, so the case grants `anonymous` `wamp.call` on every
-%% URI for its duration: a route still calling a `wamp.*` procedure then fails
-%% on its arguments rather than on authorisation.
+%% operator holds `bondy.administrators`, whose grants cover `wamp.` too, so a
+%% route still calling a `wamp.*` procedure fails on its arguments rather than
+%% on authorisation.
 registry_routes_read_the_named_realm(_Config) ->
     Realm = ~"com.example.adminsplit.registry",
     _ = bondy_realm:create(Realm),
@@ -394,24 +470,18 @@ registry_routes_read_the_named_realm(_Config) ->
         Realm,
         bondy_ref:new(internal, {?MODULE, on_call})
     ),
-    Grant = bondy_rbac:request(#{
-        roles => [~"anonymous"],
-        permissions => [~"wamp.call"],
-        uri => ~"",
-        match => ~"prefix"
-    }),
-    ok = bondy_rbac:grant(?MASTER_REALM_URI, Grant),
-    try
-        Path = ["/realms/", Realm, "/registrations/", integer_to_list(Id)],
-        ?assertMatch(#{~"id" := Id}, json_body(get_path(?ADMIN, Path))),
-        ?assertEqual([], json_body(get_path(?ADMIN, [Path, "/callees"]))),
-        ?assertMatch(
-            {ok, 404, _, _},
-            get_path(?ADMIN, ["/realms/", Realm, "/registrations_summary"])
+    Token = operator_token(),
+    Path = ["/realms/", Realm, "/registrations/", integer_to_list(Id)],
+    ?assertMatch(#{~"id" := Id}, json_body(get_path(?ADMIN, Path, Token))),
+    ?assertEqual(
+        [], json_body(get_path(?ADMIN, [Path, "/callees"], Token))
+    ),
+    ?assertMatch(
+        {ok, 404, _, _},
+        get_path(
+            ?ADMIN, ["/realms/", Realm, "/registrations_summary"], Token
         )
-    after
-        ok = bondy_rbac:revoke(?MASTER_REALM_URI, Grant)
-    end.
+    ).
 
 %% With every grant of `bondy.administrators` revoked, and none for
 %% `anonymous`, no RBAC identity can administer the master realm. The socket
@@ -435,7 +505,10 @@ admin_local_is_not_locked_out_by_rbac(_Config) ->
     try
         ?assertEqual([], bondy_rbac:group_grants(Uri, Group)),
         ?assertEqual(200, uds_get(admin_local_path(), ?ADMIN_API_PATH)),
-        ?assertMatch({ok, 403, _, _}, get_path(?ADMIN, ?ADMIN_API_PATH))
+        ?assertMatch(
+            {ok, 403, _, _},
+            get_path(?ADMIN, ?ADMIN_API_PATH, operator_token())
+        )
     after
         [ok = bondy_rbac:grant(Uri, R) || R <- Requests]
     end.
@@ -490,6 +563,34 @@ rest_states(Rules) ->
      || {_Host, Paths} <- Rules,
         {_Path, bondy_http_gateway_rest_handler, St} <- Paths
     ].
+
+%% The built-in Admin API accepts a bearer token the master realm issued, the
+%% same way a stored API Gateway specification with an `oauth2` scheme does.
+%% A request without one, or with a token another realm issued to a user of
+%% the same name, is refused. `admin_local` needs no token.
+admin_api_requires_a_master_realm_bearer_token(_Config) ->
+    ?assertMatch({ok, 401, _, _}, get_path(?ADMIN, ?ADMIN_API_PATH)),
+    ?assertMatch(
+        {ok, 200, _, _}, get_path(?ADMIN, ?ADMIN_API_PATH, operator_token())
+    ),
+    ?assertMatch(
+        {ok, 401, _, _},
+        get_path(?ADMIN, ?ADMIN_API_PATH, issue_token(?FOREIGN_REALM))
+    ),
+    ?assertEqual(200, uds_get(admin_local_path(), ?ADMIN_API_PATH)).
+
+%% The `oauth2` scheme mounts its token and revocation endpoints next to the
+%% Admin API, so a client of a listener carrying `admin_api` can obtain a
+%% token from it. The public listener carries neither.
+admin_api_listeners_mount_the_oauth2_endpoints(_Config) ->
+    [
+        ?assertMatch(
+            {ok, Status, _, _} when Status =/= 404,
+            post_path(?ADMIN, Path)
+        )
+     || Path <- ["/oauth/token", "/oauth/revoke"]
+    ],
+    ?assertMatch({ok, 404, _, _}, post_path(?PUBLIC, "/oauth/token")).
 
 %% The internal callee registered by `registry_routes_read_the_named_realm/1`;
 %% the case never calls it.
@@ -560,11 +661,7 @@ await_ready_flag(Expected) ->
 %% The port comes from the resolved inventory rather than a literal, so the case
 %% follows a listener whose configured port changes.
 get_path(Listener, Path) ->
-    {ok, #{bind := {port, Port}}} = bondy_listener_manager:listener(Listener),
-    Url = iolist_to_binary([
-        "http://127.0.0.1:", integer_to_list(Port), Path
-    ]),
-    hackney:request(get, Url, [], <<>>, []).
+    hackney:request(get, url(Listener, Path), [], <<>>, []).
 
 %% A Unix domain socket needs a client that can address one, and hackney takes a
 %% URL. `{packet, http_bin}` makes the emulator parse the status line, so this

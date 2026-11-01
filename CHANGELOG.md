@@ -2,6 +2,7 @@
 ## 1.0.1
 
 ### Action required
+* The Admin API needs an OAuth2 bearer token from the master realm on every listener that carries `admin_api` (port 18081 by default), and answers `401` without one. Since the master-realm hardening it answered `403` to every request; a deployment that granted `anonymous` again on the master realm to use it served administration without credentials. To use it over the network, add `oauth2` to the master realm's `authmethods` and an `oauth2` source for your administrators' network, then get tokens from `/oauth/token` on the same listener. The internal socket `<platform_runtime_dir>/bondy_admin.sock` needs no token. See [Authenticating to the Admin API](doc/guides/configuration/listeners.md#authenticating-to-the-admin-api).
 * `bondy.user.update` (`PUT /realms/:realm_uri/users/:id`), `bondy.oauth2.client.update` (`PUT /realms/:realm_uri/clients/:id`) and `bondy.oauth2.resource_owner.update` (`PUT /realms/:realm_uri/resource_owners/:id`) reject a `password` or `client_secret` with `wamp.error.invalid_argument` (HTTP 400). They used to return success, leave the credential unchanged and close the user's sessions. Set a password or client secret with `bondy.user.change_password` (`POST /realms/:realm_uri/users/:id/change_password`).
 
 ### New Features

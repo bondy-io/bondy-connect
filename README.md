@@ -246,10 +246,12 @@ just node1
 
 ### Create a realm
 
-Every WAMP session belongs to a realm. Create one through the Admin API:
+Every WAMP session belongs to a realm. Create one through the Admin API on the
+node's local socket, which needs no credentials:
 
 ```shell
-curl -X POST "http://localhost:18081/realms" \
+SOCK=_build/node1/rel/bondy-connect/run/bondy_admin.sock
+curl --unix-socket "$SOCK" -X POST "http://localhost/realms" \
      -H 'Content-Type: application/json; charset=utf-8' \
      -H 'Accept: application/json; charset=utf-8' \
      -d '{"uri": "com.myrealm", "description": "My first realm"}'
@@ -259,9 +261,13 @@ While you experiment, disable security on the realm so that clients can connect
 without credentials:
 
 ```shell
-curl -X DELETE "http://localhost:18081/realms/com.myrealm/security_enabled" \
+curl --unix-socket "$SOCK" \
+     -X DELETE "http://localhost/realms/com.myrealm/security_enabled" \
      -H 'Accept: application/json; charset=utf-8'
 ```
+
+On port 18081 the Admin API needs a bearer token from the master realm. See
+[Authenticating to the Admin API](doc/guides/configuration/listeners.md#authenticating-to-the-admin-api).
 
 ### Start a second node
 

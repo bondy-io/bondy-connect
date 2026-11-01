@@ -214,6 +214,31 @@ and need nothing from you. See
 [Platform directories](../deployment/platform_directories.md) for the
 requirement, the deployment rules, and what a failed bind reports.
 
+### Authenticating to the Admin API
+
+On every listener that carries `admin_api` except the internal socket, each
+Admin API request needs an `Authorization: Bearer` access token issued by the
+master realm, `com.leapsight.bondy`. A request without a valid token gets
+`401`. The check is the `oauth2` scheme of an API Gateway specification, so the
+master realm's own configuration decides who can get and present a token:
+
+- add `oauth2` to the master realm's `authmethods`, and an `oauth2` source for
+  the network your administrators connect from;
+- obtain tokens from `/oauth/token` on the same listener, which also serves
+  `/oauth/revoke`. See *Protecting an HTTP API* on developer.bondy.io for the
+  grants.
+
+A token from another realm is refused, even for a user of the same name. The
+token's user still needs grants on the master realm, as for any other
+procedure call.
+
+Requests on the internal socket need no token. They run as the local operator,
+authid `<admin_local>`, and RBAC does not apply to them: only the node's Unix
+user and root can open the socket. Administration therefore stays possible from
+the node itself after every master-realm administrator is deleted or loses
+their grants. No other listener gets this treatment, including a `uds` listener
+an operator declares.
+
 ## UDS listeners
 
 A connection over a Unix domain socket has no network peer to log, embed in
