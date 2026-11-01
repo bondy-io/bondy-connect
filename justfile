@@ -1132,3 +1132,18 @@ perf-lg-run vus="50":
 # Destroy the LG app.
 perf-lg-destroy:
     fly apps destroy bondy-perf-lg --yes
+
+
+# Delete every CT run in _build/test/logs but the newest, whether that is a
+# serial run (ct_run.<node>.<time>) or a sharded one (ct_shards.<time>)
+purge:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd _build/test/logs 2>/dev/null || exit 0
+    shopt -s nullglob
+    runs=(ct_run.*.????-??-??_??.??.?? ct_shards.????-??-??_??.??.??)
+    old=$(for r in "${runs[@]}"; do echo "${r: -19} $r"; done | sort -r | tail -n +2 | cut -d' ' -f2)
+    stale=(shard[0-9]*)
+    for d in $old "${stale[@]}"; do rm -rf "$d"; done
+    [ -L last ] && [ ! -e last ] && rm -f last
+    echo "kept: $(for r in "${runs[@]}"; do echo "${r: -19} $r"; done | sort -r | head -1 | cut -d' ' -f2)"
