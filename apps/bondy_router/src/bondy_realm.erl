@@ -2190,7 +2190,7 @@ maybe_warn_legacy_admin_password(#realm{uri = Uri}) ->
                             ok
                     end
             end;
-        _ ->
+        {error, not_found} ->
             ok
     end.
 
