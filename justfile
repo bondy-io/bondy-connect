@@ -176,8 +176,11 @@ ct suite="": _prune-stale-tests
 # the 9 such modules (75 properties). It is NOT the whole property suite —
 # see the note on `eunit` above before concluding a property did not run.
 
-# PropEr gate: the prop_*-NAMED modules only (see note above).
+# PropEr gate: the prop_*-NAMED modules only (see note above). The properties
+# write to data/bondy_db, so each run starts from an empty one and never
+# depends on what earlier runs left there.
 proper: _prune-stale-tests
+    rm -rf data/bondy_db
     {{rebar}} as test proper
 
 # Run a gate first — this only renders the accumulated coverdata, it does not
