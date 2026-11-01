@@ -786,12 +786,16 @@ init_from_claims(
             throw:{no_such_user, _} -> undefined
         end,
 
-    {Role, ValidRoles} =
+    %% A stored user is named by its casefolded username, the key of its named
+    %% sources; the claims carry the IdP's spelling. Evidence:
+    %% `named_source_matches_an_authid_in_any_case`, admin listener suite.
+    {UserId, Role, ValidRoles} =
         case User of
             undefined ->
-                {undefined, Roles};
+                {Username, undefined, Roles};
             _ ->
-                valid_roles(Roles, User)
+                {UserRole, UserRoles} = valid_roles(Roles, User),
+                {bondy_rbac_user:username(User), UserRole, UserRoles}
         end,
 
     Ctxt = #{
@@ -799,7 +803,7 @@ init_from_claims(
         session_id => SessionId,
         realm_uri => RealmUri,
         sso_realm_uri => SSORealmUri,
-        user_id => Username,
+        user_id => UserId,
         user => User,
         role => Role,
         roles => ValidRoles,

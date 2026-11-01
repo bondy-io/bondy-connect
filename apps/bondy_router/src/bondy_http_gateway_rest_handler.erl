@@ -433,7 +433,9 @@ is_authorized(Method, Req, #{accepts_ticket_cookie := true} = St) ->
     Authorization = cowboy_req:header(<<"authorization">>, Req, undefined),
     Cookies = bondy_http_utils:safe_parse_cookies(Req),
     RealmUri = maps:get(realm_uri, St),
-    case {Authorization, bondy_http_utils:find_ticket_cookie(RealmUri, Cookies)} of
+    case
+        {Authorization, bondy_http_utils:find_ticket_cookie(RealmUri, Cookies)}
+    of
         {undefined, {value, _}} -> authenticate_ticket_cookie(Method, Req, St);
         {_, _} -> authenticate_bearer(Req, St)
     end;

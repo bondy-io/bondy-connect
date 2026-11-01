@@ -37,6 +37,7 @@
 -export([admin_api_cookie_is_subject_to_master_realm_sources/1]).
 -export([admin_api_cookie_without_admin_role_is_forbidden/1]).
 -export([admin_api_csrf_checks_the_authenticating_realms_pair/1]).
+-export([named_source_matches_an_authid_in_any_case/1]).
 -export([log/2]).
 
 -define(ADMIN, admin).
@@ -82,7 +83,8 @@ all() ->
         malformed_bearer_token_is_unauthorized,
         admin_api_cookie_is_subject_to_master_realm_sources,
         admin_api_cookie_without_admin_role_is_forbidden,
-        admin_api_csrf_checks_the_authenticating_realms_pair
+        admin_api_csrf_checks_the_authenticating_realms_pair,
+        named_source_matches_an_authid_in_any_case
     ].
 
 init_per_suite(Config) ->
@@ -539,7 +541,10 @@ only_admin_local_routes_run_as_the_local_operator(_Config) ->
     LocalStates = rest_states(bondy_http_gateway:admin_api_routes(AdminLocal)),
     ?assertNotEqual([], LocalStates),
     ?assertEqual(
-        [], [St || St <- LocalStates, maps:get(local_operator, St, false) =/= true]
+        [], [
+            St
+         || St <- LocalStates, maps:get(local_operator, St, false) =/= true
+        ]
     ),
     ?assertNotEqual(
         [], rest_states(bondy_http_gateway:routes(AdminLocal))
@@ -683,14 +688,16 @@ malformed_bearer_token_is_unauthorized(_Config) ->
     Self = self(),
     Errors = capture_errors(fun() ->
         Self !
-            {results, [
-                {http, T, element(2, get_path(?ADMIN, ?ADMIN_API_PATH, T))}
-             || T <- [Short, Long]
-            ] ++
+            {results,
                 [
-                    {verify, T, bondy_oauth_jwt:verify(?MASTER_REALM_URI, T)}
+                    {http, T, element(2, get_path(?ADMIN, ?ADMIN_API_PATH, T))}
                  || T <- [Short, Long]
-                ]}
+                ] ++
+                    [
+                        {verify, T,
+                            bondy_oauth_jwt:verify(?MASTER_REALM_URI, T)}
+                     || T <- [Short, Long]
+                    ]}
     end),
     Results =
         receive
@@ -785,6 +792,39 @@ admin_api_csrf_checks_the_authenticating_realms_pair(_Config) ->
         ?assertNotEqual(401, Status)
     end).
 
+%% An IdP names a subject in whatever case it stores, and Bondy stores the
+%% user casefolded. A source naming the stored user admits its cookie whatever
+%% the case of the ticket's authid; no `all` source allows `cookie` here.
+named_source_matches_an_authid_in_any_case(_Config) ->
+    Master = ?MASTER_REALM_URI,
+    Username = ~"oidc-case@example.com",
+    Cidr = ~"127.0.0.1/32",
+    {ok, _} = bondy_rbac_user:add(
+        Master,
+        bondy_rbac_user:new(#{
+            username => Username, groups => [~"bondy.administrators"]
+        })
+    ),
+    {ok, _} = bondy_rbac_source:add(Master, #{
+        ~"usernames" => [Username],
+        ~"authmethod" => ?WAMP_COOKIE_AUTH,
+        ~"cidr" => Cidr,
+        ~"meta" => #{}
+    }),
+    try
+        with_cookie_method(fun() ->
+            ?assertEqual(
+                {200, 200},
+                {
+                    cookie_get(admin_ticket(Username), []),
+                    cookie_get(admin_ticket(~"OIDC-Case@Example.com"), [])
+                }
+            )
+        end)
+    after
+        ok = bondy_rbac_source:remove(Master, [Username], Cidr)
+    end.
+
 %% The internal callee registered by `registry_routes_read_the_named_realm/1`;
 %% the case never calls it.
 on_call(_Arg, _KWArgs, _Details) ->
@@ -800,7 +840,8 @@ admin_ticket(Authid) ->
 
 cookie_header(Prefix, Ticket, Csrf) ->
     Master = ?MASTER_REALM_URI,
-    {~"cookie",
+    {
+        ~"cookie",
         iolist_to_binary([
             Prefix,
             bondy_http_utils:ticket_cookie_name(Master),
@@ -810,7 +851,8 @@ cookie_header(Prefix, Ticket, Csrf) ->
             bondy_http_utils:csrf_cookie_name(Master),
             "=",
             Csrf
-        ])}.
+        ])
+    }.
 
 cookie_get(Ticket, Headers) ->
     {ok, Status, _, _} = hackney:request(

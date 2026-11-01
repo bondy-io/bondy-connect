@@ -129,6 +129,20 @@ session is opened:
 - the user still exists and is enabled
 - the realm still allows connections
 - for access tokens, the `token_version` gate
+- the realm's `authmethods` and sources allow, from the caller's address, the
+  method a WAMP session authenticates the credential with: `cookie` for a
+  ticket the OIDC login flow issued, however it is sent; `ticket` for a ticket
+  from `bondy.ticket.issue`; `oauth2` for an access token. As for a session,
+  `ticket` and `oauth2` also need a user with a password, and an OIDC user
+  without a local record is matched only by sources assigned to `all`
+
+> #### Sources see NGINX's address unless the listener trusts it {: .warning}
+>
+> NGINX calls the endpoint, so the source IP is NGINX's unless the listener
+> believes its forwarding headers. Set `proxy_protocol = on` on the listener and
+> list NGINX's address in `proxy_protocol.trusted_proxies`, and have NGINX
+> forward the client's address, as the examples below do. See
+> [Proxy protocol and forwarded headers](../configuration/listeners.md#proxy-protocol-and-forwarded-headers).
 
 Authorization is out of scope. The endpoint reports who the caller is, not what
 they may do; gate on `x-bondy-authroles` in the proxy if you need more.
@@ -170,6 +184,7 @@ location = /_bondy_verify {
     proxy_pass              http://bondy:18080/docs/oidc/verify;
     proxy_pass_request_body off;
     proxy_set_header        Content-Length "";
+    proxy_set_header        X-Forwarded-For $remote_addr;
 }
 
 # Send an unauthenticated visitor to the login flow rather than a bare 401.
@@ -201,6 +216,7 @@ location = /_bondy_verify {
     proxy_pass_request_body off;
     proxy_set_header        Content-Length "";
     proxy_set_header        X-Bondy-Ticket $http_x_bondy_ticket;
+    proxy_set_header        X-Forwarded-For $remote_addr;
 }
 ```
 

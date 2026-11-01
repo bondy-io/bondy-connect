@@ -29,6 +29,8 @@ is decided before any request is served.
 -define(USER, <<"alice">>).
 -define(DISABLED_USER, <<"bob">>).
 -define(PROVIDER, <<"testidp">>).
+-define(SOURCES_REALM, <<"com.example.verify.sources">>).
+-define(SOURCES_VERIFY, "/vsrc/v1.0/oidc/verify").
 
 %% SSO topology, mirroring bondy_trusted_issuer_SUITE:
 %%   SSO      — an SSO realm
@@ -77,6 +79,7 @@ groups() ->
             oidc_ticket_accepted_when_user_is_externally_managed,
             deleted_user_still_verifies_for_oidc_ticket,
             deleted_user_is_rejected_for_locally_issued_ticket,
+            credential_is_subject_to_the_realms_sources,
             malformed_credentials_never_500,
             deleted_realm_never_500,
             post_is_not_allowed
@@ -344,6 +347,81 @@ disabled_user_is_rejected(_) ->
         end
     end.
 
+%% The endpoint applies the realm's sources as a session opened with the same
+%% credential does. The method is the one a session authenticates the
+%% credential with, whatever carries it: `cookie` for a ticket the OIDC flow
+%% issued, also when sent in `X-Bondy-Ticket`; `ticket` for a ticket a WAMP
+%% session issued; `oauth2` for an access token. Each source admits its own
+%% method's credentials only. The WAMP ticket goes to a second user: issuing it
+%% to the first would replace the OIDC ticket's stored claims.
+credential_is_subject_to_the_realms_sources(_) ->
+    Realm = ?SOURCES_REALM,
+    OidcUser = ~"carol",
+    User = ~"erin",
+    _ =
+        case bondy_realm:exists(Realm) of
+            true ->
+                ok;
+            false ->
+                bondy_realm:create(#{
+                    uri => Realm,
+                    authmethods => [
+                        ?WAMP_COOKIE_AUTH, ?WAMP_TICKET_AUTH, ?OAUTH2_AUTH
+                    ],
+                    security_enabled => true,
+                    grants => [
+                        #{
+                            permissions => [~"bondy.issue"],
+                            uri => ~"",
+                            match => ~"prefix",
+                            roles => ~"all"
+                        }
+                    ]
+                })
+        end,
+    _ = bondy_rbac_user:add(
+        Realm,
+        bondy_rbac_user:new(#{username => User, password => ~"erin-Passw0rd"})
+    ),
+    ok = load_spec(<<"com.example.verify.sources">>, Realm, <<"/vsrc/v1.0">>),
+    ok = await_route(?SOURCES_VERIFY, 50),
+    {ok, OidcTicket, _} = issue_ticket(Realm, OidcUser),
+    {WampTicket, _} = issue_wamp_ticket(Realm, User),
+    {ok, Ctxt} = bondy_auth:init(
+        bondy_session_id:new(), Realm, User, all, {127, 0, 0, 1}
+    ),
+    {ok, Token} = bondy_oauth_token:issue(password, Ctxt, #{}),
+    {ok, {AccessToken, _}} = bondy_oauth_token:to_access_token(Token),
+    Requests = [
+        cookie_header(Realm, OidcTicket),
+        [{~"x-bondy-ticket", OidcTicket}],
+        [{~"x-bondy-ticket", WampTicket}],
+        [{~"authorization", <<"Bearer ", AccessToken/binary>>}]
+    ],
+    Statuses = fun() ->
+        [element(1, get_verify(?SOURCES_VERIFY, H)) || H <- Requests]
+    end,
+    Cidr = ~"127.0.0.1/32",
+    AddSource = fun(Method) ->
+        {ok, _} = bondy_rbac_source:add(Realm, #{
+            ~"usernames" => ~"all",
+            ~"authmethod" => Method,
+            ~"cidr" => Cidr,
+            ~"meta" => #{}
+        })
+    end,
+    try
+        ?assertEqual([401, 401, 401, 401], Statuses()),
+        AddSource(?WAMP_COOKIE_AUTH),
+        ?assertEqual([200, 200, 401, 401], Statuses()),
+        AddSource(?WAMP_TICKET_AUTH),
+        ?assertEqual([200, 200, 200, 401], Statuses()),
+        AddSource(?OAUTH2_AUTH),
+        ?assertEqual([200, 200, 200, 200], Statuses())
+    after
+        ok = bondy_rbac_source:remove(Realm, all, Cidr)
+    end.
+
 oidc_ticket_accepted_when_user_is_externally_managed(_) ->
     %% The provider is configured without `auto_provision`, so the subject the
     %% IdP authenticated has no local record and never will. The cookie opens a
@@ -390,8 +468,15 @@ deleted_user_is_rejected_for_locally_issued_ticket(_) ->
     %% `bondy.ticket.issue` names a locally managed user, so the record check
     %% remains a real revocation control — as it does for WAMP `ticket` auth,
     %% which resolves the user through `bondy_auth:init_from_user/8`.
+    %% The password is what a WAMP ticket's holder authenticated with to obtain
+    %% it, and the `ticket` method requires one.
     Username = <<"erin">>,
-    ok = ensure_user(?REALM, Username),
+    {ok, _} = bondy_rbac_user:add(
+        ?REALM,
+        bondy_rbac_user:new(#{
+            username => Username, password => ~"erin-Passw0rd"
+        })
+    ),
     {JWT, Claims} = issue_wamp_ticket(?REALM, Username),
     ?assertNotEqual(~"oidcrp", maps:get(authmethod, Claims)),
     {200, _, _} = get_verify(cookie_header(?REALM, JWT)),
@@ -551,9 +636,11 @@ prototype_realm_inherits_sso_trust(_) ->
 %% HELPERS
 %% =============================================================================
 
+%% An IPv4 literal, so the caller's address is the one the realms' loopback
+%% sources name: `localhost` can resolve to `::1`.
 api_url(Path) ->
     iolist_to_binary([
-        "http://localhost:", integer_to_list(?API_PORT), Path
+        "http://127.0.0.1:", integer_to_list(?API_PORT), Path
     ]).
 
 get_verify(Headers) ->
@@ -632,8 +719,9 @@ ensure_realm(RealmUri) ->
     Config = #{
         uri => RealmUri,
         description => <<"Verify endpoint test realm">>,
-        authmethods => [<<"ticket">>, <<"anonymous">>],
+        authmethods => [?WAMP_COOKIE_AUTH, <<"ticket">>, <<"anonymous">>],
         security_enabled => true,
+        sources => loopback_sources(),
         %% `bondy_ticket:do_issue/2` authorizes the caller, so without this
         %% `issue_wamp_ticket/2` cannot mint the non-OIDC ticket it needs. The
         %% endpoint itself performs no authorization, so this is invisible to
@@ -653,6 +741,18 @@ ensure_realm(RealmUri) ->
             false -> bondy_realm:create(Config)
         end,
     ok.
+
+%% The endpoint applies the realm's methods and sources, so a realm it verifies
+%% against allows the two methods its credentials map to from loopback.
+loopback_sources() ->
+    [
+        #{
+            usernames => <<"all">>,
+            authmethod => Method,
+            cidr => <<"127.0.0.0/8">>
+        }
+     || Method <- [?WAMP_COOKIE_AUTH, ?WAMP_TICKET_AUTH]
+    ].
 
 ensure_user(RealmUri, Username) ->
     case bondy_rbac_user:lookup(RealmUri, Username) of
@@ -732,7 +832,7 @@ add_member_realm(Uri, SSOUri, Usernames) ->
         uri => Uri,
         description => <<"Verify endpoint member realm">>,
         authmethods => [
-            ?WAMP_TICKET_AUTH, ?WAMP_CRA_AUTH, ?PASSWORD_AUTH
+            ?WAMP_COOKIE_AUTH, ?WAMP_TICKET_AUTH, ?WAMP_CRA_AUTH, ?PASSWORD_AUTH
         ],
         security_enabled => true,
         sso_realm_uri => SSOUri,
@@ -763,6 +863,11 @@ add_member_realm(Uri, SSOUri, Usernames) ->
                 usernames => <<"all">>,
                 authmethod => ?WAMP_TICKET_AUTH,
                 cidr => <<"0.0.0.0/0">>
+            },
+            #{
+                usernames => <<"all">>,
+                authmethod => ?WAMP_COOKIE_AUTH,
+                cidr => <<"0.0.0.0/0">>
             }
         ]
     }),
@@ -775,6 +880,8 @@ add_prototype_realm(Uri, SSOUri) ->
         is_prototype => true,
         security_enabled => true,
         sso_realm_uri => SSOUri,
+        authmethods => [?WAMP_COOKIE_AUTH, ?WAMP_TICKET_AUTH],
+        sources => loopback_sources(),
         %% Required, and not merely tidy: `bondy_realm:allow_connections/1`
         %% falls back to `not is_prototype` when the value is unset, and a child
         %% realm inherits that computed `false`. Leaving it out here would close

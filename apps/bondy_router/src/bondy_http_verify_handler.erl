@@ -46,9 +46,17 @@ Signature, expiry and revocation, via `bondy_ticket:verify/1` or
   below — still exists
 - the realm still allows connections
 - for access tokens, the `token_version` gate in `bondy_auth_oauth2`
+- the realm's `authmethods` and sources allow, from the caller's address, the
+  method a session would authenticate the credential with: `cookie` for a
+  ticket the OIDC flow issued, `ticket` for any other ticket, `oauth2` for an
+  access token (`credential_is_subject_to_the_realms_sources`)
 
-Without the last three a ticket would keep opening the gate after the user was
-disabled or removed, until it expired.
+Without the user, realm and `token_version` checks a ticket would keep opening
+the gate after the user was disabled or removed, until it expired.
+
+The caller's address is the listener's source IP. Behind a reverse proxy it is
+the proxy's, unless the listener trusts the proxy's forwarding headers
+(`proxy_protocol.trusted_proxies`).
 
 Authorization is out of scope: this answers who the caller is, not what they
 may do.
@@ -164,6 +172,7 @@ do_verify(RealmUri, Req) ->
 
         ok = check_principal(RealmUri, Identity),
         ok = check_realm(RealmUri),
+        ok = check_method(RealmUri, Identity, Req),
 
         {ok, Identity}
     catch
@@ -334,6 +343,51 @@ check_realm(RealmUri) ->
     bondy_realm:allow_connections(RealmUri) orelse
         throw(connections_not_allowed),
     ok.
+
+%% @private
+%% `bondy_auth` decides, from the realm's methods and sources and the method's
+%% requirements, as it does for a WAMP session opened with the cookie.
+check_method(
+    RealmUri, #{authid := Authid, authroles := Roles} = Identity, Req
+) ->
+    Method = authmethod(Identity),
+    case
+        bondy_auth:init(
+            bondy_session_id:new(),
+            RealmUri,
+            Authid,
+            Roles,
+            source_ip(Req),
+            #{claims => Identity}
+        )
+    of
+        {ok, Ctxt} ->
+            [Method] =:= bondy_auth:available_methods([Method], Ctxt) orelse
+                throw(no_authmethod),
+            ok;
+        {error, Reason} ->
+            throw(Reason)
+    end.
+
+%% @private
+%% The method each kind of credential is checked under, whatever carried it
+%% (`bondy_http_verify_SUITE:credential_is_subject_to_the_realms_sources`).
+authmethod(#{authmethod := ?OAUTH2_AUTH}) ->
+    ?OAUTH2_AUTH;
+authmethod(#{authmethod := ?OIDCRP_AUTH}) ->
+    ?WAMP_COOKIE_AUTH;
+authmethod(#{authmethod := Method}) when
+    Method =/= ?OAUTH2_AUTH, Method =/= ?OIDCRP_AUTH
+->
+    ?WAMP_TICKET_AUTH.
+
+%% @private
+source_ip(Req) ->
+    ProxyProtocol = bondy_http_proxy_protocol:init(Req),
+    case bondy_http_proxy_protocol:source_ip(ProxyProtocol) of
+        {ok, SourceIP} -> SourceIP;
+        {error, {protocol_error, _}} -> throw(proxy_protocol_error)
+    end.
 
 %% -----------------------------------------------------------------------------
 %% Replies
