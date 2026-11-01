@@ -20,7 +20,7 @@ dynamically implement all Cowboy REST callbacks at runtime.
 ```
 Cowboy REST
   init/2                  → build request context (id, method, path, headers, ...)
-  is_authorized/2         → validate OAuth2 / API-key / anonymous
+  is_authorized/2         → authenticate per the path's security scheme
   resource_exists/2       → collection awareness (POST on collection → 201)
   content_types_*/2       → from parsed spec (accepts / provides)
   allowed_methods/2       → from parsed spec
@@ -56,7 +56,7 @@ MOPS expressions:
   bindings, body, body_length
 - `action.result` — populated after a successful action
 - `action.error` — populated after a failed action
-- `security` — populated after OAuth2 authentication (realm_uri,
+- `security` — populated after OAuth2 bearer authentication (realm_uri,
   session, authid, groups, etc.)
 
 ## Error URI → HTTP status code
@@ -89,6 +89,7 @@ The status is derived from the error's URI by
     deprecated => boolean(),
     security => map(),
     local_operator => true,
+    accepts_ticket_cookie => true,
     is_anonymous => boolean(),
     authid => binary() | undefined,
     authroles => [binary()],
@@ -214,8 +215,16 @@ Behaviour depends on the security type in the spec:
   authenticates via `bondy_auth`. On success the security claims are
   added to the MOPS context. On failure a `401 Unauthorized` response
   is returned with a `WWW-Authenticate` header.
-- `api_key` — currently unsupported; returns `false`.
+- `oidc` — authenticates the realm's OIDC ticket cookie through
+  `bondy_auth` with the `cookie` method; a method other than GET, HEAD
+  or OPTIONS must also pass the double-submit CSRF check, or gets `403`.
+- `basic`, `api_key` and any unknown scheme — refused.
 - No security / empty — the request is treated as anonymous.
+
+Built-in Admin API routes differ (`bondy_http_gateway:admin_api_routes/1`):
+on `admin_local` the request runs as the local operator without
+credentials; on other listeners a request without an `Authorization`
+header that carries the ticket cookie authenticates as on an `oidc` path.
 
 Also initialises the proxy protocol and extracts the source IP.
 """.
@@ -418,9 +427,61 @@ is_authorized(<<"OPTIONS">>, Req, St0) ->
 is_authorized(_, Req, #{local_operator := true} = St0) ->
     St1 = St0#{is_anonymous => false, authid => ?LOCAL_OPERATOR_AUTHID},
     {true, Req, St1};
-is_authorized(
-    _, Req0, #{security := #{<<"type">> := <<"oauth2">>}} = St0
-) ->
+is_authorized(Method, Req, #{accepts_ticket_cookie := true} = St) ->
+    %% Explicit beats ambient: with an `Authorization` header the bearer token
+    %% is the credential, and a failing one never falls back to the cookie.
+    Authorization = cowboy_req:header(<<"authorization">>, Req, undefined),
+    Cookies = bondy_http_utils:safe_parse_cookies(Req),
+    RealmUri = maps:get(realm_uri, St),
+    case {Authorization, bondy_http_utils:find_ticket_cookie(RealmUri, Cookies)} of
+        {undefined, {value, _}} -> authenticate_ticket_cookie(Method, Req, St);
+        {_, _} -> authenticate_bearer(Req, St)
+    end;
+is_authorized(_, Req, #{security := #{<<"type">> := <<"oauth2">>}} = St) ->
+    authenticate_bearer(Req, St);
+is_authorized(_, Req, #{security := #{<<"type">> := <<"api_key">>}} = St) ->
+    %% TODO get auth method and status from St and validate
+    %% check scopes vs action requirements
+    ?LOG_WARNING(#{
+        description =>
+            "Request is using unsupported api_key authentication scheme",
+        request => Req
+    }),
+    {false, Req, St};
+is_authorized(Method, Req, #{security := #{<<"type">> := <<"oidc">>}} = St) ->
+    authenticate_ticket_cookie(Method, Req, St);
+is_authorized(_, Req, #{security := #{<<"type">> := <<"basic">>}} = St) ->
+    %% `basic` parses but has no runtime enforcement, so it fails closed:
+    %% the anonymous branch below would serve a route declared protected.
+    ?LOG_WARNING(#{
+        description =>
+            "Denying request: the endpoint's HTTP security scheme is not "
+            "enforced at runtime (fail-closed).",
+        type => <<"basic">>,
+        request => Req
+    }),
+    {false, Req, St};
+is_authorized(_, Req, #{security := Security} = St0) when
+    is_map(Security) andalso map_size(Security) == 0
+->
+    %% A genuinely anonymous endpoint declares an EMPTY security map
+    %% (`?DEFAULT_SECURITY`); only that is served without authentication.
+    St1 = St0#{is_anonymous => true},
+    {true, Req, St1};
+is_authorized(_, Req, #{security := Security} = St) ->
+    %% Any other (unknown / malformed / future) security value fails closed
+    %% rather than defaulting to anonymous access.
+    ?LOG_WARNING(#{
+        description =>
+            "Denying request: unrecognised endpoint security scheme "
+            "(fail-closed).",
+        security => Security,
+        request => Req
+    }),
+    {false, Req, St}.
+
+%% @private
+authenticate_bearer(Req0, St0) ->
     %% TODO get auth method and status from St and validate
     %% check scopes vs action requirements
 
@@ -431,7 +492,11 @@ is_authorized(
 
     try
         Token = parse_token(Req0),
-        Claims = bondy_oauth_jwt:decode(Token),
+        Claims =
+            case bondy_oauth_jwt:decode(Token) of
+                {ok, Decoded} -> Decoded;
+                {error, invalid} -> throw(invalid_token)
+            end,
         UserId = maps:get(<<"sub">>, Claims, undefined),
 
         case bondy_auth:init(SessionId, RealmUri, UserId, all, SourceIP) of
@@ -447,19 +512,10 @@ is_authorized(
                 EReason, <<"Bearer">>, RealmUri, json, Req1
             ),
             {stop, Req2, St0}
-    end;
-is_authorized(_, Req, #{security := #{<<"type">> := <<"api_key">>}} = St) ->
-    %% TODO get auth method and status from St and validate
-    %% check scopes vs action requirements
-    ?LOG_WARNING(#{
-        description =>
-            "Request is using unsupported api_key authentication scheme",
-        request => Req
-    }),
-    {false, Req, St};
-is_authorized(
-    Method, Req0, #{security := #{<<"type">> := <<"oidc">>}} = St0
-) ->
+    end.
+
+%% @private
+authenticate_ticket_cookie(Method, Req0, St0) ->
     %% The checks a WAMP session opened with the same cookie gets
     %% (`bondy_wamp_protocol`'s cookie clause): the realm's methods through
     %% `bondy_auth`, scope and issuer through the `cookie` method.
@@ -467,8 +523,8 @@ is_authorized(
     SourceIP = maps:get(source_ip, St0),
 
     try
-        Claims = ticket_cookie_claims(RealmUri, Req0),
-        ok = check_csrf(Method, Req0),
+        {CookieName, Claims} = ticket_cookie_claims(RealmUri, Req0),
+        ok = check_csrf(Method, CookieName, Req0),
         Authid = maps:get(authid, Claims),
         Authroles = maps:get(authroles, Claims, []),
         Ctxt0 =
@@ -510,46 +566,17 @@ is_authorized(
                 EReason, <<"Cookie">>, RealmUri, json, Req1
             ),
             {stop, Req2, St0}
-    end;
-is_authorized(_, Req, #{security := #{<<"type">> := <<"basic">>}} = St) ->
-    %% `basic` parses but has no runtime enforcement, so it fails closed:
-    %% the anonymous branch below would serve a route declared protected.
-    ?LOG_WARNING(#{
-        description =>
-            "Denying request: the endpoint's HTTP security scheme is not "
-            "enforced at runtime (fail-closed).",
-        type => <<"basic">>,
-        request => Req
-    }),
-    {false, Req, St};
-is_authorized(_, Req, #{security := Security} = St0) when
-    is_map(Security) andalso map_size(Security) == 0
-->
-    %% A genuinely anonymous endpoint declares an EMPTY security map
-    %% (`?DEFAULT_SECURITY`); only that is served without authentication.
-    St1 = St0#{is_anonymous => true},
-    {true, Req, St1};
-is_authorized(_, Req, #{security := Security} = St) ->
-    %% Any other (unknown / malformed / future) security value fails closed
-    %% rather than defaulting to anonymous access.
-    ?LOG_WARNING(#{
-        description =>
-            "Denying request: unrecognised endpoint security scheme "
-            "(fail-closed).",
-        security => Security,
-        request => Req
-    }),
-    {false, Req, St}.
+    end.
 
 %% @private
 %% Only the cookie the OIDC authorization code flow sets: a browser sends it
-%% unasked, which is why `check_csrf/2` guards every unsafe method.
+%% unasked, which is why `check_csrf/3` guards every unsafe method.
 ticket_cookie_claims(RealmUri, Req) ->
     Cookies = bondy_http_utils:safe_parse_cookies(Req),
     case bondy_http_utils:find_ticket_cookie(RealmUri, Cookies) of
-        {value, {_, Ticket}} when Ticket =/= <<>> ->
+        {value, {Name, Ticket}} when Ticket =/= <<>> ->
             case bondy_ticket:verify(Ticket) of
-                {ok, Claims} -> Claims;
+                {ok, Claims} -> {Name, Claims};
                 {error, Reason} -> throw(Reason)
             end;
         {value, {_, <<>>}} ->
@@ -559,13 +586,13 @@ ticket_cookie_claims(RealmUri, Req) ->
     end.
 
 %% @private
-check_csrf(Method, _) when
+check_csrf(Method, _, _) when
     Method == <<"GET">> orelse Method == <<"HEAD">> orelse
         Method == <<"OPTIONS">>
 ->
     ok;
-check_csrf(_, Req) ->
-    case bondy_http_utils:validate_csrf(Req) of
+check_csrf(_, CookieName, Req) ->
+    case bondy_http_utils:validate_csrf(CookieName, Req) of
         ok -> ok;
         {error, forbidden} -> throw(csrf_validation_failed)
     end.

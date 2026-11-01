@@ -232,6 +232,28 @@ A token from another realm is refused, even for a user of the same name. The
 token's user still needs grants on the master realm, as for any other
 procedure call.
 
+A browser can use OIDC instead. A request without an `Authorization` header
+that carries the master realm's ticket cookie, `bondy_ticket_com.leapsight.bondy`,
+authenticates with it, checked as on an API Gateway path with the `oidc` scheme:
+
+- add `cookie` to the master realm's `authmethods`, and an OIDC provider to its
+  `oidc_providers`;
+- add a `cookie` source for the network your administrators connect from. An
+  OIDC user without a local user record is matched only by sources assigned
+  to `all`, because a source that names users requires them to exist; the
+  provider's `auto_provision` creates the record;
+- load an API Gateway specification bound to `com.leapsight.bondy` whose
+  security is `oidc` with that provider: it serves the login, callback and
+  logout endpoints that set the cookie;
+- a request other than `GET`, `HEAD` or `OPTIONS` must also send the value of
+  the `bondy_csrf_com.leapsight.bondy` cookie in `x-csrf-token`.
+
+The cookie's path is `/`, and without a `cookie_domain` in the provider's
+configuration it is sent only to the host that set it, on any port. Serve the
+login from the host the Admin API answers on, or set `cookie_domain` to cover
+both. When a request sends a bearer token as well, the token is the credential
+and the cookie is ignored.
+
 Requests on the internal socket need no token. They run as the local operator,
 authid `<admin_local>`, and RBAC does not apply to them: only the node's Unix
 user and root can open the socket. Administration therefore stays possible from

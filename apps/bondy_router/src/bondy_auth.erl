@@ -76,8 +76,6 @@ system and the user's password capabilities.
 -export([decoy/5]).
 -export([fence_freshness/1]).
 -export([host/1]).
--export([init/3]).
--export([init/4]).
 -export([init/5]).
 -export([init/6]).
 -export([issuer/1]).
@@ -138,75 +136,6 @@ format_status(Ctxt) ->
 %% =============================================================================
 %% API
 %% =============================================================================
-
--doc """
-Only valid for transport-level authentication e.g. cookie
-""".
--spec init(
-    SessionId :: bondy_session_id:t(),
-    Realm :: bondy_realm:t() | uri(),
-    SourceIP :: inet:ip_address()
-) ->
-    {ok, context()}
-    | {error,
-        {no_such_user, binary()}
-        | {no_such_realm, binary()}
-        | {no_such_groups, [bondy_rbac_group:name()]}}
-    | no_return().
-
-init(SessionId, Uri, SourceIP) ->
-    init(SessionId, Uri, SourceIP, #{}).
-
--doc """
-Only valid for transport-level authentication e.g. cookie
-""".
--spec init(
-    SessionId :: bondy_session_id:t(),
-    Realm :: bondy_realm:t() | uri(),
-    SourceIP :: inet:ip_address(),
-    Opts :: opts()
-) ->
-    {ok, context()}
-    | {error,
-        {no_such_user, binary()}
-        | {no_such_realm, binary()}
-        | {no_such_groups, [bondy_rbac_group:name()]}}
-    | no_return().
-
-init(SessionId, Uri, SourceIP, Opts) when
-    is_binary(SessionId), is_binary(Uri), ?IS_IP(SourceIP)
-->
-    case bondy_realm:lookup(string:casefold(Uri)) of
-        {ok, Realm} ->
-            init(SessionId, Realm, SourceIP, Opts);
-        {error, not_found} ->
-            {error, {no_such_realm, Uri}}
-    end;
-init(SessionId, Realm, SourceIP, Opts) when
-    is_binary(SessionId), is_tuple(Realm), ?IS_IP(SourceIP), is_map(Opts)
-->
-    try
-        RealmUri = bondy_realm:uri(Realm),
-        SSORealmUri = bondy_realm:sso_realm_uri(Realm),
-
-        Ctxt = #{
-            provider => ?BONDY_AUTH_PROVIDER,
-            session_id => SessionId,
-            realm_uri => RealmUri,
-            sso_realm_uri => SSORealmUri,
-            source_ip => SourceIP,
-            host => maps:get(host, Opts, undefined),
-            user_id => undefined,
-            user => undefined,
-            role => undefined,
-            roles => undefined
-        },
-        Methods = compute_available_methods(Realm, Ctxt),
-        {ok, maps:put(available_methods, Methods, Ctxt)}
-    catch
-        throw:Reason ->
-            {error, Reason}
-    end.
 
 -doc """
 WAMP-level authentication.
@@ -721,9 +650,6 @@ compute_available_methods(Realm, Ctxt) ->
 
 %% @private
 
-do_compute_available_methods(#{user := undefined}, RealmAllowed) ->
-    %% Not perfect, this is the case of cookies.
-    RealmAllowed;
 do_compute_available_methods(#{user_id := UserId} = Ctxt, RealmAllowed) ->
     #{
         realm_uri := RealmUri,
@@ -781,7 +707,13 @@ has_wamp_auth(Method) ->
 
 %% @private
 matches_requirements(Method, #{user_id := UserId, user := User}) ->
-    Password = bondy_rbac_user:password(User),
+    %% `undefined` is an identity the ticket claims carry and Bondy holds no
+    %% record for, so a requirement on the record is unmet.
+    Password =
+        case User of
+            undefined -> undefined;
+            _ -> bondy_rbac_user:password(User)
+        end,
 
     Requirements = maps:to_list((callback_mod(Method)):requirements()),
 
@@ -794,7 +726,8 @@ matches_requirements(Method, #{user_id := UserId, user := User}) ->
             Match({identification, true}) ->
                 UserId =/= anonymous;
             Match({authorized_keys, true}) ->
-                bondy_rbac_user:has_authorized_keys(User);
+                User =/= undefined andalso
+                    bondy_rbac_user:has_authorized_keys(User);
             Match({password, true}) ->
                 Password =/= undefined;
             Match({password, {true, #{protocols := Ps}}}) ->

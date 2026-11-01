@@ -33,6 +33,11 @@
 -export([admin_local_socket_is_bound_and_serves/1]).
 -export([registry_routes_read_the_named_realm/1]).
 -export([on_call/3]).
+-export([malformed_bearer_token_is_unauthorized/1]).
+-export([admin_api_cookie_is_subject_to_master_realm_sources/1]).
+-export([admin_api_cookie_without_admin_role_is_forbidden/1]).
+-export([admin_api_csrf_checks_the_authenticating_realms_pair/1]).
+-export([log/2]).
 
 -define(ADMIN, admin).
 -define(PUBLIC, api_gateway_http).
@@ -53,6 +58,7 @@
 -define(OPERATOR, ~"adminsplit-operator").
 -define(OPERATOR_PASS, ~"adminsplit-Passw0rd").
 -define(FOREIGN_REALM, ~"com.example.adminsplit.foreign").
+-define(TRACED, [bondy_http_gateway_rest_handler, bondy_oauth_jwt]).
 
 all() ->
     [
@@ -70,7 +76,13 @@ all() ->
         admin_local_is_not_locked_out_by_rbac,
         only_admin_local_routes_run_as_the_local_operator,
         admin_api_requires_a_master_realm_bearer_token,
-        admin_api_listeners_mount_the_oauth2_endpoints
+        admin_api_listeners_mount_the_oauth2_endpoints,
+        admin_api_accepts_the_master_realm_ticket_cookie,
+        only_admin_api_routes_accept_the_ticket_cookie,
+        malformed_bearer_token_is_unauthorized,
+        admin_api_cookie_is_subject_to_master_realm_sources,
+        admin_api_cookie_without_admin_role_is_forbidden,
+        admin_api_csrf_checks_the_authenticating_realms_pair
     ].
 
 init_per_suite(Config) ->
@@ -592,10 +604,290 @@ admin_api_listeners_mount_the_oauth2_endpoints(_Config) ->
     ],
     ?assertMatch({ok, 404, _, _}, post_path(?PUBLIC, "/oauth/token")).
 
+%% A request without `Authorization` may authenticate with the master realm's
+%% OIDC ticket cookie, checked as on an `oidc` route: the master realm's
+%% `authmethods` must include `cookie`, a source must allow it from the
+%% client's address, and a request that changes state needs the CSRF token. A
+%% bearer token, when sent, is the credential used.
+admin_api_accepts_the_master_realm_ticket_cookie(_Config) ->
+    Master = ?MASTER_REALM_URI,
+    Ticket = admin_ticket(~"oidc-admin@example.com"),
+    Csrf = ~"admin-csrf-token",
+    Cookie = cookie_header(<<>>, Ticket, Csrf),
+    Post = fun(Headers) ->
+        {ok, Status, _, _} = hackney:request(
+            post,
+            url(?ADMIN, ?ADMIN_API_PATH),
+            [{~"content-type", ~"application/json"}, Cookie | Headers],
+            <<"{}">>,
+            []
+        ),
+        Status
+    end,
+    with_cookie_source(fun() ->
+        with_cookie_method(fun() ->
+            ?assertEqual(200, cookie_get(Ticket, [])),
+            ?assertEqual(403, Post([])),
+            ?assertNotEqual(403, Post([{~"x-csrf-token", Csrf}])),
+            ?assertNotEqual(401, Post([{~"x-csrf-token", Csrf}])),
+            Foreign = issue_token(?FOREIGN_REALM),
+            ?assertEqual(
+                401,
+                cookie_get(Ticket, [
+                    {~"authorization", <<"Bearer ", Foreign/binary>>}
+                ])
+            )
+        end),
+        ?assertNot(
+            lists:member(?WAMP_COOKIE_AUTH, bondy_realm:authmethods(Master))
+        ),
+        ?assertEqual(401, cookie_get(Ticket, []))
+    end).
+
+%% The route state that lets a request authenticate with the ticket cookie
+%% instead of its specification's scheme is set by `admin_api_routes/1` alone:
+%% every Admin API REST route carries it, and no stored specification's route
+%% does.
+only_admin_api_routes_accept_the_ticket_cookie(_Config) ->
+    Listeners = bondy_listener_manager:listeners(),
+    AdminStates = lists:append([
+        rest_states(bondy_http_gateway:admin_api_routes(L))
+     || L <- Listeners
+    ]),
+    ?assertNotEqual([], AdminStates),
+    ?assertEqual(
+        [],
+        [
+            St
+         || St <- AdminStates,
+            maps:get(accepts_ticket_cookie, St, false) =/= true
+        ]
+    ),
+    ?assertEqual(
+        [],
+        [
+            maps:get(name, L)
+         || L <- Listeners,
+            St <- rest_states(bondy_http_gateway:routes(L)),
+            maps:is_key(accepts_ticket_cookie, St)
+        ]
+    ).
+
+%% A bearer value that is not a JWT is an invalid credential, answered 401
+%% without an error report. `bondy_oauth_jwt:verify/2` serves the WAMP `oauth2`
+%% method, and is held to the same. Each error shape of the decode is covered
+%% by `bondy_oauth_jwt_test`.
+malformed_bearer_token_is_unauthorized(_Config) ->
+    Short = ~"not-a-token",
+    Long = binary:copy(~"x", 48),
+    Self = self(),
+    Errors = capture_errors(fun() ->
+        Self !
+            {results, [
+                {http, T, element(2, get_path(?ADMIN, ?ADMIN_API_PATH, T))}
+             || T <- [Short, Long]
+            ] ++
+                [
+                    {verify, T, bondy_oauth_jwt:verify(?MASTER_REALM_URI, T)}
+                 || T <- [Short, Long]
+                ]}
+    end),
+    Results =
+        receive
+            {results, R} -> R
+        end,
+    ?assertEqual(
+        {
+            [
+                {http, Short, 401},
+                {http, Long, 401},
+                {verify, Short, {error, oauth2_invalid_grant}},
+                {verify, Long, {error, oauth2_invalid_grant}}
+            ],
+            []
+        },
+        {Results, [maps:get(msg, E) || E <- Errors]}
+    ).
+
+%% An OIDC identity is held to the master realm's sources like any other
+%% administrator: with no source allowing `cookie` from loopback, its cookie
+%% is refused, whether or not a local user record exists for it. A realm-wide
+%% `all` source admits an identity Bondy holds no record for.
+admin_api_cookie_is_subject_to_master_realm_sources(_Config) ->
+    Master = ?MASTER_REALM_URI,
+    External = ~"oidc-external@example.com",
+    Stored = ~"oidc-stored@example.com",
+    {ok, _} = bondy_rbac_user:add(
+        Master,
+        bondy_rbac_user:new(#{
+            username => Stored, groups => [~"bondy.administrators"]
+        })
+    ),
+    [
+        ?assertEqual(
+            [],
+            [
+                S
+             || S <- bondy_rbac_source:match(Master, Id, {127, 0, 0, 1}),
+                bondy_rbac_source:authmethod(S) =:= ?WAMP_COOKIE_AUTH
+            ]
+        )
+     || Id <- [External, Stored]
+    ],
+    with_cookie_method(fun() ->
+        ?assertEqual(401, cookie_get(admin_ticket(Stored), [])),
+        ?assertEqual(401, cookie_get(admin_ticket(External), [])),
+        with_cookie_source(fun() ->
+            ?assertEqual(200, cookie_get(admin_ticket(External), [])),
+            ?assertEqual(200, cookie_get(admin_ticket(Stored), []))
+        end)
+    end).
+
+%% The Admin API's permissions apply to a cookie-authenticated caller: a
+%% ticket that carries no role is authenticated and then refused.
+admin_api_cookie_without_admin_role_is_forbidden(_Config) ->
+    {ok, Ticket, _} = bondy_oidc_ticket:issue(
+        ?MASTER_REALM_URI, ~"oidc-nobody@example.com", ~"idp", #{}, #{
+            authroles => []
+        }
+    ),
+    with_cookie_auth(fun() -> ?assertEqual(403, cookie_get(Ticket, [])) end).
+
+%% A browser keeps the cookie pair of every realm it signed in to. The CSRF
+%% token is checked against the pair of the realm whose cookie authenticated,
+%% even when another realm's pair arrives first.
+admin_api_csrf_checks_the_authenticating_realms_pair(_Config) ->
+    Other = ?FOREIGN_REALM,
+    Csrf = ~"master-csrf",
+    Others = iolist_to_binary([
+        bondy_http_utils:ticket_cookie_name(Other),
+        "=other-ticket; ",
+        bondy_http_utils:csrf_cookie_name(Other),
+        "=other-csrf; "
+    ]),
+    with_cookie_auth(fun() ->
+        {ok, Status, _, _} = hackney:request(
+            post,
+            url(?ADMIN, ?ADMIN_API_PATH),
+            [
+                {~"content-type", ~"application/json"},
+                {~"x-csrf-token", Csrf},
+                cookie_header(
+                    Others,
+                    admin_ticket(~"oidc-admin@example.com"),
+                    Csrf
+                )
+            ],
+            <<"{}">>,
+            []
+        ),
+        ?assertNotEqual(403, Status),
+        ?assertNotEqual(401, Status)
+    end).
+
 %% The internal callee registered by `registry_routes_read_the_named_realm/1`;
 %% the case never calls it.
 on_call(_Arg, _KWArgs, _Details) ->
     {ok, #{}, [], #{}}.
+
+admin_ticket(Authid) ->
+    {ok, Ticket, _} = bondy_oidc_ticket:issue(
+        ?MASTER_REALM_URI, Authid, ~"idp", #{}, #{
+            authroles => [~"bondy.administrators"]
+        }
+    ),
+    Ticket.
+
+cookie_header(Prefix, Ticket, Csrf) ->
+    Master = ?MASTER_REALM_URI,
+    {~"cookie",
+        iolist_to_binary([
+            Prefix,
+            bondy_http_utils:ticket_cookie_name(Master),
+            "=",
+            Ticket,
+            "; ",
+            bondy_http_utils:csrf_cookie_name(Master),
+            "=",
+            Csrf
+        ])}.
+
+cookie_get(Ticket, Headers) ->
+    {ok, Status, _, _} = hackney:request(
+        get,
+        url(?ADMIN, ?ADMIN_API_PATH),
+        [cookie_header(<<>>, Ticket, ~"csrf") | Headers],
+        <<>>,
+        []
+    ),
+    Status.
+
+%% The configuration an operator writes for OIDC administration: `cookie` among
+%% the master realm's methods, and a source allowing it to every user from the
+%% client's network.
+with_cookie_auth(Fun) ->
+    with_cookie_method(fun() -> with_cookie_source(Fun) end).
+
+with_cookie_method(Fun) ->
+    Master = ?MASTER_REALM_URI,
+    Methods = bondy_realm:authmethods(Master),
+    _ = bondy_realm:update(Master, #{
+        ~"authmethods" => lists:usort([?WAMP_COOKIE_AUTH | Methods])
+    }),
+    try
+        Fun()
+    after
+        _ = bondy_realm:update(Master, #{~"authmethods" => Methods})
+    end.
+
+%% A /32, so removing it leaves the master realm's default `127.0.0.0/8`
+%% sources in place.
+with_cookie_source(Fun) ->
+    Master = ?MASTER_REALM_URI,
+    Cidr = ~"127.0.0.1/32",
+    {ok, _} = bondy_rbac_source:add(Master, #{
+        ~"usernames" => ~"all",
+        ~"authmethod" => ?WAMP_COOKIE_AUTH,
+        ~"cidr" => Cidr,
+        ~"meta" => #{}
+    }),
+    try
+        Fun()
+    after
+        ok = bondy_rbac_source:remove(Master, all, Cidr)
+    end.
+
+%% Error-level reports logged while `Fun` runs whose stack trace passes through
+%% the gateway handler or the JWT module. The handler logs through
+%% `logger:log/3`, so its events carry no `mfa`.
+capture_errors(Fun) ->
+    Id = admin_listener_suite_errors,
+    ok = logger:add_handler(Id, ?MODULE, #{
+        level => error, config => #{pid => self()}
+    }),
+    try
+        _ = Fun(),
+        collect_errors([])
+    after
+        ok = logger:remove_handler(Id)
+    end.
+
+collect_errors(Acc) ->
+    receive
+        {logged, #{msg := {report, #{stacktrace := Trace}}} = Event} ->
+            case [M || {M, _, _, _} <- Trace, lists:member(M, ?TRACED)] of
+                [] -> collect_errors(Acc);
+                [_ | _] -> collect_errors([Event | Acc])
+            end;
+        {logged, #{}} ->
+            collect_errors(Acc)
+    after 200 ->
+        lists:reverse(Acc)
+    end.
+
+log(Event, #{config := #{pid := Pid}}) ->
+    Pid ! {logged, Event},
+    ok.
 
 %% @private
 json_body({ok, Status, _, Ref}) ->

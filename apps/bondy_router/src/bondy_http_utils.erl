@@ -43,6 +43,7 @@ the API Gateway spec defaults read it here.
 -export([ticket_cookie_name/1]).
 -export([ticket_cookie_realm/1]).
 -export([validate_csrf/1]).
+-export([validate_csrf/2]).
 
 %% ERROR STATUS MAPPING
 -export([default_status_codes/0]).
@@ -273,38 +274,50 @@ ticket_cookie_realm(Name) when is_binary(Name) ->
     binary:part(Name, PrefixLen, byte_size(Name) - PrefixLen).
 
 -doc """
-Validates the double-submit CSRF token of a cookie-authenticated request.
+Validates the double-submit CSRF token of a request authenticated by the first
+Bondy ticket cookie it carries, the one `find_ticket_cookie/1` returns.
 
 Returns `ok` when the request carries no Bondy ticket cookie, since a request
-that does not rely on ambient cookie authority has nothing to protect. When a
-ticket cookie is present, the `x-csrf-token` header must match the value of the
-matching CSRF cookie. See `bondy_oidc_handler`, which issues the pair.
+that does not rely on ambient cookie authority has nothing to protect.
+Otherwise behaves as `validate_csrf/2` for that cookie.
 """.
 -spec validate_csrf(Req :: cowboy_req:req()) -> ok | {error, forbidden}.
 
 validate_csrf(Req) ->
-    Cookies = safe_parse_cookies(Req),
-
-    case find_ticket_cookie(Cookies) of
+    case find_ticket_cookie(safe_parse_cookies(Req)) of
         false ->
-            %% No ticket cookie — non-OIDC flow, skip CSRF
             ok;
         {value, {Name, _}} ->
-            CsrfName = csrf_cookie_name(ticket_cookie_realm(Name)),
-            CsrfHeader = cowboy_req:header(<<"x-csrf-token">>, Req, undefined),
-            CsrfCookie =
-                case lists:keyfind(CsrfName, 1, Cookies) of
-                    {_, V} -> V;
-                    false -> undefined
-                end,
+            validate_csrf(Name, Req)
+    end.
 
-            case
-                is_binary(CsrfHeader) andalso is_binary(CsrfCookie) andalso
-                    CsrfHeader =:= CsrfCookie
-            of
-                true -> ok;
-                false -> {error, forbidden}
-            end
+-doc """
+Validates the double-submit CSRF token of a request authenticated by the ticket
+cookie named `TicketCookieName`.
+
+The `x-csrf-token` header must equal the CSRF cookie of the realm that names the
+ticket cookie. A browser keeps one pair per realm it signed in to, so the check
+uses the pair of the cookie that authenticated, not the first one sent. See
+`bondy_oidc_handler`, which issues the pair.
+""".
+-spec validate_csrf(TicketCookieName :: binary(), Req :: cowboy_req:req()) ->
+    ok | {error, forbidden}.
+
+validate_csrf(TicketCookieName, Req) when is_binary(TicketCookieName) ->
+    CsrfName = csrf_cookie_name(ticket_cookie_realm(TicketCookieName)),
+    CsrfHeader = cowboy_req:header(<<"x-csrf-token">>, Req, undefined),
+    CsrfCookie =
+        case lists:keyfind(CsrfName, 1, safe_parse_cookies(Req)) of
+            {_, V} -> V;
+            false -> undefined
+        end,
+
+    case
+        is_binary(CsrfHeader) andalso is_binary(CsrfCookie) andalso
+            CsrfHeader =:= CsrfCookie
+    of
+        true -> ok;
+        false -> {error, forbidden}
     end.
 
 -doc """

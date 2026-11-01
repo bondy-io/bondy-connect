@@ -23,7 +23,6 @@ stored session, no auth state outlives the throw. The handler turns that
 throw into a `401` with `WWW-Authenticate`.
 """.
 
--include_lib("kernel/include/logger.hrl").
 -include_lib("bondy_router/include/bondy_security.hrl").
 
 -export([authenticate/2]).
@@ -91,23 +90,11 @@ authenticate(Req, RealmUri) ->
 %% claims carry `authid`, not `sub`; garbage peeks to nothing) goes to
 %% ticket verification, which is what actually validates it
 %% (`bondy_mcp_modern_SUITE:delegated_ticket_caps_the_projection`).
-%% `bondy_oauth_jwt:decode/1` raises `{badarg, [Token]}` below 32 bytes.
-%% jose's failure space on garbage bytes is not established from its
-%% source, so the last clause keeps and logs the class and reason.
 bearer(Token, RealmUri, SourceIP, Req) ->
     Peeked =
-        try bondy_oauth_jwt:decode(Token) of
-            Map when is_map(Map) -> Map
-        catch
-            error:{badarg, [Token]} ->
-                undefined;
-            Class:Reason ->
-                ?LOG_DEBUG(#{
-                    description => "Bearer token is not a JWT",
-                    class => Class,
-                    reason => Reason
-                }),
-                undefined
+        case bondy_oauth_jwt:decode(Token) of
+            {ok, Map} -> Map;
+            {error, invalid} -> undefined
         end,
     case Peeked of
         #{<<"sub">> := Sub} ->

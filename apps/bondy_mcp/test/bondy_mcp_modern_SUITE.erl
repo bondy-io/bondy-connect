@@ -884,9 +884,9 @@ delegated_ticket_caps_the_projection(Config) ->
         lists:sort([maps:get(<<"name">>, T) || T <- UTools])
     ).
 
-%% A Bearer value that is not a compact JWS. Short garbage fails
-%% `bondy_oauth_jwt:decode/1`'s own guard; long garbage fails inside
-%% jose. Both fall through to ticket verification and answer 401.
+%% A Bearer value that is not a compact JWS, short and long. Neither
+%% decodes as a JWT, so both fall through to ticket verification and answer
+%% 401.
 garbage_bearer_token_is_unauthorized(Config) ->
     Short = bearer_auth(<<"not-a-jwt">>),
     {S1, _} = post(

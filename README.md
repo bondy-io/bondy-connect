@@ -7,7 +7,6 @@
 ![Docker Build (develop)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy-connect/docker-debian.yaml?&branch=develop&label=docker-develop&style=for-the-badge)
 <br>![Architectures](https://img.shields.io/badge/architecture-linux%2Famd64%20%7C%20linux%2Farm64%20%7C%20macOS%2Fintel%20%7C%20macOS%2Fapple%20silicon-lightgrey?style=for-the-badge)
 
-
 # Bondy Connect
 
 ### The distributed application networking platform

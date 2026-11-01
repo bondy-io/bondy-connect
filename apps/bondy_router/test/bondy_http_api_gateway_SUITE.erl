@@ -579,7 +579,7 @@ http_status(Method, Url, Headers0, Body, N) ->
 %% the realm's own rules: the `cookie` method must be allowed, the ticket must
 %% be scoped to the realm, and a request that changes state must echo the CSRF
 %% cookie in `x-csrf-token`. The subject has no local user, so its roles come
-%% from the ticket.
+%% from the ticket, and the realm's `all` source admits it from loopback.
 oidc_scheme_authenticates_with_the_realm_cookie_test(_) ->
     Realm = ~"com.example.test.oidc_scheme",
     Other = ~"com.example.test.oidc_scheme.other",
@@ -592,6 +592,14 @@ oidc_scheme_authenticates_with_the_realm_cookie_test(_) ->
             uri => R,
             authmethods => Methods,
             security_enabled => true,
+            sources => [
+                #{
+                    usernames => ~"all",
+                    authmethod => ?COOKIE,
+                    cidr => ~"127.0.0.0/8",
+                    meta => #{}
+                }
+            ],
             groups => [#{name => Group}],
             grants => [
                 #{
