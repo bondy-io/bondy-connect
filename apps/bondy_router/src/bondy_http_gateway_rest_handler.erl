@@ -547,7 +547,7 @@ authenticate_ticket_cookie(Method, Req0, St0) ->
             {ok, _, Ctxt1} ->
                 St1 = St0#{
                     is_anonymous => false,
-                    authid => Authid,
+                    authid => bondy_auth:user_id(Ctxt1),
                     authroles => bondy_auth:roles(Ctxt1)
                 },
                 {true, Req0, St1};

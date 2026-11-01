@@ -20,6 +20,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("kernel/include/file.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
 -include("bondy.hrl").
 -include("bondy_security.hrl").
 
@@ -84,7 +85,9 @@ all() ->
         admin_api_cookie_is_subject_to_master_realm_sources,
         admin_api_cookie_without_admin_role_is_forbidden,
         admin_api_csrf_checks_the_authenticating_realms_pair,
-        named_source_matches_an_authid_in_any_case
+        named_source_matches_an_authid_in_any_case,
+        user_grant_applies_to_an_authid_in_any_case,
+        wamp_cookie_session_user_grant_applies_to_an_authid_in_any_case
     ].
 
 init_per_suite(Config) ->
@@ -825,10 +828,112 @@ named_source_matches_an_authid_in_any_case(_Config) ->
         ok = bondy_rbac_source:remove(Master, [Username], Cidr)
     end.
 
+%% A permission granted to the stored user by name applies to its cookie
+%% whatever the case of the ticket's authid. The ticket carries no role, so
+%% the grant is the only permission the caller holds.
+user_grant_applies_to_an_authid_in_any_case(_Config) ->
+    Master = ?MASTER_REALM_URI,
+    Username = ~"oidc-grant@example.com",
+    {ok, _} = bondy_rbac_user:add(
+        Master, bondy_rbac_user:new(#{username => Username})
+    ),
+    ok = bondy_rbac:grant(Master, #{
+        ~"permissions" => [~"wamp.call"],
+        ~"uri" => ~"bondy.realm.list",
+        ~"match" => ~"exact",
+        ~"roles" => [Username]
+    }),
+    Get = fun(Authid) ->
+        {ok, Ticket, _} = bondy_oidc_ticket:issue(
+            Master, Authid, ~"idp", #{}, #{authroles => []}
+        ),
+        cookie_get(Ticket, [])
+    end,
+    with_cookie_auth(fun() ->
+        ?assertEqual(
+            {200, 200}, {Get(Username), Get(~"OIDC-Grant@Example.com")}
+        )
+    end).
+
+%% The same for a WAMP session opened with the cookie over HTTP long-poll: the
+%% session's authid is the stored username, and the user's grant applies.
+wamp_cookie_session_user_grant_applies_to_an_authid_in_any_case(_Config) ->
+    Master = ?MASTER_REALM_URI,
+    Username = ~"oidc-wamp-grant@example.com",
+    {ok, _} = bondy_rbac_user:add(
+        Master, bondy_rbac_user:new(#{username => Username})
+    ),
+    ok = bondy_rbac:grant(Master, #{
+        ~"permissions" => [~"wamp.call"],
+        ~"uri" => ~"bondy.realm.list",
+        ~"match" => ~"exact",
+        ~"roles" => [Username]
+    }),
+    with_cookie_auth(fun() ->
+        ?assertEqual(
+            [{Username, result}, {Username, result}],
+            [
+                cookie_session_call(Authid, ~"bondy.realm.list")
+             || Authid <- [Username, ~"OIDC-WAMP-Grant@Example.com"]
+            ]
+        )
+    end).
+
 %% The internal callee registered by `registry_routes_read_the_named_realm/1`;
 %% the case never calls it.
 on_call(_Arg, _KWArgs, _Details) ->
     {ok, #{}, [], #{}}.
+
+%% Opens a long-poll WAMP session on the master realm with the claims of a
+%% roleless OIDC ticket for `Authid`, calls `Procedure` once, and returns the
+%% session's authid and the reply's message type.
+cookie_session_call(Authid, Procedure) ->
+    Master = ?MASTER_REALM_URI,
+    {ok, Ticket, _} = bondy_oidc_ticket:issue(
+        Master, Authid, ~"idp", #{}, #{authroles => []}
+    ),
+    {ok, Claims} = bondy_ticket:verify(Ticket),
+    TransportId = iolist_to_binary([
+        "admin-suite-",
+        integer_to_binary(erlang:unique_integer([positive]))
+    ]),
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, Master, bondy_session_id:new()
+    ),
+    try
+        ok = bondy_http_transport_session:init_protocol(
+            Pid, {http_longpoll, text, json}, {{127, 0, 0, 1}, 12345}
+        ),
+        ok = bondy_http_transport_session:set_auth_claims(Pid, Claims),
+        #welcome{details = #{authid := SessionAuthid}} = longpoll_exchange(
+            Pid,
+            #hello{
+                realm_uri = Master,
+                details = #{~"roles" => #{~"caller" => #{}}}
+            }
+        ),
+        Reply = longpoll_exchange(
+            Pid,
+            #call{request_id = 1, options = #{}, procedure_uri = Procedure}
+        ),
+        {SessionAuthid, element(1, Reply)}
+    after
+        ok = bondy_http_transport_session:close(Pid)
+    end.
+
+longpoll_exchange(Pid, Message) ->
+    ok = bondy_http_transport_session:handle_client_message(
+        Pid, bondy_wamp_encoding:encode(Message, json)
+    ),
+    case bondy_http_transport_session:poll_receive(Pid, 5000) of
+        {ok, {messages, [Reply]}} ->
+            Reply;
+        {ok, {replies, [Bin]}} ->
+            {[Reply], <<>>} = bondy_wamp_encoding:decode(
+                {http_longpoll, text, json}, Bin
+            ),
+            Reply
+    end.
 
 admin_ticket(Authid) ->
     {ok, Ticket, _} = bondy_oidc_ticket:issue(
