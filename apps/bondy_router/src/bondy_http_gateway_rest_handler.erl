@@ -449,7 +449,7 @@ is_authorized(_, Req, #{security := #{<<"type">> := <<"api_key">>}} = St) ->
             "Request is using unsupported api_key authentication scheme",
         request => Req
     }),
-    {false, Req, St};
+    deny_unenforced(<<"ApiKey">>, Req, St);
 is_authorized(Method, Req, #{security := #{<<"type">> := <<"oidc">>}} = St) ->
     authenticate_ticket_cookie(Method, Req, St);
 is_authorized(_, Req, #{security := #{<<"type">> := <<"basic">>}} = St) ->
@@ -462,7 +462,7 @@ is_authorized(_, Req, #{security := #{<<"type">> := <<"basic">>}} = St) ->
         type => <<"basic">>,
         request => Req
     }),
-    {false, Req, St};
+    deny_unenforced(<<"Basic">>, Req, St);
 is_authorized(_, Req, #{security := Security} = St0) when
     is_map(Security) andalso map_size(Security) == 0
 ->
@@ -480,7 +480,14 @@ is_authorized(_, Req, #{security := Security} = St) ->
         security => Security,
         request => Req
     }),
-    {false, Req, St}.
+    deny_unenforced(<<"Bearer">>, Req, St).
+
+%% @private
+deny_unenforced(Scheme, Req0, St) ->
+    Req1 = set_resp_headers(eval_headers(Req0, St), Req0),
+    RealmUri = maps:get(realm_uri, St),
+    Req2 = reply_auth_error(authentication_failed, Scheme, RealmUri, json, Req1),
+    {stop, Req2, St}.
 
 %% @private
 authenticate_bearer(Req0, St0) ->
