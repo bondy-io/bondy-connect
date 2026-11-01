@@ -208,7 +208,7 @@ admin_api_routes(Listener) ->
     %% `bondy_http_services' supply those.
     Tables = bondy_http_gateway_api_spec_parser:dispatch_table([Spec], []),
     case lists:keyfind(Scheme, 1, Tables) of
-        {Scheme, Rules} -> Rules;
+        {Scheme, Rules} -> mark_local_operator(Listener, Rules);
         false -> []
     end.
 
@@ -398,6 +398,23 @@ code_change(_OldVsn, State, _Extra) ->
 %% =============================================================================
 %% PRIVATE
 %% =============================================================================
+
+%% @private
+%% Keyed on the name alone: a configured inventory cannot name a listener
+%% `admin_local` (`bondy_listener_config_test:operator_cannot_define_admin_local_test`).
+mark_local_operator(#{name := admin_local}, Rules) ->
+    [
+        {Host, [mark_local_operator(Path) || Path <- Paths]}
+     || {Host, Paths} <- Rules
+    ];
+mark_local_operator(#{name := _}, Rules) ->
+    Rules.
+
+%% @private
+mark_local_operator({Path, bondy_http_gateway_rest_handler, #{} = St}) ->
+    {Path, bondy_http_gateway_rest_handler, St#{local_operator => true}};
+mark_local_operator({_, _, _} = Path) ->
+    Path.
 
 %% @private
 subscribe(State0) ->

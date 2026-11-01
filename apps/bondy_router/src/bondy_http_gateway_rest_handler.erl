@@ -76,6 +76,10 @@ The status is derived from the error's URI by
 -include("bondy_uris.hrl").
 -include("http_api.hrl").
 
+%% `<` is illegal in a username (`bondy_data_validators:rolename/1`), so no user
+%% can hold this authid.
+-define(LOCAL_OPERATOR_AUTHID, ~"<admin_local>").
+
 -type state() :: #{
     api_spec => map(),
     api_context => map(),
@@ -84,6 +88,7 @@ The status is derived from the error's URI by
     realm_uri => binary(),
     deprecated => boolean(),
     security => map(),
+    local_operator => true,
     is_anonymous => boolean(),
     authid => binary() | undefined,
     encoding => binary() | json | msgpack,
@@ -408,6 +413,9 @@ accept(Req0, St0) ->
 %% @private
 is_authorized(<<"OPTIONS">>, Req, St0) ->
     St1 = St0#{is_anonymous => true},
+    {true, Req, St1};
+is_authorized(_, Req, #{local_operator := true} = St0) ->
+    St1 = St0#{is_anonymous => false, authid => ?LOCAL_OPERATOR_AUTHID},
     {true, Req, St1};
 is_authorized(
     _, Req0, #{security := #{<<"type">> := <<"oauth2">>}} = St0
@@ -1157,7 +1165,11 @@ wamp_context(RealmUri, Peer, St1) ->
             }
         }
     },
-    Session = bondy_session:new(RealmUri, SessionProps),
+    Session =
+        case maps:get(local_operator, St1, false) of
+            true -> bondy_session:new_local_operator(RealmUri, SessionProps);
+            false -> bondy_session:new(RealmUri, SessionProps)
+        end,
 
     Subprotocol = {http, text, maps:get(encoding, St1)},
     bondy_context:new(Peer, Subprotocol, #{session => Session}).

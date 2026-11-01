@@ -23,7 +23,8 @@ all() ->
         admin_grant_is_scoped,
         migration_removes_legacy_anon_and_is_idempotent,
         hardening_warnings_name_no_review_ids,
-        legacy_password_warning_names_change_password
+        legacy_password_warning_names_change_password,
+        hardening_tolerates_a_deleted_admin_user
     ].
 
 init_per_suite(Config) ->
@@ -162,6 +163,24 @@ legacy_password_warning_names_change_password(_Config) ->
             string:find(D, "security.admin_user.password") =/= nomatch
         ]
     ).
+
+%% An operator may delete the master `admin` user; the boot migration must
+%% still succeed.
+hardening_tolerates_a_deleted_admin_user(_Config) ->
+    Uri = ?MASTER_REALM_URI,
+    ok = bondy_rbac_user:remove(Uri, ~"admin"),
+    try
+        ?assertEqual(ok, bondy_realm:harden_master_realm())
+    after
+        {ok, _} = bondy_rbac_user:add(
+            Uri,
+            bondy_rbac_user:new(#{
+                username => ~"admin",
+                password => ~"aDminPassw0rd",
+                groups => [~"bondy.administrators"]
+            })
+        )
+    end.
 
 hardening_warnings(Acc) ->
     receive

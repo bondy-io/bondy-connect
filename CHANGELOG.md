@@ -14,6 +14,7 @@
 * Partisan 6.3.2. A node that crashed and returned on a new address, such as a Kubernetes StatefulSet pod recreated with a new IP, left its previous address in the cluster membership, and every node kept retrying it. The previous address is now pruned, and the returning node is not reported down when it is. See the [Partisan changelog](https://github.com/lasp-lang/partisan/blob/v6.3.2/CHANGELOG.md).
 * The master-realm hardening warnings and the default admin password warning no longer contain internal review identifiers ("(D-1)", "(D-2)"). A log alert that matched them needs updating.
 * The warning that the master realm `admin` user still has the legacy password `bondy-admin` said to rotate it with `security.admin_user.password`. That key only sets the password when the master realm is created, so it has no effect on an existing install. The warning now says to call `bondy.user.change_password`.
+* The Admin API on the internal `admin_local` Unix socket ran every request as `anonymous`, which a hardened master realm refuses, so it answered 403 to everything. Requests on that socket now act as the local operator (authid `<admin_local>`) and are not subject to RBAC: only the node's Unix user and root can open the socket (mode 0600). It stays usable after every master-realm administrator is deleted or loses their grants. No other listener, including an operator-defined Unix socket listener, gets this mode.
 
 ## 1.0.0
 

@@ -60,7 +60,9 @@ all() ->
         realm_scope_http_budget_is_enforced,
         oauth2_draws_from_the_auth_class,
         the_ready_probe_follows_a_blocking_alarm,
-        registry_routes_read_the_named_realm
+        registry_routes_read_the_named_realm,
+        admin_local_is_not_locked_out_by_rbac,
+        only_admin_local_routes_run_as_the_local_operator
     ].
 
 init_per_suite(Config) ->
@@ -410,6 +412,84 @@ registry_routes_read_the_named_realm(_Config) ->
     after
         ok = bondy_rbac:revoke(?MASTER_REALM_URI, Grant)
     end.
+
+%% With every grant of `bondy.administrators` revoked, and none for
+%% `anonymous`, no RBAC identity can administer the master realm. The socket
+%% must still serve the Admin API, and the TCP listener must not.
+admin_local_is_not_locked_out_by_rbac(_Config) ->
+    Uri = ?MASTER_REALM_URI,
+    Group = ~"bondy.administrators",
+    Requests = [
+        bondy_rbac:request(#{
+            roles => [Group],
+            permissions => Permissions,
+            uri => ResourceUri,
+            match => Match
+        })
+     || {{ResourceUri, Match}, Permissions} <- bondy_rbac:group_grants(
+            Uri, Group
+        )
+    ],
+    ?assertNotEqual([], Requests),
+    [ok = bondy_rbac:revoke(Uri, R) || R <- Requests],
+    try
+        ?assertEqual([], bondy_rbac:group_grants(Uri, Group)),
+        ?assertEqual(200, uds_get(admin_local_path(), ?ADMIN_API_PATH)),
+        ?assertMatch({ok, 403, _, _}, get_path(?ADMIN, ?ADMIN_API_PATH))
+    after
+        [ok = bondy_rbac:grant(Uri, R) || R <- Requests]
+    end.
+
+%% The route state that exempts a request from RBAC is set from the
+%% listener's name alone. Every other listener, including an operator's own
+%% Unix domain listener carrying `admin_api`, gets Admin API routes without
+%% it, and stored specifications never carry it.
+only_admin_local_routes_run_as_the_local_operator(_Config) ->
+    Listeners = bondy_listener_manager:listeners(),
+    {ok, AdminLocal} = bondy_listener_manager:listener(admin_local),
+    OperatorUds = AdminLocal#{name => operator_uds},
+    Others = [L || #{name := N} = L <- Listeners, N =/= admin_local],
+    ?assertNotEqual([], Others),
+
+    LocalStates = rest_states(bondy_http_gateway:admin_api_routes(AdminLocal)),
+    ?assertNotEqual([], LocalStates),
+    ?assertEqual(
+        [], [St || St <- LocalStates, maps:get(local_operator, St, false) =/= true]
+    ),
+    ?assertNotEqual(
+        [], rest_states(bondy_http_gateway:routes(AdminLocal))
+    ),
+    [
+        ?assertEqual(
+            [],
+            [
+                St
+             || St <- rest_states(bondy_http_gateway:admin_api_routes(L)),
+                maps:is_key(local_operator, St)
+            ],
+            maps:get(name, L)
+        )
+     || L <- [OperatorUds | Others]
+    ],
+    [
+        ?assertEqual(
+            [],
+            [
+                St
+             || St <- rest_states(bondy_http_gateway:routes(L)),
+                maps:is_key(local_operator, St)
+            ],
+            maps:get(name, L)
+        )
+     || L <- [AdminLocal | Listeners]
+    ].
+
+rest_states(Rules) ->
+    [
+        St
+     || {_Host, Paths} <- Rules,
+        {_Path, bondy_http_gateway_rest_handler, St} <- Paths
+    ].
 
 %% The internal callee registered by `registry_routes_read_the_named_realm/1`;
 %% the case never calls it.
