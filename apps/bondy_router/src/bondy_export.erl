@@ -55,6 +55,30 @@ mis-written):
   because it is banded by the realm URI, independent of the realm record.
 - **`security_status`** — dead; the live flag is the realm's `security_enabled`.
 
+## Import report
+
+`status/1`, given the file being imported or the last one imported, adds an
+`import` report: the `outcome` (`in_progress`, `finished` or `failed`),
+`read_count`, `written_count`, the `written` count per table, the `skipped`
+count per reason, and `bad_bytes`. The worker reports after every write, so
+the report of a failed import shows what it wrote before failing
+(`bondy_export_SUITE:crashed_import_is_reported/1`). An import is not atomic:
+those writes stay. The report lives in this server's state, so a restart
+loses it, and a new import or export replaces it.
+
+`disk_log` skips bytes it cannot read, such as a record cut short at the end
+of the file, and the import counts them in `bad_bytes` and carries on
+(`bondy_export_SUITE:truncated_last_record_imports_the_rest/1`).
+
+## Dry run
+
+An import with `dry_run => true` reads the whole file through the same loop
+as an import and writes nothing; `written` counts what the import would write
+(`bondy_export_SUITE:dry_run_reports_without_writing/1`). A dry run converts
+each record as the import does, so a record the import cannot convert is
+skipped in both. A refresh token the token store refuses when written counts as
+written in a dry run and as skipped in an import.
+
 The administrative WAMP procedures are `bondy.export.create`,
 `bondy.export.status` and `bondy.export.import`; the former `bondy.backup.*`
 procedures are kept as deprecated aliases.
@@ -108,6 +132,14 @@ procedures are kept as deprecated aliases.
             (_) ->
                 false
         end
+    },
+    <<"dry_run">> => #{
+        alias => dry_run,
+        key => dry_run,
+        required => true,
+        allow_null => false,
+        default => false,
+        datatype => boolean
     }
 }).
 
@@ -133,10 +165,20 @@ procedures are kept as deprecated aliases.
     status :: status(),
     timestamp :: non_neg_integer(),
     pid :: pid() | undefined,
-    filename :: file:filename() | undefined
+    filename :: file:filename() | undefined,
+    report :: import_report() | undefined
 }).
 
 -type status() :: export_in_progress | import_in_progress | undefined.
+-type import_report() :: #{
+    outcome := in_progress | finished | failed,
+    dry_run := boolean(),
+    read_count := non_neg_integer(),
+    written_count := non_neg_integer(),
+    written := #{atom() => pos_integer()},
+    skipped := #{term() => pos_integer()},
+    bad_bytes := non_neg_integer()
+}.
 -type info() :: #{
     filename => file:filename(),
     timestamp => non_neg_integer()
@@ -187,8 +229,14 @@ export(Path) ->
 status() ->
     status(#{}).
 
+-doc """
+Without a filename, returns the current operation (`export_in_progress`,
+`import_in_progress` or `undefined`). With a filename, returns the file's
+header and, for the file being imported or the last one imported, the import
+report described in the module doc.
+""".
 -spec status(file:filename_all() | map()) ->
-    undefined | {status(), non_neg_integer()} | {error, unknown}.
+    {ok, status() | map()} | {error, term()}.
 
 status(Map0) when is_map(Map0) ->
     try maps_utils:validate(Map0, ?STATUS_SPEC) of
@@ -202,7 +250,8 @@ status(Filename) ->
     status(#{filename => Filename}).
 
 -doc """
-Imports an export file (or a legacy `bondy_backup` file).
+Imports an export file (or a legacy `bondy_backup` file) in the background.
+With `dry_run => true` it reports what it would write and writes nothing.
 """.
 -spec import(file:filename_all() | map()) -> {ok, info()} | {error, term()}.
 
@@ -222,6 +271,7 @@ import(Filename) ->
 %% =============================================================================
 
 init([]) ->
+    process_flag(trap_exit, true),
     {ok, #state{}}.
 
 handle_call({export, Map}, _From, #state{status = undefined} = State0) ->
@@ -252,10 +302,11 @@ handle_call(
     Reply =
         case State#state.status of
             undefined ->
-                read_head(Filename);
+                with_report(read_head(Filename), State#state.report);
             Status ->
                 Secs = erlang:system_time(second) - State#state.timestamp,
-                {ok, #{status => Status, elapsed_time_secs => Secs}}
+                Info = #{status => Status, elapsed_time_secs => Secs},
+                with_report({ok, Info}, State#state.report)
         end,
     {reply, Reply, State};
 handle_call({status, #{filename := Filename}}, _From, State) ->
@@ -274,27 +325,44 @@ handle_info({export_reply, {error, Reason}, Pid}, #state{pid = Pid} = State) ->
     Secs = erlang:system_time(second) - State#state.timestamp,
     ok = notify_export_error([Reason, State#state.filename, Secs]),
     {noreply, State#state{status = undefined, pid = undefined}};
-handle_info({import_reply, {ok, Counters}, Pid}, #state{pid = Pid} = State) ->
-    #{read_count := N, written_count := M} = Counters,
+handle_info({import_progress, Pid, Report}, #state{pid = Pid} = State) ->
+    {noreply, State#state{report = Report#{outcome => in_progress}}};
+handle_info({import_reply, {ok, Report}, Pid}, #state{pid = Pid} = State) ->
     Secs = erlang:system_time(second) - State#state.timestamp,
     _ =
-        case maps:get(skipped, Counters, #{}) of
-            Skipped when map_size(Skipped) > 0 ->
+        case Report of
+            #{skipped := Skipped} when map_size(Skipped) > 0 ->
                 ?LOG_NOTICE(#{
                     description =>
                         "Import skipped some legacy records by reason",
                     filename => State#state.filename,
                     skipped => Skipped
                 });
-            _ ->
+            #{skipped := _} ->
                 ok
         end,
-    ok = notify_import_finished([State#state.filename, Secs, N, M]),
-    {noreply, State#state{status = undefined, pid = undefined}};
+    ok = notify_import_finished([State#state.filename, Secs, Report]),
+    {noreply, State#state{
+        status = undefined,
+        pid = undefined,
+        report = Report#{outcome => finished}
+    }};
 handle_info({import_reply, {error, Reason}, Pid}, #state{pid = Pid} = State) ->
     Secs = erlang:system_time(second) - State#state.timestamp,
     ok = notify_import_error([State#state.filename, Reason, Secs]),
-    {noreply, State#state{status = undefined, pid = undefined}};
+    {noreply, import_failed(State)};
+handle_info({'EXIT', Pid, Reason}, #state{pid = Pid} = State) ->
+    Secs = erlang:system_time(second) - State#state.timestamp,
+    case State#state.status of
+        import_in_progress ->
+            ok = notify_import_error([State#state.filename, Reason, Secs]),
+            {noreply, import_failed(State)};
+        export_in_progress ->
+            ok = notify_export_error([Reason, State#state.filename, Secs]),
+            {noreply, State#state{status = undefined, pid = undefined}}
+    end;
+handle_info({'EXIT', _Pid, normal}, State) ->
+    {noreply, State};
 handle_info(Info, State) ->
     ?LOG_DEBUG(#{
         description => "Unexpected event received",
@@ -307,6 +375,25 @@ terminate(_Reason, _State) ->
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+%% @private
+import_failed(#state{report = Report} = State) ->
+    State#state{
+        status = undefined, pid = undefined, report = Report#{outcome => failed}
+    }.
+
+%% @private
+with_report({ok, Info}, undefined) ->
+    {ok, Info};
+with_report({ok, Info}, #{skipped := Skipped} = Report) ->
+    Reasons =
+        #{
+            iolist_to_binary(io_lib:format("~0tp", [Reason])) => N
+         || Reason := N <- Skipped
+        },
+    {ok, Info#{import => Report#{skipped => Reasons}}};
+with_report({error, _} = Error, _) ->
+    Error.
 
 %% =============================================================================
 %% PRIVATE: EXPORT
@@ -330,14 +417,15 @@ async_export(#{path := Path}, State0) ->
         filename = File,
         pid = Pid,
         timestamp = Ts,
-        status = export_in_progress
+        status = export_in_progress,
+        report = undefined
     },
     {ok, State1}.
 
 %% @private
 do_export(File, Ts) ->
     Opts = [
-        {name, log},
+        {name, {?MODULE, make_ref()}},
         {file, File},
         {type, halt},
         {size, infinity},
@@ -457,11 +545,11 @@ maybe_throw({error, Reason}) -> throw(Reason).
 %% =============================================================================
 
 %% @private
-async_import(#{filename := Filename}, State0) ->
+async_import(#{filename := Filename, dry_run := DryRun}, State0) ->
     Ts = erlang:system_time(second),
     Me = self(),
     Pid = spawn_link(fun() ->
-        case do_import(Filename) of
+        case do_import(Filename, new_counters(Me, DryRun)) of
             {ok, _Counters} = OK ->
                 Me ! {import_reply, OK, self()};
             {error, _} = Error ->
@@ -472,36 +560,34 @@ async_import(#{filename := Filename}, State0) ->
         filename = Filename,
         pid = Pid,
         timestamp = Ts,
-        status = import_in_progress
+        status = import_in_progress,
+        report = (report(new_counters(Me, DryRun)))#{outcome => in_progress}
     },
     {ok, State1}.
 
 %% @private
-do_import(Filename) ->
+do_import(Filename, #{dry_run := DryRun} = Counters) ->
     Opts = [
-        {name, log},
+        {name, {?MODULE, make_ref()}},
         {mode, read_only},
         {file, Filename}
     ],
     case disk_log:open(Opts) of
         {ok, Log} ->
-            ok = notify_import_started([Filename, 0, 0]),
-            do_import_aux(Log);
+            ok = notify_import_started([Filename, 0, 0, DryRun]),
+            do_import_aux(Log, Counters);
         {repaired, Log, {recovered, Rec}, {badbytes, Bad}} ->
-            ok = notify_import_started([Filename, Rec, Bad]),
-            do_import_aux(Log);
+            ok = notify_import_started([Filename, Rec, Bad, DryRun]),
+            do_import_aux(Log, Counters);
         {error, _} = Error ->
             Error
     end.
 
 %% @private
-do_import_aux(Log) ->
+do_import_aux(Log, Counters) ->
     try
-        Counters0 = #{
-            read_count => 0, written_count => 0, writes => [], writes_n => 0
-        },
         import_chunk(
-            {head, disk_log:chunk(Log, start)}, undefined, Log, Counters0
+            {head, disk_log:chunk(Log, start)}, undefined, Log, Counters
         )
     catch
         throw:{invalid_header, _} = Reason ->
@@ -515,7 +601,7 @@ import_chunk(eof, Mode, Log, Counters0) ->
     Counters1 = flush_writes(Counters0),
     Counters = maybe_flush_tokens(Mode, Counters1),
     ok = disk_log:close(Log),
-    {ok, Counters};
+    {ok, report(Counters)};
 import_chunk({error, _} = Error, _, Log, _) ->
     _ = disk_log:close(Log),
     Error;
@@ -525,16 +611,61 @@ import_chunk({head, eof}, undefined, Log, _) ->
     _ = disk_log:close(Log),
     {error, empty_file};
 import_chunk({head, {Cont, [H | T]}}, undefined, Log, Counters) ->
-    Mode = import_mode(H),
-    import_chunk({Cont, T}, Mode, Log, Counters);
+    import_chunk({Cont, T}, import_mode(H), Log, Counters);
+import_chunk({head, {Cont, [H | T], BadBytes}}, undefined, Log, Counters) ->
+    import_chunk({Cont, T, BadBytes}, import_mode(H), Log, Counters);
+import_chunk({Cont, Terms, BadBytes}, Mode, Log, Counters) ->
+    #{read_count := Read, bad_bytes := Bad} = Counters,
+    ?LOG_WARNING(#{
+        description => "Import skipped unreadable bytes in the file",
+        bad_bytes => BadBytes,
+        read_count => Read
+    }),
+    import_chunk({Cont, Terms}, Mode, Log, Counters#{
+        bad_bytes => Bad + BadBytes
+    });
 import_chunk({Cont, Terms}, Mode, Log, Counters0) ->
-    try
-        {ok, Counters} = import_terms(Terms, Mode, Counters0),
-        import_chunk(disk_log:chunk(Log, Cont), Mode, Log, Counters)
-    catch
-        _:Reason ->
-            {error, Reason}
-    end.
+    {ok, Counters} = import_terms(Terms, Mode, Counters0),
+    import_chunk(disk_log:chunk(Log, Cont), Mode, Log, Counters).
+
+%% @private
+new_counters(Server, DryRun) ->
+    #{
+        server => Server,
+        dry_run => DryRun,
+        read_count => 0,
+        written_count => 0,
+        written => #{},
+        skipped => #{},
+        bad_bytes => 0,
+        writes => [],
+        writes_n => 0
+    }.
+
+%% @private
+report(C) ->
+    maps:with(
+        [dry_run, read_count, written_count, written, skipped, bad_bytes], C
+    ).
+
+%% @private
+written(Entity, N, #{server := Server} = C0) ->
+    #{written_count := Total, written := Written} = C0,
+    C = C0#{
+        written_count => Total + N,
+        written => maps:update_with(Entity, fun(M) -> M + N end, N, Written)
+    },
+    Server ! {import_progress, self(), report(C)},
+    C.
+
+%% @private
+%% Every write the import makes goes through here, so a dry run takes the
+%% import's path up to the write (`dry_run_reports_without_writing/1` fails
+%% when a write bypasses it).
+commit(#{dry_run := true}, _Write) ->
+    ok;
+commit(#{dry_run := false}, Write) ->
+    Write().
 
 %% @private
 %% Determines the import mode from the file header: the current bondy_db export
@@ -558,18 +689,17 @@ import_terms([Term | T], {legacy, _} = Mode, Counters) ->
     import_terms(T, Mode, import_legacy(Term, Counters));
 import_terms([{entry, Name, Band, Key, Value} | T], new, Counters) ->
     import_terms(T, new, apply_entry(Name, Band, Key, Value, Counters));
-import_terms([_Other | T], new, #{read_count := N} = Counters) ->
-    %% Unknown term (e.g. a stray header) — count as read, skip.
-    import_terms(T, new, Counters#{read_count => N + 1}).
+import_terms([_Other | T], new, Counters) ->
+    import_terms(T, new, skip(unknown_term, bump(read_count, Counters))).
 
 %% @private
 %% Applies one logical entry to bondy_db. Tables declared but not provisioned on
-%% this node are skipped (counted as read only).
-apply_entry(Name, Band, Key, Value, #{read_count := N} = C) ->
-    C1 = C#{read_count => N + 1},
+%% this node are skipped.
+apply_entry(Name, Band, Key, Value, C) ->
+    C1 = bump(read_count, C),
     case bondy_namespace_catalog:table(Name) of
         undefined ->
-            C1;
+            skip({table_not_provisioned, Name}, C1);
         Table ->
             import_entry(Name, Table, Band, Key, Value, C1)
     end.
@@ -586,9 +716,9 @@ apply_entry(Name, Band, Key, Value, #{read_count := N} = C) ->
 %%   the keys in the record, which are extracted here.
 %% - `bondy_realm_keys` — exported as a materialized aw-map; an aw-map cannot be
 %%   `{set}`, so re-apply each kid as a `{put, Kid, Bundle}` op.
-import_entry(?BONDY_DB_REALM_TAB, Table, Band, Key, Value, C) ->
+import_entry(?BONDY_DB_REALM_TAB = Name, Table, Band, Key, Value, C) ->
     {Identity, KeyEntries} = bondy_realm:split_for_import(Value),
-    C1 = buffer_write(Table, Band, Key, {set, Identity}, C),
+    C1 = buffer_write(Name, Table, Band, Key, {set, Identity}, C),
     put_realm_keys(Band, Key, KeyEntries, C1);
 import_entry(?BONDY_DB_REALM_KEYS_TAB, Table, Band, Key, Value, C) ->
     put_realm_keys_into(
@@ -596,7 +726,13 @@ import_entry(?BONDY_DB_REALM_KEYS_TAB, Table, Band, Key, Value, C) ->
     );
 import_entry(Name, Table, Band, Key, Value, C) ->
     import_by_fold(
-        bondy_namespace_catalog:fold_type(Name), Table, Band, Key, Value, C
+        bondy_namespace_catalog:fold_type(Name),
+        Name,
+        Table,
+        Band,
+        Key,
+        Value,
+        C
     ).
 
 %% @private
@@ -611,17 +747,17 @@ import_entry(Name, Table, Band, Key, Value, C) ->
 %% `aw` never reaches here: the only add-wins table is `bondy_realm_keys`, which
 %% has its own clause above. Anything else is counted as skipped rather than
 %% written with a guessed operation — a visible gap beats a silent one.
-import_by_fold(lww, Table, Band, Key, Value, C) ->
-    buffer_write(Table, Band, Key, {set, Value}, C);
-import_by_fold(ew, Table, Band, Key, true, C) ->
-    buffer_write(Table, Band, Key, enable, C);
-import_by_fold(ew, _Table, _Band, _Key, false, C) ->
+import_by_fold(lww, Name, Table, Band, Key, Value, C) ->
+    buffer_write(Name, Table, Band, Key, {set, Value}, C);
+import_by_fold(ew, Name, Table, Band, Key, true, C) ->
+    buffer_write(Name, Table, Band, Key, enable, C);
+import_by_fold(ew, _Name, _Table, _Band, _Key, false, C) ->
     %% A retracted fact. `disable` is an observed-remove: replayed without the
     %% causal context it was issued under it removes nothing, so importing one
     %% cannot faithfully reproduce the retraction. The absence of an enabled
     %% fact is the same observable, so the entry is skipped rather than written.
     skip(retracted_fact, C);
-import_by_fold(Fold, _Table, _Band, _Key, _Value, C) ->
+import_by_fold(Fold, _Name, _Table, _Band, _Key, _Value, C) ->
     skip({unsupported_fold, Fold}, C).
 
 %% @private
@@ -637,7 +773,14 @@ put_realm_keys(Band, Key, Entries, C) ->
 put_realm_keys_into(Table, Band, Key, Entries, C) ->
     lists:foldl(
         fun({Kid, Bundle}, Acc) ->
-            buffer_write(Table, Band, Key, {put, Kid, Bundle}, Acc)
+            buffer_write(
+                ?BONDY_DB_REALM_KEYS_TAB,
+                Table,
+                Band,
+                Key,
+                {put, Kid, Bundle},
+                Acc
+            )
         end,
         C,
         Entries
@@ -744,9 +887,10 @@ flush_tokens(#{tokens := Tokens} = C0) ->
     C = maps:remove(tokens, C0),
     maps:fold(
         fun(_MapKey, {_IssuedAt, Spec}, Acc) ->
-            case bondy_oauth_token:import_legacy(Spec) of
+            Import = fun() -> bondy_oauth_token:import_legacy(Spec) end,
+            case commit(Acc, Import) of
                 ok ->
-                    bump(written_count, Acc);
+                    written(?BONDY_DB_OAUTH_TOKEN_TAB, 1, Acc);
                 {error, Reason} ->
                     skip({token_import, Reason}, Acc)
             end
@@ -767,8 +911,10 @@ apply_legacy(?BONDY_DB_USER_TAB, Band, Key, Value, C) ->
     %% the same reason `bondy_oauth_token:import_legacy/1` owns the token case.
     %% The write is immediate rather than buffered, which a one-off restore can
     %% afford.
-    case bondy_rbac_user:import_legacy(Band, Key, Value) of
-        ok -> bump(written_count, C);
+    Cell = bondy_rbac_user:legacy_cell(Key, Value),
+    Import = fun() -> bondy_rbac_user:put_legacy_cell(Band, Key, Cell) end,
+    case commit(C, Import) of
+        ok -> written(?BONDY_DB_USER_TAB, 1, C);
         {error, Reason} -> skip({user_import, Reason}, C)
     end;
 apply_legacy(Table, Band, Key, Value, C) ->
@@ -780,7 +926,7 @@ apply_legacy_write(Table, Band, Key, Value, C) ->
         undefined ->
             skip({table_not_provisioned, Table}, C);
         Handle ->
-            buffer_write(Handle, Band, Key, {set, Value}, C)
+            buffer_write(Table, Handle, Band, Key, {set, Value}, C)
     end.
 
 %% @private
@@ -790,13 +936,15 @@ apply_legacy_write(Table, Band, Key, Value, C) ->
 %% rather than one fsync per entry, which is the difference between an import
 %% taking minutes and seconds. tier_2 (ew/mv/aw) cells stamp a per-cell causal
 %% context that `bondy_db:apply_many/1` refuses, so they are applied one by one.
-buffer_write(Handle, Band, Key, Event, C) ->
+buffer_write(Name, Handle, Band, Key, Event, C) ->
     case maps:get(causal_tier, Handle, tier_0) of
         tier_2 ->
-            ok = bondy_db:apply(Handle, Band, Key, Event),
-            bump(written_count, C);
+            ok = commit(C, fun() -> bondy_db:apply(Handle, Band, Key, Event) end),
+            written(Name, 1, C);
         _ ->
-            Buf = [{Handle, Band, Key, Event} | maps:get(writes, C, [])],
+            Buf = [
+                {Name, {Handle, Band, Key, Event}} | maps:get(writes, C, [])
+            ],
             N = maps:get(writes_n, C, 0) + 1,
             C1 = C#{writes => Buf, writes_n => N},
             case N >= ?IMPORT_BATCH of
@@ -807,15 +955,18 @@ buffer_write(Handle, Band, Key, Event, C) ->
 
 %% @private
 %% Apply the buffered tier_0 writes as one `bondy_db:apply_many/1` (grouped into
-%% one
-%% atomic WAL frame per shard) and credit them to `written_count`.
-flush_writes(#{writes := Buf, writes_n := N} = C) when Buf =/= [] ->
-    ok = bondy_db:apply_many(lists:reverse(Buf)),
-    C#{
-        writes => [],
-        writes_n => 0,
-        written_count => maps:get(written_count, C, 0) + N
-    };
+%% one atomic WAL frame per shard) and credit them to their tables.
+flush_writes(#{writes := Buf} = C) when Buf =/= [] ->
+    Writes = lists:reverse([W || {_Name, W} <- Buf]),
+    ok = commit(C, fun() -> bondy_db:apply_many(Writes) end),
+    PerTable = lists:foldl(
+        fun({Name, _}, Acc) ->
+            maps:update_with(Name, fun(N) -> N + 1 end, 1, Acc)
+        end,
+        #{},
+        Buf
+    ),
+    maps:fold(fun written/3, C#{writes => [], writes_n => 0}, PerTable);
 flush_writes(C) ->
     C.
 
@@ -852,7 +1003,7 @@ intentionally-unmigrated domain (see the moduledoc). The reshape per domain:
 - per-realm security tables band by the realm URI (the legacy `SubPrefix`);
 - grants / sources re-key through the live `encode_key/1`;
 - groups upgrade their value via the module's `from_term/1`;
-- users pass through unread — `bondy_rbac_user:import_legacy/3` owns the shape
+- users pass through unread — `bondy_rbac_user:legacy_cell/2` owns the shape
   upgrade, because it also owns telling a user record from an alias pointer;
 - `api_gateway` specs live under the global band.
 """.
@@ -866,7 +1017,7 @@ intentionally-unmigrated domain (see the moduledoc). The reshape per domain:
 
 legacy_translate(security_users, Realm, Key, Payload) when is_binary(Realm) ->
     %% Passed through unread: a `security_users` cell is a user record or an
-    %% alias pointer, and `bondy_rbac_user:import_legacy/3` is the one place
+    %% alias pointer, and `bondy_rbac_user:legacy_cell/2` is the one place
     %% that tells them apart and upgrades each. Interpreting the value here as
     %% well would put that knowledge in two places.
     {entry, ?BONDY_DB_USER_TAB, Realm, Key, Payload};
@@ -964,7 +1115,7 @@ skip(Reason, C) ->
 %% @private
 read_head(Filename) ->
     Opts = [
-        {name, log},
+        {name, {?MODULE, make_ref()}},
         {mode, read_only},
         {file, Filename}
     ],
@@ -1051,32 +1202,47 @@ notify_export_error([Reason, Filename, Time]) ->
     ).
 
 %% @private
-notify_import_started([Filename, Rec, Bad]) ->
+notify_import_started([Filename, Rec, Bad, DryRun]) ->
     ?LOG_NOTICE(#{
         description => "Import started",
         filename => Filename,
         recovered => Rec,
-        bad_bytes => Bad
+        bad_bytes => Bad,
+        dry_run => DryRun
     }),
     bondy_event_manager:notify(
-        {[bondy, export, import, start], #{filename => Filename}}
+        {[bondy, export, import, start], #{
+            filename => Filename, dry_run => DryRun
+        }}
     ).
 
 %% @private
-notify_import_finished([Filename, Time, Read, Written]) ->
+notify_import_finished([Filename, Time, Report]) ->
+    #{
+        read_count := Read,
+        written_count := Written,
+        written := PerTable,
+        bad_bytes := BadBytes,
+        dry_run := DryRun
+    } = Report,
     ?LOG_NOTICE(#{
         description => "Import finished",
         filename => Filename,
         elapsed_time_secs => Time,
         read_count => Read,
-        written_count => Written
+        written_count => Written,
+        written => PerTable,
+        bad_bytes => BadBytes,
+        dry_run => DryRun
     }),
     bondy_event_manager:notify(
         {[bondy, export, import, stop], #{
             filename => Filename,
             elapsed_time_secs => Time,
             read_count => Read,
-            written_count => Written
+            written_count => Written,
+            bad_bytes => BadBytes,
+            dry_run => DryRun
         }}
     ).
 

@@ -275,6 +275,8 @@ end#{
 -export([fetch/2]).
 -export([from_term/1]).
 -export([import_legacy/3]).
+-export([legacy_cell/2]).
+-export([put_legacy_cell/3]).
 -export([groups/1]).
 -export([has_authorized_keys/1]).
 -export([has_password/1]).
@@ -1943,37 +1945,60 @@ update_groups(RealmUri, Username, Groupnames, Fun) when is_binary(Username) ->
     update_groups(RealmUri, fetch(RealmUri, Username), Groupnames, Fun).
 
 -doc """
-Persists one cell of a legacy `security_users` backup — one written before the
-current storage layout — keyed by `Key` within `RealmUri`.
+Reads one cell of a legacy `security_users` backup, one written before the
+current storage layout, keyed by `Key`, and writes nothing.
 
 The table holds two kinds of cell, and this is the one place that decides which
 a value is, so a restore splits a record exactly as the live write path does.
+An alias-pointer cell (`#{type => alias, username => Target}`) is returned as
+`{alias, Entry}`. It names its target in the same field a user record names
+itself, so the `type` decides, never the presence of `username`. Any other
+value is a user record, upgraded to the current shape by `from_term/1` and
+returned as `{user, User}`; a value `from_term/1` cannot upgrade raises as it
+does.
+""".
+-spec legacy_cell(Key :: binary(), Value :: term()) ->
+    {alias, map()} | {user, t()} | no_return().
 
-**An alias-pointer cell** (`#{type => alias, username => Target}`) is written
-verbatim under its own key. It names its target in the same field a user record
-names itself, so the `type` decides, never the presence of `username`.
+legacy_cell(_Alias, Entry) when ?IS_ALIAS(Entry) ->
+    {alias, Entry};
+legacy_cell(Username, Value) ->
+    {user, from_term({Username, Value})}.
 
-**A user record** is upgraded to the current shape and routed through the
-declarative write path. A legacy record carries its groups inline, and `groups`
-is not a key of the user cell: they belong in the membership relation, which is
-where authorization reads them. Declarative is what a restore is — overwrite the
-record, reconcile the membership to what the backup declares, and fire no
-runtime lifecycle side-effects.
+-doc """
+Writes a cell `legacy_cell/2` returned under `Key` within `RealmUri`.
+
+An alias-pointer cell is written verbatim under its own key. A user record goes
+through the declarative write path. A legacy record carries its groups inline,
+and `groups` is not a key of the user cell: they belong in the membership
+relation, which is where authorization reads them. Declarative is what a
+restore is — overwrite the record, reconcile the membership to what the backup
+declares, and fire no runtime lifecycle side-effects.
 
 Not routed through `add/3`, which re-derives credentials and requires every
 named group to already exist. A restore must accept a record whose password
 shape it cannot re-derive and whose groups have not been read out of the backup
 yet.
 """.
--spec import_legacy(RealmUri :: uri(), Key :: binary(), Value :: term()) ->
-    ok | no_return().
+-spec put_legacy_cell(
+    RealmUri :: uri(), Key :: binary(), Cell :: {alias, map()} | {user, t()}
+) -> ok | {error, term()}.
 
-import_legacy(RealmUri, Alias, Entry) when ?IS_ALIAS(Entry) ->
+put_legacy_cell(RealmUri, Alias, {alias, Entry}) ->
     bondy_db:apply(table(), RealmUri, Alias, {set, Entry});
-import_legacy(RealmUri, Username, Value) ->
-    User = from_term({Username, Value}),
+put_legacy_cell(RealmUri, _Username, {user, User}) ->
     {ok, _} = store(RealmUri, User, #{declarative => true}),
     ok.
+
+-doc """
+Reads and writes one cell of a legacy `security_users` backup:
+`put_legacy_cell(RealmUri, Key, legacy_cell(Key, Value))`.
+""".
+-spec import_legacy(RealmUri :: uri(), Key :: binary(), Value :: term()) ->
+    ok | {error, term()}.
+
+import_legacy(RealmUri, Key, Value) ->
+    put_legacy_cell(RealmUri, Key, legacy_cell(Key, Value)).
 
 %% @private
 %% `groups` is NOT persisted in the user cell — membership is the authoritative
