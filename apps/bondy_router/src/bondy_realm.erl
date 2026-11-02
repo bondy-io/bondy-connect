@@ -1159,8 +1159,9 @@ close(RealmUri, Reason) ->
     bondy_session_manager:close_all(RealmUri, Reason).
 
 -doc """
-Removes realm `RealmUri` from THIS node: closes its sessions and deletes its
-registry entries, including the router's own session-less ones.
+Removes realm `RealmUri` from THIS node: closes its sessions, deletes its
+registry entries, including the router's own session-less ones, and stops its
+OIDC provider workers.
 
 This is the half of realm deletion that does not replicate. `delete/2` clears
 the realm's `m:bondy_db` cells and every node converges on those, but sessions
@@ -1178,9 +1179,11 @@ exists and must keep its entries.
 
 Pinned by `bondy_session_cleanup_SUITE:realm_delete_purges_registry` (the
 deleting node) and
-`bondy_aae_cluster_SUITE:remote_realm_delete_purges_peer_registry` (a peer).
+`bondy_aae_cluster_SUITE:remote_realm_delete_purges_peer_registry` (a peer);
+the provider workers by
+`bondy_realm_cluster_SUITE:oidc_provider_workers_stop_with_their_realm`.
 
-Both suites cover the delete arriving as an event. A catalogue-snapshot
+These suites cover the delete arriving as an event. A catalogue-snapshot
 bootstrap replaces a table's projection wholesale and emits no per-cell merge
 event (`bondy_aae_reactor` handles `bondy_oplog_core_bootstrap_event`
 separately), so a live node recovering that way does not learn of a realm
@@ -1198,6 +1201,7 @@ teardown(RealmUri) ->
     %% path can reach those.
     ok = bondy_registry:remove_all(registration, RealmUri, '_', undefined),
     ok = bondy_registry:remove_all(subscription, RealmUri, '_', undefined),
+    ok = bondy_oidc_provider:stop_realm_workers(RealmUri),
 
     %% Must move with the entries: the table only caches which realms already
     %% have their wildcard registered, so a realm reclaiming this URI while the

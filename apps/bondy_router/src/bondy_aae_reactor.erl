@@ -20,7 +20,7 @@ is ignored here.
 |-------------------------|---------------|-------------|
 | `security_users`        | delete        | close this node's sessions for the user (`bondy.user.deleted`) |
 | `security_users`        | credential change | close this node's sessions for the user (`bondy.user.credentials_changed`) |
-| `bondy_realm`           | delete        | close this node's sessions for the realm and drop its registry entries (`bondy_realm:teardown/1`) |
+| `bondy_realm`           | delete        | close this node's sessions for the realm, drop its registry entries and stop its OIDC provider workers (`bondy_realm:teardown/1`) |
 | `security_user_grants`  | grant/revoke  | invalidate this node's cached RBAC contexts for the realm (§9.5) + conflict alarm |
 | `security_group_grants` | grant/revoke  | invalidate this node's cached RBAC contexts for the realm (§9.5) + conflict alarm |
 | `security_group_members`| add/remove    | invalidate this node's cached RBAC contexts for the realm (§9.5) |
