@@ -1081,7 +1081,7 @@ add_alias(
     is_binary(RealmUri)
 ->
     Username = maps:get(username, User),
-    do_add_alias(RealmUri, fetch(RealmUri, Username), Alias);
+    add_alias(RealmUri, Username, Alias);
 add_alias(RealmUri, #{type := ?USER_TYPE} = User, Alias) ->
     do_add_alias(RealmUri, User, Alias);
 add_alias(RealmUri, Username, Alias) ->

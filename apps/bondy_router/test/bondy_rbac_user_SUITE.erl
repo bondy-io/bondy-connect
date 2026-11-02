@@ -38,6 +38,7 @@ all() ->
         remove_user,
         remove_refuses_a_linked_sso_user,
         update_reports_a_missing_sso_user,
+        alias_procedures_report_a_missing_sso_user,
         delete_api_reports_a_linked_sso_user_as_a_conflict,
         list_members,
         group_deletion_cleans_members,
@@ -602,6 +603,38 @@ update_reports_a_missing_sso_user(_) ->
             meta => #{fruit => ~"kiwi"}
         })
     ).
+
+%% The same missing SSO user as `update_reports_a_missing_sso_user`, through
+%% `bondy_rbac_user` and through `bondy_wamp_api:handle_call/2`.
+alias_procedures_report_a_missing_sso_user(_) ->
+    Username = ~"sso_missing_alias",
+    {ok, User} = bondy_rbac_user:add(
+        ?REALM1_URI,
+        bondy_rbac_user:new(#{
+            username => Username,
+            password => Username,
+            sso_realm_uri => ?SSO_REALM_URI
+        })
+    ),
+    Table = bondy_namespace_catalog:table(?BONDY_DB_USER_TAB),
+    ok = bondy_db:apply(Table, ?SSO_REALM_URI, Username, clear),
+    Missing = {error, {no_such_user, Username}},
+    Update = api_reply(?BONDY_USER_UPDATE, [?REALM1_URI, Username, #{}]),
+    ?assertEqual(
+        {Missing, Missing, Missing, Update, Update},
+        {
+            bondy_rbac_user:add_alias(?REALM1_URI, Username, ~"sso_a1"),
+            bondy_rbac_user:add_alias(?REALM1_URI, User, ~"sso_a1"),
+            bondy_rbac_user:remove_alias(?REALM1_URI, Username, ~"sso_a1"),
+            api_reply(
+                ?BONDY_USER_ADD_ALIAS, [?REALM1_URI, Username, ~"sso_a1"]
+            ),
+            api_reply(
+                ?BONDY_USER_REMOVE_ALIAS, [?REALM1_URI, Username, ~"sso_a1"]
+            )
+        }
+    ),
+    ?assertEqual({error, ?WAMP_NO_SUCH_PRINCIPAL}, Update).
 
 delete_api_reports_a_linked_sso_user_as_a_conflict(_) ->
     Username = <<"sso_linked_api">>,
