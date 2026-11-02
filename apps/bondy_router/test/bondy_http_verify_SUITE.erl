@@ -18,6 +18,7 @@ is decided before any request is served.
 -include_lib("stdlib/include/assert.hrl").
 
 -include("bondy_security.hrl").
+-include_lib("oidcc/include/oidcc_token.hrl").
 
 -compile([nowarn_export_all, export_all]).
 
@@ -80,8 +81,12 @@ groups() ->
             deleted_user_still_verifies_for_oidc_ticket,
             deleted_user_is_rejected_for_locally_issued_ticket,
             credential_is_subject_to_the_realms_sources,
+            oidcrp_admits_the_oidc_credential_and_cookie_carries_it,
+            cookie_admits_an_oidc_credential_with_a_deprecation_warning,
+            oidc_login_requires_the_realm_to_admit_oidcrp,
             malformed_credentials_never_500,
             deleted_realm_never_500,
+            oidc_paths_answer_a_missing_provider_or_realm,
             post_is_not_allowed
         ]},
         {sso, [], [
@@ -422,6 +427,162 @@ credential_is_subject_to_the_realms_sources(_) ->
         ok = bondy_rbac_source:remove(Realm, all, Cidr)
     end.
 
+%% `oidcrp` admits a ticket from the OIDC login flow and `ticket` any other
+%% ticket, whatever carries them; a ticket in the cookie also needs `cookie`.
+%% `oidcrp` is admitted, so no deprecation warning is logged.
+oidcrp_admits_the_oidc_credential_and_cookie_carries_it(_) ->
+    Realm = ~"com.example.verify.oidcrp",
+    Path = "/voidcrp/v1.0/oidc/verify",
+    ok = carrier_realm(
+        Realm,
+        [?OIDCRP_AUTH, ?WAMP_COOKIE_AUTH, ?WAMP_TICKET_AUTH],
+        <<"/voidcrp/v1.0">>
+    ),
+    ok = await_route(Path, 50),
+    {ok, _} = bondy_rbac_user:add(
+        Realm,
+        bondy_rbac_user:new(#{username => ~"olga", password => ~"olga-Passw0rd"})
+    ),
+    {ok, OidcTicket, _} = issue_ticket(Realm, ~"oscar"),
+    {WampTicket, _} = issue_wamp_ticket(Realm, ~"olga"),
+    Requests = [
+        cookie_header(Realm, OidcTicket),
+        [{~"x-bondy-ticket", OidcTicket}],
+        cookie_header(Realm, WampTicket),
+        [{~"x-bondy-ticket", WampTicket}]
+    ],
+    Statuses = fun() ->
+        [element(1, get_verify(Path, H)) || H <- Requests]
+    end,
+    Steps = [
+        {?OIDCRP_AUTH, [401, 200, 401, 401]},
+        {?WAMP_TICKET_AUTH, [401, 200, 401, 200]},
+        {?WAMP_COOKIE_AUTH, [200, 200, 200, 200]}
+    ],
+    {Results, Warnings} = legacy_cookie_warnings(Realm, fun() ->
+        Before = Statuses(),
+        [Before | [add_loopback_source(Realm, M, Statuses) || {M, _} <- Steps]]
+    end),
+    ?assertEqual(
+        {[[401, 401, 401, 401] | [Expected || {_, Expected} <- Steps]], 0},
+        {Results, Warnings}
+    ).
+
+%% A realm that admits `cookie` but not `oidcrp` still admits an OIDC ticket,
+%% and Bondy logs one deprecation warning for the realm however many requests
+%% use it.
+cookie_admits_an_oidc_credential_with_a_deprecation_warning(_) ->
+    Realm = ~"com.example.verify.legacy_cookie",
+    Path = "/vlegacy/v1.0/oidc/verify",
+    ok = carrier_realm(
+        Realm, [?OIDCRP_AUTH, ?WAMP_COOKIE_AUTH], <<"/vlegacy/v1.0">>
+    ),
+    ok = await_route(Path, 50),
+    {ok, OidcTicket, _} = issue_ticket(Realm, ~"lena"),
+    Statuses = fun() ->
+        [
+            element(1, get_verify(Path, H))
+         || H <- [
+                cookie_header(Realm, OidcTicket),
+                [{~"x-bondy-ticket", OidcTicket}],
+                cookie_header(Realm, OidcTicket)
+            ]
+        ]
+    end,
+    ?assertEqual(
+        {[200, 200, 200], 1},
+        legacy_cookie_warnings(Realm, fun() ->
+            add_loopback_source(Realm, ?WAMP_COOKIE_AUTH, Statuses)
+        end)
+    ).
+
+%% The OIDC login issues the ticket cookie only when the realm admits `oidcrp`
+%% for the user from the caller's address, and creates no user before then.
+%% The provider is mocked: the code exchange returns an ID token naming the
+%% user, and userinfo fails, so the ID token's claims are used.
+oidc_login_requires_the_realm_to_admit_oidcrp(_) ->
+    Realm = ~"com.example.verify.login",
+    User = ~"lucia",
+    _ = bondy_realm:create(#{
+        uri => Realm,
+        authmethods => [?OIDCRP_AUTH, ?WAMP_COOKIE_AUTH],
+        security_enabled => true,
+        info => #{
+            ~"oidc_providers" => #{
+                ?PROVIDER => #{
+                    ~"issuer" => ~"http://127.0.0.1:1",
+                    ~"client_id" => ~"client",
+                    ~"client_secret" => ~"secret",
+                    ~"redirect_uri" => ~"http://127.0.0.1:18080/cb",
+                    ~"auto_provision" => true
+                }
+            }
+        }
+    }),
+    ok = load_spec(<<Realm/binary, ".api">>, Realm, <<"/vlogin/v1.0">>),
+    ok = await_route("/vlogin/v1.0/oidc/verify", 50),
+    Callback = fun() ->
+        StateToken = bondy_router_utils:uuid(),
+        ok = bondy_oidc_state:new(
+            StateToken,
+            ~"nonce",
+            ~"verifier",
+            ?PROVIDER,
+            Realm,
+            ~"http://127.0.0.1/app",
+            ~"web",
+            ~"device"
+        ),
+        {ok, Status, _, Ref} = hackney:request(
+            get,
+            api_url(
+                "/vlogin/v1.0/oidc/" ++ binary_to_list(?PROVIDER) ++
+                    "/callback?code=c&state=" ++ binary_to_list(StateToken)
+            ),
+            [],
+            <<>>,
+            []
+        ),
+        {ok, _} = hackney:body(Ref),
+        Status
+    end,
+    Mocked = [oidcc_token, oidcc_userinfo, bondy_oidc_provider],
+    ok = meck:new(Mocked, [passthrough, no_link]),
+    try
+        ok = meck:expect(oidcc_token, retrieve, fun(_, _, _) ->
+            {ok, #oidcc_token{
+                id = #oidcc_token_id{
+                    token = ~"id-token",
+                    claims = #{~"sub" => User, ~"preferred_username" => User}
+                },
+                access = none,
+                refresh = none,
+                scope = []
+            }}
+        end),
+        ok = meck:expect(oidcc_userinfo, retrieve, fun(_, _, _) ->
+            {error, mocked}
+        end),
+        ok = meck:expect(bondy_oidc_provider, get_client_context, fun(_, _) ->
+            {ok, client_context}
+        end),
+        ok = meck:expect(bondy_oidc_provider, get_refresh_jwks_fun, fun(_, _) ->
+            {error, mocked}
+        end),
+        Refused = Callback(),
+        Provisioned = bondy_rbac_user:lookup(Realm, User),
+        {Admitted, Warnings} = legacy_cookie_warnings(Realm, fun() ->
+            add_loopback_source(Realm, ?OIDCRP_AUTH, Callback)
+        end),
+        ?assertEqual(
+            {403, {error, not_found}, 302, 0},
+            {Refused, Provisioned, Admitted, Warnings}
+        ),
+        ?assertMatch({ok, _}, bondy_rbac_user:lookup(Realm, User))
+    after
+        ok = meck:unload(Mocked)
+    end.
+
 oidc_ticket_accepted_when_user_is_externally_managed(_) ->
     %% The provider is configured without `auto_provision`, so the subject the
     %% IdP authenticated has no local record and never will. The cookie opens a
@@ -500,7 +661,8 @@ malformed_credentials_never_500(_) ->
         [{<<"authorization">>, <<"Bearer a.b.c">>}],
         [{<<"authorization">>, <<"Bearer eyJhbGciOiJub25lIn0.W10.">>}],
         [{<<"cookie">>, <<"=x">>}],
-        [{<<"x-bondy-ticket">>, <<"not-a-jwt">>}]
+        [{<<"x-bondy-ticket">>, <<"not-a-jwt">>}],
+        cookie_header(?REALM, <<"not-a-jwt">>)
     ],
     lists:foreach(
         fun(Headers) ->
@@ -510,18 +672,91 @@ malformed_credentials_never_500(_) ->
         Cases
     ).
 
+%% A route outlives its realm until the dispatch table is rebuilt, so a request
+%% can reach the verify route of a realm that was deleted. Every credential is
+%% refused with 401, never a 5xx, which a proxy cannot act on.
 deleted_realm_never_500(_) ->
-    %% Routes outlive their realm: the dispatch table is compiled ahead of
-    %% time, so a request can arrive for a realm that has since been removed.
-    %% The realm and user lookups raise in that case and must not surface as a
-    %% 5xx, which a proxy cannot act on.
-    Transient = <<"com.example.verify.transient">>,
-    ok = ensure_realm(Transient),
-    ok = ensure_user(Transient, ?USER),
-    {ok, JWT, _} = issue_ticket(Transient, ?USER),
-    ok = bondy_realm:delete(Transient, #{force => true}),
-    {Status, _, _} = get_verify(cookie_header(Transient, JWT)),
-    ?assertEqual(401, Status).
+    Realm = ~"com.example.verify.transient",
+    Path = "/vtransient/v1.0/oidc/verify",
+    ok = carrier_realm(
+        Realm,
+        [?OIDCRP_AUTH, ?WAMP_COOKIE_AUTH, ?OAUTH2_AUTH],
+        <<"/vtransient/v1.0">>
+    ),
+    ok = await_route(Path, 50),
+    {ok, _} = bondy_rbac_user:add(
+        Realm,
+        bondy_rbac_user:new(#{username => ~"tess", password => ~"tess-Passw0rd"})
+    ),
+    {ok, OidcTicket, _} = issue_ticket(Realm, ~"tom"),
+    {ok, Ctxt} = bondy_auth:init(
+        bondy_session_id:new(), Realm, ~"tess", all, {127, 0, 0, 1}
+    ),
+    {ok, Token} = bondy_oauth_token:issue(password, Ctxt, #{}),
+    {ok, {AccessToken, _}} = bondy_oauth_token:to_access_token(Token),
+    ok = bondy_realm:delete(Realm, #{force => true}),
+    Statuses = [
+        element(1, get_verify(Path, H))
+     || H <- [
+            cookie_header(Realm, OidcTicket),
+            [{~"x-bondy-ticket", OidcTicket}],
+            [{~"authorization", <<"Bearer ", AccessToken/binary>>}]
+        ]
+    ],
+    ?assertEqual([401, 401, 401], Statuses).
+
+oidc_paths_answer_a_missing_provider_or_realm(_) ->
+    Realm = ~"com.example.verify.gone",
+    Base = "/vgone/v1.0",
+    ok = carrier_realm(Realm, [?OIDCRP_AUTH], list_to_binary(Base)),
+    ok = await_route(Base ++ "/oidc/verify", 50),
+    StateToken = bondy_router_utils:uuid(),
+    ok = bondy_oidc_state:new(
+        StateToken,
+        ~"nonce",
+        ~"verifier",
+        ?PROVIDER,
+        Realm,
+        ~"http://127.0.0.1/app",
+        ~"web",
+        ~"device"
+    ),
+    Get = fun(P) ->
+        {ok, Status, _, Ref} = hackney:request(get, api_url(P), [], <<>>, []),
+        {ok, Body} = hackney:body(Ref),
+        {Status, Body}
+    end,
+    NoProvider = Get(Base ++ "/oidc/login"),
+    {ok, OidcTicket, _} = issue_ticket(Realm, ~"tom"),
+    {ok, LogoutStatus, _, LogoutRef} = hackney:request(
+        get,
+        api_url(Base ++ "/oidc/logout"),
+        cookie_header(Realm, OidcTicket),
+        <<>>,
+        []
+    ),
+    {ok, _} = hackney:body(LogoutRef),
+    ?assertEqual(302, LogoutStatus),
+    ok = bondy_realm:delete(Realm, #{force => true}),
+    Paths = [
+        Base ++ "/oidc/login",
+        Base ++ "/oidc/" ++ binary_to_list(?PROVIDER) ++
+            "/callback?code=c&state=" ++ binary_to_list(StateToken)
+    ],
+    Replies = [NoProvider | [Get(P) || P <- Paths]],
+    ?assertEqual([404, 404, 404], [S || {S, _} <- Replies], Replies),
+    ?assertEqual(
+        [
+            {~"unknown_provider", ~"bondy.error.unknown_provider"},
+            {~"no_such_realm", ~"wamp.error.no_such_realm"},
+            {~"no_such_realm", ~"wamp.error.no_such_realm"}
+        ],
+        [
+            {E, U}
+         || {_, B} <- Replies,
+            #{~"error" := E, ~"uri" := U} <- [json:decode(B)]
+        ]
+    ).
 
 post_is_not_allowed(_) ->
     {ok, Status, _, _} = hackney:request(
@@ -714,6 +949,67 @@ issue_wamp_ticket(RealmUri, Authid) ->
     ),
     {ok, Ticket, Claims} = bondy_ticket:issue(Session, #{}),
     {Ticket, Claims}.
+
+%% A realm with `Methods`, no sources, the grant `issue_wamp_ticket/2` needs,
+%% and a verify route under `BasePath`.
+carrier_realm(Realm, Methods, BasePath) ->
+    _ = bondy_realm:create(#{
+        uri => Realm,
+        authmethods => Methods,
+        security_enabled => true,
+        grants => [
+            #{
+                permissions => [~"bondy.issue"],
+                uri => ~"",
+                match => ~"prefix",
+                roles => ~"all"
+            }
+        ]
+    }),
+    load_spec(<<Realm/binary, ".api">>, Realm, BasePath).
+
+%% Adds a source allowing `Method` to every user from 127.0.0.1, then returns
+%% `Statuses()`.
+add_loopback_source(Realm, Method, Statuses) ->
+    {ok, _} = bondy_rbac_source:add(Realm, #{
+        ~"usernames" => ~"all",
+        ~"authmethod" => Method,
+        ~"cidr" => ~"127.0.0.1/32",
+        ~"meta" => #{}
+    }),
+    Statuses().
+
+%% Runs `Fun` and returns its result with the number of deprecation warnings
+%% logged for `Realm` while it ran.
+legacy_cookie_warnings(Realm, Fun) ->
+    Id = verify_suite_legacy_cookie,
+    ok = logger:add_handler(Id, ?MODULE, #{
+        level => warning, config => #{pid => self(), realm => Realm}
+    }),
+    try
+        Result = Fun(),
+        {Result, count_warnings(0)}
+    after
+        ok = logger:remove_handler(Id)
+    end.
+
+count_warnings(N) ->
+    receive
+        legacy_cookie_warning -> count_warnings(N + 1)
+    after 200 ->
+        N
+    end.
+
+log(
+    #{msg := {report, #{realm_uri := Realm, description := Description}}},
+    #{config := #{pid := Pid, realm := Realm}}
+) ->
+    case string:find(Description, "through the 'cookie' method") of
+        nomatch -> ok;
+        _ -> Pid ! legacy_cookie_warning
+    end;
+log(#{}, #{config := #{pid := _}}) ->
+    ok.
 
 ensure_realm(RealmUri) ->
     Config = #{

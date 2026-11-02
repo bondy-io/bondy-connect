@@ -15,6 +15,16 @@
 %% This module spawns a peer node, drives the store from there, and
 %% SIGKILLs the peer between `set_root/2` and any debounce flush. The
 %% parent then opens the store directly and verifies both halves.
+%%
+%% It also SIGKILLs a sealing peer, in both seal modes, right before and
+%% right after the first call of each exported `bondy_mst_pack_seal' function
+%% and of `bondy_mst_pack_manifest:write/2' (wrapped with meck on the peer),
+%% and checks that the store reopens and that, after reopening, every sealed
+%% pack the manifest names has its pack and index files, and that every page of a seal the peer
+%% reported complete is readable. A function the seal path does not call
+%% through its module is reported `not_reached'. SIGKILL ends the VM but not
+%% the OS, so writes still in the page cache survive: this does not cover
+%% power loss.
 %% =============================================================================
 
 -module(bondy_mst_pack_crash_injection_test).
@@ -23,6 +33,7 @@
 
 %% Invoked by the peer via erpc:call/4.
 -export([peer_stage_root/4]).
+-export([peer_seal_killed_at/5]).
 
 -define(STAGED_TAG, staged_ack).
 
@@ -110,9 +121,181 @@ crash_loses_staged_root_wal_replay_recovers() ->
         rmrf(Dir)
     end.
 
+kill_at_each_seal_boundary_leaves_a_store_that_reopens_test_() ->
+    {timeout, 600, fun kill_at_each_seal_boundary/0}.
+
+kill_at_each_seal_boundary() ->
+    process_flag(trap_exit, true),
+    {ok, _} = application:ensure_all_started(telemetry),
+    ok = ensure_distribution(),
+    Points = [
+        {Mode, Mod, Fun, Arity, When}
+     || Mode <- [sync, async],
+        {Mod, Fun, Arity} <-
+            [{bondy_mst_pack_manifest, write, 2}] ++
+                [
+                    {bondy_mst_pack_seal, F, A}
+                 || {F, A} <- bondy_mst_pack_seal:module_info(exports),
+                    F =/= module_info
+                ],
+        When <- [before, 'after']
+    ],
+    Outcomes = [{Point, kill_at(Point)} || Point <- Points],
+    ?debugFmt("seal boundary kills: ~w", [
+        [P || {P, killed} <- Outcomes]
+    ]),
+    %% A boundary the seal path never calls proves nothing, so the manifest
+    %% write must have been reached on both sides in each mode.
+    [
+        ?assertEqual(
+            {Mode, When, killed},
+            {Mode, When,
+                proplists:get_value(
+                    {Mode, bondy_mst_pack_manifest, write, 2, When}, Outcomes
+                )}
+        )
+     || Mode <- [sync, async], When <- [before, 'after']
+    ].
+
+kill_at({Mode, Mod, Fun, Arity, When} = Point) ->
+    Dir = mk_tmp_dir(),
+    InstId = mk_inst_id(),
+    try
+        {ok, Peer, Node} = start_peer(),
+        ok = setup_peer(Node),
+        ok = erpc:cast(
+            Node,
+            ?MODULE,
+            peer_seal_killed_at,
+            [self(), Dir, InstId, Mode, {Mod, Fun, Arity, When}]
+        ),
+        Outcome =
+            receive
+                {'EXIT', Peer, _} -> killed;
+                {boundary_not_reached, Node} -> not_reached
+            after 30_000 -> error({no_outcome, Point})
+            end,
+        ok = stop_if_alive(Outcome, Peer),
+        Sealed = sealed_acks([]),
+        Store = bondy_mst_pack_store:open(sha256, #{
+            dir => Dir, instance_id => InstId
+        }),
+        {ok, M} = bondy_mst_pack_manifest:read(Dir),
+        ?assertEqual(
+            {Point, []},
+            {Point, [
+                Id
+             || Id <- bondy_mst_pack_manifest:sealed_packs(M),
+                not (filelib:is_regular(pack_file(Dir, Id, ".pack")) andalso
+                    filelib:is_regular(pack_file(Dir, Id, ".idx")))
+            ]}
+        ),
+        ?assertEqual(
+            {Point, []},
+            {Point, [
+                Hash
+             || {_PackId, Hashes} <- Sealed,
+                Hash <- Hashes,
+                not is_tuple(bondy_mst_pack_store:get(Store, Hash))
+            ]}
+        ),
+        ok = bondy_mst_pack_store:close(Store),
+        Outcome
+    after
+        rmrf(Dir)
+    end.
+
+stop_if_alive(killed, _Peer) ->
+    ok;
+stop_if_alive(not_reached, Peer) ->
+    ok = peer:stop(Peer),
+    receive
+        {'EXIT', Peer, _} -> ok
+    after 10_000 -> error(peer_did_not_stop)
+    end.
+
+sealed_acks(Acc) ->
+    receive
+        {pack_sealed, PackId, Hashes} -> sealed_acks([{PackId, Hashes} | Acc])
+    after 0 ->
+        Acc
+    end.
+
+pack_file(Dir, Id, Ext) ->
+    filename:join(
+        Dir, lists:flatten(io_lib:format("pack-~4..0B~s", [Id, Ext]))
+    ).
+
 %% =============================================================================
 %% Peer-side entry
 %% =============================================================================
+
+%% Runs on the peer: seals one pack cleanly, then wraps `Mod:Fun/Arity' so its
+%% first call kills this VM `When' it runs, and seals a second pack. Reports
+%% `boundary_not_reached' if the second seal completes without calling it.
+peer_seal_killed_at(Parent, Dir, InstId, Mode, {Mod, Fun, Arity, When}) ->
+    Store0 = bondy_mst_pack_store:open(sha256, #{
+        dir => Dir,
+        instance_id => InstId,
+        seal_mode => Mode,
+        sync_every_records => 1,
+        sync_every_ms => infinity,
+        auto_seal_records => 50,
+        auto_seal_bytes => infinity
+    }),
+    Store1 = put_and_seal(Parent, Mode, 1, Store0),
+    ok = meck:new(Mod, [passthrough, no_link]),
+    ok = meck:expect(Mod, Fun, killing(Arity, When)),
+    _ = put_and_seal(Parent, Mode, 2, Store1),
+    Parent ! {boundary_not_reached, node()},
+    ok.
+
+put_and_seal(Parent, Mode, N, Store0) ->
+    Pages = [
+        bondy_mst_page:new(0, undefined, [{{N, I}, I, undefined}])
+     || I <- lists:seq(1, 50)
+    ],
+    Store1 = lists:foldl(
+        fun(Page, Acc) ->
+            {_Hash, Acc1} = bondy_mst_pack_store:put(Acc, Page),
+            Acc1
+        end,
+        Store0,
+        Pages
+    ),
+    {PackId, Store2} = peer_seal(Mode, Store1),
+    Parent !
+        {pack_sealed, PackId, [bondy_mst_page:hash(P, sha256) || P <- Pages]},
+    Store2.
+
+killing(2, When) ->
+    fun(A, B) -> kill_around(When, [A, B]) end;
+killing(3, When) ->
+    fun(A, B, C) -> kill_around(When, [A, B, C]) end;
+killing(4, When) ->
+    fun(A, B, C, D) -> kill_around(When, [A, B, C, D]) end;
+killing(6, When) ->
+    fun(A, B, C, D, E, F) -> kill_around(When, [A, B, C, D, E, F]) end.
+
+kill_around(before, _Args) ->
+    kill_self();
+kill_around('after', Args) ->
+    _ = meck:passthrough(Args),
+    kill_self().
+
+kill_self() ->
+    _ = os:cmd("kill -9 " ++ os:getpid()),
+    timer:sleep(infinity).
+
+peer_seal(sync, Store0) ->
+    {ok, Store} = bondy_mst_pack_store:seal(Store0),
+    {lists:last(bondy_mst_pack_store:sealed_pack_ids(Store)), Store};
+peer_seal(async, Store0) ->
+    {rolled, Job, Store1} = bondy_mst_pack_store:maybe_roll_for_seal(Store0),
+    PackId = maps:get(pack_id, Job),
+    ok = bondy_mst_pack_store:run_seal_job(Job),
+    {ok, Store} = bondy_mst_pack_store:complete_seal(Store1, PackId),
+    {PackId, Store}.
 
 %% Runs on the peer node. Opens the store with the manifest debounce
 %% effectively disabled, appends synced pages, stages a new root, and

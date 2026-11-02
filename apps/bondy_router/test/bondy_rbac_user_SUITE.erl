@@ -34,16 +34,23 @@ all() ->
         update_groups,
         add_group,
         remove_group,
+        membership_procedures_reply_after_commit,
         remove_user,
         remove_refuses_a_linked_sso_user,
         update_reports_a_missing_sso_user,
+        alias_procedures_report_a_missing_sso_user,
         delete_api_reports_a_linked_sso_user_as_a_conflict,
         list_members,
         group_deletion_cleans_members,
         membership_is_relation_authoritative,
         token_version,
         declarative_config_membership,
-        recreated_user_inherits_nothing
+        recreated_user_inherits_nothing,
+        remove_alias_leaves_other_owners_alone,
+        alias_removal_survives_a_projection_timeout,
+        user_removal_leaves_names_it_does_not_hold,
+        user_procedures_answer_a_missing_user_like_update,
+        reserved_names_answer_like_add
     ].
 
 init_per_suite(Config) ->
@@ -492,6 +499,42 @@ remove_group(_) ->
         bondy_rbac_user:groups(bondy_rbac_user:fetch(?SSO_REALM_URI, ?SSOU1))
     ).
 
+%% The eight `bondy.user.*` and `bondy.group.*` membership procedures, through
+%% `bondy_wamp_api:handle_call/2`. The bondy_docs WAMP API reference documents
+%% no results for any of them, so each must answer an empty RESULT once its
+%% change is stored. The case records every reply, crash included, and the
+%% stored group lists before asserting, so one run shows all eight.
+membership_procedures_reply_after_commit(_) ->
+    R = ~"com.example.test.membership_api",
+    _ = bondy_realm:create(R),
+    ok = lists:foreach(
+        fun(G) -> ok = add_group(R, G) end, [~"m_a", ~"m_b", ~"m_c", ~"m_d"]
+    ),
+    ok = add_member(R, ~"m_user", []),
+    Steps = [
+        {?BONDY_USER_ADD_GROUP, [~"m_user", ~"m_a"], user, [~"m_a"]},
+        {?BONDY_USER_ADD_GROUPS, [~"m_user", [~"m_b", ~"m_c"]], user, [
+            ~"m_a", ~"m_b", ~"m_c"
+        ]},
+        {?BONDY_USER_REMOVE_GROUP, [~"m_user", ~"m_a"], user, [~"m_b", ~"m_c"]},
+        {?BONDY_USER_REMOVE_GROUPS, [~"m_user", [~"m_b"]], user, [~"m_c"]},
+        {?BONDY_GROUP_ADD_GROUP, [~"m_d", ~"m_a"], group, [~"m_a"]},
+        {?BONDY_GROUP_ADD_GROUPS, [~"m_d", [~"m_b", ~"m_c"]], group, [
+            ~"m_a", ~"m_b", ~"m_c"
+        ]},
+        {?BONDY_GROUP_REMOVE_GROUP, [~"m_d", ~"m_a"], group, [~"m_b", ~"m_c"]},
+        {?BONDY_GROUP_REMOVE_GROUPS, [~"m_d", [~"m_b"]], group, [~"m_c"]}
+    ],
+    Observed = [
+        {Proc, api_reply(Proc, [R | Args]), stored_groups(Kind, R, hd(Args))}
+     || {Proc, Args, Kind, _} <- Steps
+    ],
+    Expected = [
+        {Proc, {result, undefined}, Groups}
+     || {Proc, _, _, Groups} <- Steps
+    ],
+    ?assertEqual(Expected, Observed).
+
 remove_user(_) ->
     _Local = bondy_rbac_user:fetch(?REALM1_URI, ?LU1),
     _SSO1 = bondy_rbac_user:fetch(?REALM1_URI, ?SSOU1),
@@ -560,6 +603,38 @@ update_reports_a_missing_sso_user(_) ->
             meta => #{fruit => ~"kiwi"}
         })
     ).
+
+%% The same missing SSO user as `update_reports_a_missing_sso_user`, through
+%% `bondy_rbac_user` and through `bondy_wamp_api:handle_call/2`.
+alias_procedures_report_a_missing_sso_user(_) ->
+    Username = ~"sso_missing_alias",
+    {ok, User} = bondy_rbac_user:add(
+        ?REALM1_URI,
+        bondy_rbac_user:new(#{
+            username => Username,
+            password => Username,
+            sso_realm_uri => ?SSO_REALM_URI
+        })
+    ),
+    Table = bondy_namespace_catalog:table(?BONDY_DB_USER_TAB),
+    ok = bondy_db:apply(Table, ?SSO_REALM_URI, Username, clear),
+    Missing = {error, {no_such_user, Username}},
+    Update = api_reply(?BONDY_USER_UPDATE, [?REALM1_URI, Username, #{}]),
+    ?assertEqual(
+        {Missing, Missing, Missing, Update, Update},
+        {
+            bondy_rbac_user:add_alias(?REALM1_URI, Username, ~"sso_a1"),
+            bondy_rbac_user:add_alias(?REALM1_URI, User, ~"sso_a1"),
+            bondy_rbac_user:remove_alias(?REALM1_URI, Username, ~"sso_a1"),
+            api_reply(
+                ?BONDY_USER_ADD_ALIAS, [?REALM1_URI, Username, ~"sso_a1"]
+            ),
+            api_reply(
+                ?BONDY_USER_REMOVE_ALIAS, [?REALM1_URI, Username, ~"sso_a1"]
+            )
+        }
+    ),
+    ?assertEqual({error, ?WAMP_NO_SUCH_PRINCIPAL}, Update).
 
 delete_api_reports_a_linked_sso_user_as_a_conflict(_) ->
     Username = <<"sso_linked_api">>,
@@ -814,9 +889,188 @@ recreated_user_inherits_nothing(_) ->
     ?assertEqual([], bondy_rbac_source:match(Uri, User)),
     ?assertEqual({error, not_found}, bondy_rbac_user:lookup(Uri, Alias)).
 
+%% A user removing a name it does not hold, whether another user's alias or
+%% another user's username, leaves that name with its owner.
+remove_alias_leaves_other_owners_alone(_) ->
+    Uri = <<"com.example.user.alias_owner">>,
+    Remover = <<"alias_remover">>,
+    Owner = <<"alias_owner">>,
+    Other = <<"alias_other">>,
+    Alias = <<"owners_alias">>,
+    _ = bondy_realm:create(#{
+        uri => Uri,
+        security_enabled => true,
+        authmethods => [?PASSWORD_AUTH],
+        users => [
+            #{username => U, password => U}
+         || U <- [Remover, Owner, Other]
+        ]
+    }),
+    ok = bondy_rbac_user:add_alias(Uri, Owner, Alias),
+
+    Results = [
+        {Name, bondy_rbac_user:remove_alias(Uri, Remover, Name)}
+     || Name <- [Alias, Other]
+    ],
+    Owners = [
+        {Name, owner(bondy_rbac_user:lookup(Uri, Name))}
+     || Name <- [Alias, Other]
+    ],
+    ?assertEqual(
+        {[{Alias, ok}, {Other, ok}], [{Alias, Owner}, {Other, Other}]},
+        {Results, Owners}
+    ).
+
+%% This module's user writes treat `{error, timeout}` from `bondy_db:apply/4` as
+%% an appended write still being projected. An alias clear must do the same and
+%% drop the alias from the user, or deleting the user later clears the name
+%% after someone else has claimed it.
+alias_removal_survives_a_projection_timeout(_) ->
+    Uri = <<"com.example.user.alias_timeout">>,
+    Owner = <<"timeout_owner">>,
+    Claimant = <<"timeout_claimant">>,
+    Alias = <<"timeout_alias">>,
+    _ = bondy_realm:create(#{
+        uri => Uri,
+        security_enabled => true,
+        authmethods => [?PASSWORD_AUTH],
+        users => [#{username => U, password => U} || U <- [Owner, Claimant]]
+    }),
+    ok = bondy_rbac_user:add_alias(Uri, Owner, Alias),
+
+    ok = meck:new(bondy_db, [passthrough, no_link]),
+    ok = meck:expect(bondy_db, apply, fun
+        (Table, Realm, Key, clear) when Key =:= Alias ->
+            ok = meck:passthrough([Table, Realm, Key, clear]),
+            {error, timeout};
+        (Table, Realm, Key, Event) ->
+            meck:passthrough([Table, Realm, Key, Event])
+    end),
+    Removed =
+        try
+            bondy_rbac_user:remove_alias(Uri, Owner, Alias)
+        after
+            ok = meck:unload(bondy_db)
+        end,
+    OwnerAliases = maps:get(aliases, bondy_rbac_user:fetch(Uri, Owner), []),
+    Claimed = bondy_rbac_user:add_alias(Uri, Claimant, Alias),
+    ok = bondy_rbac_user:remove(Uri, Owner),
+    ?assertEqual(
+        {ok, [], ok, Claimant},
+        {Removed, OwnerAliases, Claimed,
+            owner(bondy_rbac_user:lookup(Uri, Alias))}
+    ).
+
+%% Deleting a user whose alias list names something it does not hold, another
+%% user's alias or another user's username, leaves that name with its holder.
+%% The list is written directly to stand for one that drifted from the cells.
+user_removal_leaves_names_it_does_not_hold(_) ->
+    Uri = <<"com.example.user.removal_owner">>,
+    Removed = <<"removal_removed">>,
+    Owner = <<"removal_owner">>,
+    Other = <<"removal_other">>,
+    Alias = <<"removal_alias">>,
+    _ = bondy_realm:create(#{
+        uri => Uri,
+        security_enabled => true,
+        authmethods => [?PASSWORD_AUTH],
+        users => [
+            #{username => U, password => U}
+         || U <- [Removed, Owner, Other]
+        ]
+    }),
+    ok = bondy_rbac_user:add_alias(Uri, Owner, Alias),
+    Table = bondy_namespace_catalog:table(?BONDY_DB_USER_TAB),
+    {ok, {Record, _}} = bondy_db:read(Table, Uri, Removed),
+    ok = bondy_db:apply(
+        Table, Uri, Removed, {set, Record#{aliases => [Alias, Other]}}
+    ),
+
+    ok = bondy_rbac_user:remove(Uri, Removed),
+    ?assertEqual(
+        [{Alias, Owner}, {Other, Other}],
+        [
+            {Name, owner(bondy_rbac_user:lookup(Uri, Name))}
+         || Name <- [Alias, Other]
+        ]
+    ).
+
+%% Through `bondy_wamp_api:handle_call/2`, for a username the realm does not
+%% hold. The bondy_docs WAMP API reference names `wamp.error.no_such_principal`
+%% for each of these procedures; `bondy.user.update` is the reference answer.
+user_procedures_answer_a_missing_user_like_update(_) ->
+    R = ~"com.example.test.enable_missing",
+    _ = bondy_realm:create(R),
+    Update = api_reply(?BONDY_USER_UPDATE, [R, ~"nobody", #{}]),
+    ?assertEqual({error, ?WAMP_NO_SUCH_PRINCIPAL}, Update),
+    Calls = [
+        {?BONDY_USER_ENABLE, [R, ~"nobody"]},
+        {?BONDY_USER_DISABLE, [R, ~"nobody"]},
+        {?BONDY_USER_IS_ENABLED, [R, ~"nobody"]},
+        {?BONDY_USER_ADD_ALIAS, [R, ~"nobody", ~"somealias"]},
+        {?BONDY_USER_REMOVE_ALIAS, [R, ~"nobody", ~"somealias"]}
+    ],
+    ?assertEqual(
+        [{P, Update} || {P, _} <- Calls],
+        [{P, api_reply(P, A)} || {P, A} <- Calls]
+    ),
+    ok = add_member(R, ~"somebody", []),
+    Toggled = [
+        {
+            api_reply(P, [R, ~"somebody"]),
+            api_reply(?BONDY_USER_IS_ENABLED, [R, ~"somebody"])
+        }
+     || P <- [?BONDY_USER_DISABLE, ?BONDY_USER_ENABLE]
+    ],
+    ?assertEqual(
+        [
+            {{result, undefined}, {result, [false]}},
+            {{result, undefined}, {result, [true]}}
+        ],
+        Toggled
+    ).
+
+%% A reserved name answers every write the way `bondy.user.add` answers it.
+%% Only `bondy_wamp_api:handle_call/2` runs here, so `add`'s validator raises
+%% and its URI is read from the raised error.
+reserved_names_answer_like_add(_) ->
+    R = ~"com.example.test.reserved_names",
+    _ = bondy_realm:create(R),
+    Add = #{~"username" => ~"all", ~"password" => ~"x1y2z3w4"},
+    {crashed, Raised} = api_reply(?BONDY_USER_ADD, [R, Add]),
+    #{uri := Uri} = bondy_connect_error:from_term(Raised),
+    Calls = [
+        {?BONDY_USER_ADD_ALIAS, [R, ~"anonymous", ~"somealias"]}
+        | [
+            C
+         || N <- [~"anonymous", ~"all"],
+            C <- [
+                {?BONDY_USER_UPDATE, [R, N, #{}]},
+                {?BONDY_USER_DELETE, [R, N]},
+                {?BONDY_USER_ENABLE, [R, N]},
+                {?BONDY_USER_DISABLE, [R, N]},
+                {?BONDY_GROUP_UPDATE, [R, N, #{}]},
+                {?BONDY_GROUP_DELETE, [R, N]},
+                {?BONDY_OAUTH2_CLIENT_UPDATE, [R, N, #{}]},
+                {?BONDY_OAUTH2_CLIENT_DELETE, [R, N]},
+                {?BONDY_OAUTH2_RES_OWNER_UPDATE, [R, N, #{}]},
+                {?BONDY_OAUTH2_RES_OWNER_DELETE, [R, N]}
+            ]
+        ]
+    ],
+    ?assertEqual(
+        [{P, A, {error, Uri}} || {P, A} <- Calls],
+        [{P, A, api_reply(P, A)} || {P, A} <- Calls]
+    ).
+
 %% =============================================================================
 %% Member-test helpers
 %% =============================================================================
+
+owner({ok, #{username := Username}}) ->
+    Username;
+owner({error, not_found}) ->
+    not_found.
 
 %% Adds a user the way `bondy_realm:apply_rbac_config/3` does. The user carries
 %% no credentials so the stored record is identical across applies — a password
@@ -866,3 +1120,18 @@ add_member(RealmUri, Username, Groups) ->
     }),
     {ok, _} = bondy_rbac_user:add(RealmUri, User),
     ok.
+
+api_reply(Proc, Args) ->
+    Ctxt = bondy_context:local_context(?MASTER_REALM_URI),
+    M = bondy_wamp_message:call(1, #{}, Proc, Args),
+    try bondy_wamp_api:handle_call(M, Ctxt) of
+        {reply, #result{args = A}} -> {result, A};
+        {reply, #error{error_uri = Uri}} -> {error, Uri}
+    catch
+        error:Reason -> {crashed, Reason}
+    end.
+
+stored_groups(user, RealmUri, Name) ->
+    user_groups(RealmUri, Name);
+stored_groups(group, RealmUri, Name) ->
+    lists:sort(bondy_rbac_group:groups(bondy_rbac_group:fetch(RealmUri, Name))).

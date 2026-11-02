@@ -47,7 +47,7 @@ resolve_mixed_test() ->
 
 %% A `security_users` cell is banded by the realm and keyed by the cell's own
 %% key, and its value is passed through untouched: a user record and an alias
-%% pointer share this domain, and `bondy_rbac_user:import_legacy/3` is what
+%% pointer share this domain, and `bondy_rbac_user:legacy_cell/2` is what
 %% tells them apart. Deciding here as well would split that knowledge in two.
 translate_user_test() ->
     PList = [

@@ -20,6 +20,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("kernel/include/file.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
 -include("bondy.hrl").
 -include("bondy_security.hrl").
 
@@ -56,6 +57,7 @@
 -define(ADMIN_API_PATH, "/realms").
 %% An administrator the Admin API cases authenticate as, and a realm holding a
 %% user of the same name, whose tokens the master realm must refuse.
+-define(LOOPBACK, {127, 0, 0, 1}).
 -define(OPERATOR, ~"adminsplit-operator").
 -define(OPERATOR_PASS, ~"adminsplit-Passw0rd").
 -define(FOREIGN_REALM, ~"com.example.adminsplit.foreign").
@@ -72,6 +74,8 @@ all() ->
         listener_scope_http_budget_is_enforced,
         realm_scope_http_budget_is_enforced,
         oauth2_draws_from_the_auth_class,
+        refused_requests_draw_from_the_budget,
+        throttled_requests_keep_their_route_label,
         the_ready_probe_follows_a_blocking_alarm,
         registry_routes_read_the_named_realm,
         admin_local_is_not_locked_out_by_rbac,
@@ -84,7 +88,10 @@ all() ->
         admin_api_cookie_is_subject_to_master_realm_sources,
         admin_api_cookie_without_admin_role_is_forbidden,
         admin_api_csrf_checks_the_authenticating_realms_pair,
-        named_source_matches_an_authid_in_any_case
+        named_source_matches_an_authid_in_any_case,
+        user_grant_applies_to_an_authid_in_any_case,
+        wamp_cookie_session_user_grant_applies_to_an_authid_in_any_case,
+        wamp_cookie_session_checks_a_wamp_ticket_under_ticket
     ].
 
 init_per_suite(Config) ->
@@ -214,14 +221,11 @@ admin_local_socket_is_bound_and_serves(_Config) ->
     %% a node whose every TCP listener failed to bind is still administrable.
     assert_routed(uds_get(Path, ?ADMIN_API_PATH)).
 
-%% The gateway REST handler's `rate_limited` hook draws from the `http`
-%% class per source IP. Enabling ONLY that class both trips it and PINS
-%% it — a hook drawing from any other class would never see a 429 here.
-%% Statuses are not asserted before exhaustion: the `{http, 127.0.0.1}`
-%% bucket is shared with any other suite in a run, so only "rapid
-%% requests trip 429" and "off means served" are contract. Cowboy calls
-%% `rate_limited` after `is_authorized`, so this case and the next two
-%% authenticate: a request without a token is refused before any budget.
+%% Gateway routes draw from the `http` class per source IP. Enabling ONLY
+%% that class both trips it and PINS it: a route drawing from any other class
+%% would never see a 429 here. Statuses are not asserted before exhaustion:
+%% the `{http, 127.0.0.1}` bucket is shared with any other suite in a run, so
+%% only "rapid requests trip 429" and "off means served" are contract.
 http_requests_are_rate_limited(_) ->
     {ok, Before, _, _} = get_path(?ADMIN, ?ADMIN_API_PATH, operator_token()),
     ?assertNotEqual(429, Before),
@@ -300,40 +304,74 @@ realm_scope_http_budget_is_enforced(_) ->
     {ok, After, _, _} = get_path(?ADMIN, ?ADMIN_API_PATH, operator_token()),
     ?assertNotEqual(429, After).
 
-%% The OAuth2 endpoints draw from the `auth` class — the shared per-IP
-%% credential-guessing budget WAMP AUTHENTICATE consumes — while the
-%% gateway hook does NOT: with only `auth` enabled, the OAuth2 callback
-%% throttles and the gateway callback stays open. A distinct loopback
-%% peer keys buckets no other suite touches.
+%% The OAuth2 endpoints draw from the `auth` class, the per-IP
+%% credential-guessing budget WAMP AUTHENTICATE also consumes, and gateway
+%% routes do not. With only `auth` enabled the Admin API is never throttled;
+%% with only `http` enabled `/oauth/token` is never throttled. The positive
+%% sides are in `refused_requests_draw_from_the_budget`.
 oauth2_draws_from_the_auth_class(_) ->
-    Req = #{ref => ?ADMIN, peer => {{127, 0, 0, 88}, 5000}, headers => #{}},
-    %% The handler state is built by the handler itself — its
-    %% `rate_limited` reads the realm dimension from it, so a hand-rolled
-    %% stand-in would not exercise the real seat.
-    {cowboy_rest, _, OauthSt} = bondy_oauth2_rest_handler:init(Req, #{
-        realm_uri => <<"com.leapsight.bondy">>,
-        token_path => <<"/token">>,
-        revoke_path => <<"/revoke">>
-    }),
-    ok = bondy_config:set([security, rate_limit], #{
-        enabled => true,
-        auth => #{rate => 1, capacity => 1}
-    }),
+    Gateway = burst(auth, fun() ->
+        get_path(?ADMIN, ?ADMIN_API_PATH, operator_token())
+    end),
+    Oauth2 = burst(http, fun() -> bad_client_token_request() end),
+    ?assertEqual(
+        {false, false},
+        {lists:member(429, Gateway), lists:member(429, Oauth2)},
+        {Gateway, Oauth2}
+    ).
+
+%% Requests that authentication refuses must still spend the budget, or a flood
+%% of missing or bad credentials is never throttled. A 429 among statuses that
+%% are otherwise 401 shows the throttle saw a refused request.
+refused_requests_draw_from_the_budget(_) ->
+    Observed = [
+        {Kind, burst(Class, Request)}
+     || {Kind, Class, Request} <- [
+            {no_token, http, fun() -> get_path(?ADMIN, ?ADMIN_API_PATH) end},
+            {bad_token, http, fun() ->
+                get_path(?ADMIN, ?ADMIN_API_PATH, ~"not-a-jwt")
+            end},
+            {bad_client, auth, fun() -> bad_client_token_request() end}
+        ]
+    ],
+    ?assertEqual(
+        [{no_token, true}, {bad_token, true}, {bad_client, true}],
+        [{Kind, lists:member(429, Statuses)} || {Kind, Statuses} <- Observed],
+        Observed
+    ).
+
+%% A request the rate limit refuses is reported under the same `route` metrics
+%% label as one it serves.
+throttled_requests_keep_their_route_label(_) ->
+    Self = self(),
+    Id = {?MODULE, route_label},
+    ok = telemetry:attach(
+        Id,
+        [bondy, http, request],
+        fun(_, _, #{req := #{path := Path}} = M, _) ->
+            Path =:= ~"/realms" andalso
+                (Self !
+                    {route_label, maps:get(resp_status, M),
+                        maps:get(route, maps:get(user_data, M), undefined)})
+        end,
+        undefined
+    ),
     try
-        ?assertMatch(
-            {false, _, _},
-            bondy_oauth2_rest_handler:rate_limited(Req, OauthSt)
-        ),
-        ?assertMatch(
-            {{true, _}, _, _},
-            bondy_oauth2_rest_handler:rate_limited(Req, OauthSt)
-        ),
-        ?assertMatch(
-            {false, _, _},
-            bondy_http_gateway_rest_handler:rate_limited(Req, #{})
-        )
+        Statuses = burst(http, fun() ->
+            get_path(?ADMIN, ?ADMIN_API_PATH, operator_token())
+        end),
+        Labels = [
+            receive
+                {route_label, Status, Route} -> {Status, Route}
+            after 5000 -> {Status, timeout}
+            end
+         || Status <- Statuses
+        ],
+        Routes = lists:usort([R || {_, R} <- Labels]),
+        ?assert(lists:member(429, Statuses), Labels),
+        ?assertMatch([R] when is_binary(R), Routes, Labels)
     after
-        ok = bondy_config:set([security, rate_limit], undefined)
+        ok = telemetry:detach(Id)
     end.
 
 %% =============================================================================
@@ -825,10 +863,214 @@ named_source_matches_an_authid_in_any_case(_Config) ->
         ok = bondy_rbac_source:remove(Master, [Username], Cidr)
     end.
 
+%% A permission granted to the stored user by name applies to its cookie
+%% whatever the case of the ticket's authid. The ticket carries no role, so
+%% the grant is the only permission the caller holds.
+user_grant_applies_to_an_authid_in_any_case(_Config) ->
+    Master = ?MASTER_REALM_URI,
+    Username = ~"oidc-grant@example.com",
+    {ok, _} = bondy_rbac_user:add(
+        Master, bondy_rbac_user:new(#{username => Username})
+    ),
+    ok = bondy_rbac:grant(Master, #{
+        ~"permissions" => [~"wamp.call"],
+        ~"uri" => ~"bondy.realm.list",
+        ~"match" => ~"exact",
+        ~"roles" => [Username]
+    }),
+    Get = fun(Authid) ->
+        {ok, Ticket, _} = bondy_oidc_ticket:issue(
+            Master, Authid, ~"idp", #{}, #{authroles => []}
+        ),
+        cookie_get(Ticket, [])
+    end,
+    with_cookie_auth(fun() ->
+        ?assertEqual(
+            {200, 200}, {Get(Username), Get(~"OIDC-Grant@Example.com")}
+        )
+    end).
+
+%% The same for a WAMP session opened with the cookie over HTTP long-poll: the
+%% session's authid is the stored username, and the user's grant applies.
+wamp_cookie_session_user_grant_applies_to_an_authid_in_any_case(_Config) ->
+    Master = ?MASTER_REALM_URI,
+    Username = ~"oidc-wamp-grant@example.com",
+    {ok, _} = bondy_rbac_user:add(
+        Master, bondy_rbac_user:new(#{username => Username})
+    ),
+    ok = bondy_rbac:grant(Master, #{
+        ~"permissions" => [~"wamp.call"],
+        ~"uri" => ~"bondy.realm.list",
+        ~"match" => ~"exact",
+        ~"roles" => [Username]
+    }),
+    with_cookie_auth(fun() ->
+        ?assertEqual(
+            [{Username, result}, {Username, result}],
+            [
+                cookie_session_call(Authid, ~"bondy.realm.list")
+             || Authid <- [Username, ~"OIDC-WAMP-Grant@Example.com"]
+            ]
+        )
+    end).
+
 %% The internal callee registered by `registry_routes_read_the_named_realm/1`;
 %% the case never calls it.
 on_call(_Arg, _KWArgs, _Details) ->
     {ok, #{}, [], #{}}.
+
+%% A WAMP session opened over long-poll with a ticket from `bondy.ticket.issue`
+%% in the cookie needs `cookie` and `ticket`: it is aborted until a source
+%% allows `ticket`.
+wamp_cookie_session_checks_a_wamp_ticket_under_ticket(_Config) ->
+    Realm = ~"com.example.admin_suite.wamp_ticket_cookie",
+    User = ~"walter",
+    _ = bondy_realm:create(#{
+        uri => Realm,
+        authmethods => [?WAMP_COOKIE_AUTH, ?WAMP_TICKET_AUTH, ?WAMP_CRA_AUTH],
+        security_enabled => true,
+        sources => [
+            #{
+                usernames => ~"all",
+                authmethod => ?WAMP_COOKIE_AUTH,
+                cidr => ~"127.0.0.0/8",
+                meta => #{}
+            }
+        ],
+        users => [#{username => User, password => ~"walter-secret"}],
+        grants => [
+            #{
+                permissions => [~"bondy.issue"],
+                uri => ~"",
+                match => ~"prefix",
+                roles => ~"all"
+            }
+        ]
+    }),
+    Session = bondy_session:new(Realm, #{
+        peer => {{127, 0, 0, 1}, 0},
+        authrealm => Realm,
+        authid => User,
+        authmethod => ?WAMP_CRA_AUTH,
+        security_enabled => true,
+        authroles => [],
+        roles => #{caller => #{}}
+    }),
+    true = ets:insert(
+        bondy_session:table(bondy_session:external_id(Session)), Session
+    ),
+    {ok, _, Claims} = bondy_ticket:issue(Session, #{}),
+    Before = element(1, longpoll_hello(Realm, Claims)),
+    {ok, _} = bondy_rbac_source:add(Realm, #{
+        ~"usernames" => ~"all",
+        ~"authmethod" => ?WAMP_TICKET_AUTH,
+        ~"cidr" => ~"127.0.0.0/8",
+        ~"meta" => #{}
+    }),
+    ?assertEqual(
+        {abort, welcome}, {Before, element(1, longpoll_hello(Realm, Claims))}
+    ).
+
+%% Opens a long-poll WAMP session on `Realm` with `Claims` as the cookie's
+%% ticket claims and returns the reply to its HELLO. An ABORT stops the
+%% session, which hands the reply to a waiting poller first, so the poller is
+%% started before the HELLO is sent.
+longpoll_hello(Realm, Claims) ->
+    TransportId = iolist_to_binary([
+        "admin-suite-",
+        integer_to_binary(erlang:unique_integer([positive]))
+    ]),
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, Realm, bondy_session_id:new()
+    ),
+    ok = bondy_http_transport_session:init_protocol(
+        Pid, {http_longpoll, text, json}, {{127, 0, 0, 1}, 12345}
+    ),
+    ok = bondy_http_transport_session:set_auth_claims(Pid, Claims),
+    Ref = monitor(process, Pid),
+    Self = self(),
+    _ = spawn_link(fun() ->
+        Self !
+            {hello_reply, bondy_http_transport_session:poll_receive(Pid, 5000)}
+    end),
+    timer:sleep(100),
+    ok = bondy_http_transport_session:handle_client_message(
+        Pid,
+        bondy_wamp_encoding:encode(
+            #hello{
+                realm_uri = Realm,
+                details = #{~"roles" => #{~"caller" => #{}}}
+            },
+            json
+        )
+    ),
+    Reply =
+        receive
+            {hello_reply, Polled} -> polled_message(Polled)
+        after 5000 -> ct:fail(no_hello_reply)
+        end,
+    case Reply of
+        #abort{} ->
+            receive
+                {'DOWN', Ref, process, Pid, normal} -> ok
+            after 5000 -> ct:fail(session_not_stopped)
+            end;
+        #welcome{} ->
+            true = demonitor(Ref, [flush]),
+            ok = bondy_http_transport_session:close(Pid)
+    end,
+    Reply.
+
+%% Opens a long-poll WAMP session on the master realm with the claims of a
+%% roleless OIDC ticket for `Authid`, calls `Procedure` once, and returns the
+%% session's authid and the reply's message type.
+cookie_session_call(Authid, Procedure) ->
+    Master = ?MASTER_REALM_URI,
+    {ok, Ticket, _} = bondy_oidc_ticket:issue(
+        Master, Authid, ~"idp", #{}, #{authroles => []}
+    ),
+    {ok, Claims} = bondy_ticket:verify(Ticket),
+    TransportId = iolist_to_binary([
+        "admin-suite-",
+        integer_to_binary(erlang:unique_integer([positive]))
+    ]),
+    {ok, Pid} = bondy_http_transport_session_sup:start_child(
+        TransportId, Master, bondy_session_id:new()
+    ),
+    try
+        ok = bondy_http_transport_session:init_protocol(
+            Pid, {http_longpoll, text, json}, {{127, 0, 0, 1}, 12345}
+        ),
+        ok = bondy_http_transport_session:set_auth_claims(Pid, Claims),
+        #welcome{details = #{authid := SessionAuthid}} = longpoll_exchange(
+            Pid,
+            #hello{
+                realm_uri = Master,
+                details = #{~"roles" => #{~"caller" => #{}}}
+            }
+        ),
+        Reply = longpoll_exchange(
+            Pid,
+            #call{request_id = 1, options = #{}, procedure_uri = Procedure}
+        ),
+        {SessionAuthid, element(1, Reply)}
+    after
+        ok = bondy_http_transport_session:close(Pid)
+    end.
+
+longpoll_exchange(Pid, Message) ->
+    ok = bondy_http_transport_session:handle_client_message(
+        Pid, bondy_wamp_encoding:encode(Message, json)
+    ),
+    polled_message(bondy_http_transport_session:poll_receive(Pid, 5000)).
+
+polled_message({ok, {messages, [Message]}}) ->
+    Message;
+polled_message({ok, {replies, [Bin]}}) ->
+    {[Message], <<>>} = bondy_wamp_encoding:decode(
+        {http_longpoll, text, json}, Bin
+    ),
+    Message.
 
 admin_ticket(Authid) ->
     {ok, Ticket, _} = bondy_oidc_ticket:issue(
@@ -1019,3 +1261,45 @@ uds_get(Path, Target) ->
         end,
     ok = gen_tcp:close(Sock),
     Status.
+
+%% Six rapid requests with only `Class` enabled at one token a second and a
+%% capacity of two; returns their statuses. A bucket keeps the limits it was
+%% created with (`bondy_rate_limiter:allow/3`), so the node-scope buckets of
+%% this source IP are forgotten first and every burst starts from its own.
+burst(Class, Request) ->
+    ok = lists:foreach(
+        fun(C) ->
+            ok = bondy_rate_limiter:forget({bondy_rate_limit, C, ?LOOPBACK})
+        end,
+        [http, auth]
+    ),
+    ok = bondy_config:set([security, rate_limit], #{
+        enabled => true,
+        Class => #{rate => 1, capacity => 2}
+    }),
+    try
+        [
+            begin
+                {ok, Status, _, _} = Request(),
+                Status
+            end
+         || _ <- lists:seq(1, 6)
+        ]
+    after
+        ok = bondy_config:set([security, rate_limit], undefined)
+    end.
+
+bad_client_token_request() ->
+    hackney:request(
+        post,
+        url(?ADMIN, "/oauth/token"),
+        [
+            {~"content-type", ~"application/x-www-form-urlencoded"},
+            {
+                ~"authorization",
+                <<"Basic ", (base64:encode(~"nobody:wrong"))/binary>>
+            }
+        ],
+        ~"grant_type=client_credentials",
+        []
+    ).

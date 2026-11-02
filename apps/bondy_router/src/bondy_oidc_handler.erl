@@ -69,6 +69,11 @@ do_handle_login(Req0, State, RealmUri) ->
     case bondy_oidc_provider:get_provider_config(RealmUri, Provider) of
         {ok, Config} ->
             do_login_redirect(Req0, State, RealmUri, Provider, Config);
+        {error, {no_such_realm, _} = Reason} ->
+            Req1 = reply_json_error(
+                ?HTTP_NOT_FOUND, <<"no_such_realm">>, Reason, Req0
+            ),
+            {ok, Req1, State};
         {error, not_found} ->
             Req1 = reply_json_error(
                 ?HTTP_NOT_FOUND, <<"unknown_provider">>, Req0
@@ -297,6 +302,11 @@ do_exchange_code(
                     ),
                     {ok, Req1, State}
             end;
+        {error, {no_such_realm, _} = Reason} ->
+            Req1 = reply_json_error(
+                ?HTTP_NOT_FOUND, <<"no_such_realm">>, Reason, Req0
+            ),
+            {ok, Req1, State};
         {error, not_found} ->
             Req1 = reply_json_error(
                 ?HTTP_NOT_FOUND, <<"unknown_provider">>, Req0
@@ -410,6 +420,78 @@ do_issue_ticket(
     %% authroles and RBAC context.
     ValidAuthroles = filter_valid_groups(RealmUri, Authid, Authroles),
 
+    case check_login(Req0, RealmUri, Authid, ValidAuthroles) of
+        ok ->
+            issue_ticket(
+                Req0,
+                State,
+                RealmUri,
+                Provider,
+                Config,
+                Authid,
+                ValidAuthroles,
+                IdTokenJWT,
+                AccessToken,
+                RefreshToken,
+                SpaRedirect,
+                TicketScope
+            );
+        {error, Reason} ->
+            ?LOG_INFO(#{
+                description =>
+                    "OIDC login refused by the realm's authmethods or sources",
+                realm_uri => RealmUri,
+                provider => Provider,
+                authid => Authid,
+                reason => Reason
+            }),
+            Req1 = reply_json_error(?HTTP_FORBIDDEN, <<"no_authmethod">>, Req0),
+            {ok, Req1, State}
+    end.
+
+%% @private
+%% The OIDC login authenticates the user with `oidcrp`, so the realm must admit
+%% that method for the user from the caller's address before a ticket exists.
+check_login(Req, RealmUri, Authid, Authroles) ->
+    ProxyProtocol = bondy_http_proxy_protocol:init(Req),
+    case bondy_http_proxy_protocol:source_ip(ProxyProtocol) of
+        {ok, SourceIP} ->
+            case
+                bondy_auth:init(
+                    bondy_session_id:new(),
+                    RealmUri,
+                    Authid,
+                    Authroles,
+                    SourceIP,
+                    #{claims => #{authmethod => ?OIDCRP_AUTH}}
+                )
+            of
+                {ok, Ctxt} ->
+                    bondy_auth:check_credential(
+                        direct, #{authmethod => ?OIDCRP_AUTH}, Ctxt
+                    );
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, {protocol_error, _}} ->
+            {error, proxy_protocol_error}
+    end.
+
+%% @private
+issue_ticket(
+    Req0,
+    State,
+    RealmUri,
+    Provider,
+    Config,
+    Authid,
+    ValidAuthroles,
+    IdTokenJWT,
+    AccessToken,
+    RefreshToken,
+    SpaRedirect,
+    TicketScope
+) ->
     case maps:get(auto_provision, Config, false) of
         true ->
             ok = ensure_user(RealmUri, Authid, ValidAuthroles);
@@ -954,12 +1036,16 @@ maybe_idp_logout_url(RealmUri, Claims, RedirectUri) ->
 
 %% @private
 reply_json_error(StatusCode, ErrorBin, Req) ->
-    %% `error' carries the RFC 6749 code and is retained; the standard error
-    %% payload is added alongside it.
+    reply_json_error(StatusCode, ErrorBin, ErrorBin, Req).
+
+%% @private
+reply_json_error(StatusCode, ErrorBin, Reason, Req) ->
+    %% `error' carries a short machine-readable code and is retained; the
+    %% standard error payload is added alongside it.
     Body = maps:put(
         ~"error",
         ErrorBin,
-        bondy_connect_error:to_map(bondy_connect_error:from_term(ErrorBin))
+        bondy_connect_error:to_map(bondy_connect_error:from_term(Reason))
     ),
     ReplyBody = json:encode(Body),
     cowboy_req:reply(

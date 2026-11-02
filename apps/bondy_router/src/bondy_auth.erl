@@ -28,6 +28,7 @@ system and the user's password capabilities.
 %% against; revocation rides the per-user token_version fence and the
 %% merge-reactor RBAC invalidation, not this bound.
 -define(AUTH_MAX_LAG, 60000).
+-define(LEGACY_COOKIE_TAB, bondy_auth_legacy_cookie_realms).
 
 -type context() :: #{
     realm_uri := uri(),
@@ -36,6 +37,7 @@ system and the user's password capabilities.
     source_ip := inet:ip_address(),
     user_id := binary(),
     user := optional(bondy_rbac_user:t()),
+    admitted_methods := [binary()],
     available_methods := [binary()],
     role := optional(binary()),
     roles := optional([binary()]),
@@ -66,6 +68,9 @@ system and the user's password capabilities.
 
 %% BONDY_SENSITIVE CALLBACKS
 -export([format_status/1]).
+-export([admits/2]).
+-export([check_credential/3]).
+-export([init_tables/0]).
 
 %% API
 -export([authenticate/4]).
@@ -283,6 +288,7 @@ decoy(SessionId, Realm, Authid0, Method, SourceIP) when
         roles => [],
         source_ip => SourceIP,
         host => undefined,
+        admitted_methods => [Method],
         available_methods => [Method],
         decoy => true
     }.
@@ -333,6 +339,61 @@ available_methods(List, #{available_methods := Available}) ->
     sets:to_list(
         sets:intersection(sets:from_list(List), sets:from_list(Available))
     ).
+
+-doc """
+Returns `true` when the realm admits `Method` for the context's user from its
+source IP address: the realm lists it, a source allows it, and the user meets
+its requirements. Unlike `available_methods/1`, this includes methods that are
+not offered in a WAMP HELLO, such as `oidcrp`.
+""".
+-spec admits(Method :: binary(), Ctxt :: context()) -> boolean().
+
+admits(Method, #{admitted_methods := Admitted}) when is_binary(Method) ->
+    lists:member(Method, Admitted).
+
+-doc """
+Checks that the realm admits a credential presented outside a WAMP HELLO, a
+Bondy ticket, an OAuth2 access token or the identity an OIDC login
+established, given its verified claims.
+
+The credential is checked under its own method, read from its `authmethod`
+claim: `oidcrp` for an identity from the OIDC login flow, `oauth2` for an
+access token, and `ticket` for any other ticket. `Carrier` is `cookie` for a
+credential that arrived in a cookie, which also needs `cookie`, the WAMP
+transport-level method, and `direct` for one that reached Bondy any other
+way: a request header, or the OIDC login's exchange with the provider.
+
+`cookie` also admits an OIDC credential the realm does not admit under
+`oidcrp`. That use is deprecated: Bondy logs a warning the first time it
+happens for a realm on a node.
+""".
+-spec check_credential(
+    Carrier :: cookie | direct, Claims :: map(), Ctxt :: context()
+) -> ok | {error, no_authmethod}.
+
+check_credential(Carrier, #{authmethod := Authmethod}, Ctxt) when
+    (Carrier == cookie orelse Carrier == direct) andalso is_binary(Authmethod)
+->
+    Method = credential_method(Authmethod),
+    Carried = Carrier == direct orelse admits(?WAMP_COOKIE_AUTH, Ctxt),
+
+    case Carried andalso admits_credential(Method, Ctxt) of
+        true -> ok;
+        false -> {error, no_authmethod}
+    end.
+
+-doc """
+Creates the table that records which realms have admitted an OIDC credential
+through the deprecated use of `cookie`. Called once at application start.
+""".
+-spec init_tables() -> ok.
+
+init_tables() ->
+    Opts = [set, named_table, public, {read_concurrency, true}],
+    {ok, ?LEGACY_COOKIE_TAB} = bondy_connect_table_manager:add_or_claim(
+        ?LEGACY_COOKIE_TAB, Opts
+    ),
+    ok.
 
 -spec provider(context()) -> [binary()].
 
@@ -638,19 +699,19 @@ callback_mod(Method, Fun) when is_function(Fun, 1) ->
     end.
 
 %% @private
-compute_available_methods(Realm, Ctxt) ->
+compute_methods(Realm, Ctxt) ->
     RealmAllowed = bondy_realm:authmethods(Realm),
 
     case bondy_realm:is_security_enabled(Realm) of
         true ->
-            do_compute_available_methods(Ctxt, RealmAllowed);
+            Admitted = admitted_methods(Ctxt, RealmAllowed),
+            {Admitted, [M || M <- Admitted, has_wamp_auth(M)]};
         false ->
-            RealmAllowed
+            {RealmAllowed, RealmAllowed}
     end.
 
 %% @private
-
-do_compute_available_methods(#{user_id := UserId} = Ctxt, RealmAllowed) ->
+admitted_methods(#{user_id := UserId} = Ctxt, RealmAllowed) ->
     #{
         realm_uri := RealmUri,
         source_ip := IPAddress
@@ -689,7 +750,8 @@ do_compute_available_methods(#{user_id := UserId} = Ctxt, RealmAllowed) ->
             bondy_rbac:anonymous_allowed(source_ip(Ctxt)) andalso
                 matches_requirements(Method, Ctxt);
         ({_Order, Method}) ->
-            has_wamp_auth(Method) andalso matches_requirements(Method, Ctxt)
+            not has_wamp_auth(Method) orelse
+                matches_requirements(Method, Ctxt)
     end,
 
     Available = lists:usort(lists:filtermap(Filter, Allowed)),
@@ -697,8 +759,38 @@ do_compute_available_methods(#{user_id := UserId} = Ctxt, RealmAllowed) ->
     [Method || {_, Method} <- Available].
 
 %% @private
+credential_method(?OIDCRP_AUTH) -> ?OIDCRP_AUTH;
+credential_method(?OAUTH2_AUTH) -> ?OAUTH2_AUTH;
+credential_method(Authmethod) when is_binary(Authmethod) -> ?WAMP_TICKET_AUTH.
+
+%% @private
+admits_credential(?OIDCRP_AUTH = Method, Ctxt) ->
+    admits(Method, Ctxt) orelse
+        (admits(?WAMP_COOKIE_AUTH, Ctxt) andalso legacy_cookie(Ctxt));
+admits_credential(Method, Ctxt) ->
+    admits(Method, Ctxt).
+
+%% @private
+legacy_cookie(#{realm_uri := RealmUri}) ->
+    case ets:insert_new(?LEGACY_COOKIE_TAB, {RealmUri}) of
+        true ->
+            ?LOG_WARNING(#{
+                description =>
+                    "The realm admitted an OIDC credential through the "
+                    "'cookie' method, which is deprecated for this use. "
+                    "Add 'oidcrp' to the realm's authmethods and a source "
+                    "for it.",
+                realm_uri => RealmUri
+            });
+        false ->
+            ok
+    end,
+    true.
+
+%% @private
 %% `tls` and `oidcrp` name how a user may authenticate outside a WAMP HELLO, so
-%% they have no callback module and are never offered to a session.
+%% they have no callback module, no requirements on the user record, and are
+%% never offered to a session.
 has_wamp_auth(Method) ->
     case maps:get(Method, ?BONDY_AUTHMETHODS_INFO) of
         #{callback_mod := undefined} -> false;
@@ -810,8 +902,8 @@ init_from_claims(
         source_ip => SourceIP,
         host => maps:get(host, Opts, undefined)
     },
-    Methods = compute_available_methods(Realm, Ctxt),
-    {ok, maps:put(available_methods, Methods, Ctxt)}.
+    {Admitted, Available} = compute_methods(Realm, Ctxt),
+    {ok, Ctxt#{admitted_methods => Admitted, available_methods => Available}}.
 
 %% @private
 init_from_user(
@@ -841,8 +933,8 @@ init_from_user(
         source_ip => SourceIP,
         host => maps:get(host, Opts, undefined)
     },
-    Methods = compute_available_methods(Realm, Ctxt),
-    {ok, maps:put(available_methods, Methods, Ctxt)}.
+    {Admitted, Available} = compute_methods(Realm, Ctxt),
+    {ok, Ctxt#{admitted_methods => Admitted, available_methods => Available}}.
 
 %% @private
 maybe_set_method(Method, #{method := Method} = Ctxt) ->

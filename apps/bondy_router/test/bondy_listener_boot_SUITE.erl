@@ -16,7 +16,7 @@ inventory — the configured path — and asserts against the booted state:
      listener, and a real HTTP request against the declared `admin` listener.
 
 This complements, rather than repeats, the coverage at the two ends of this
-path: `bondy_listener_schema_SUITE` renders `listeners.$name.*` through
+path: `bondy_conf_schema_SUITE` renders `listeners.$name.*` through
 cuttlefish and boots nothing; `bondy_listener_SUITE` drives
 `bondy_listener_config` and `bondy_listener_manager` directly against real
 sockets and its own `init_per_suite/1` says outright that it does not call

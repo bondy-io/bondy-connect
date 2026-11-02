@@ -102,15 +102,16 @@ listener dimension is derived here from the request itself).
 ) -> ok | throttled.
 
 throttle(Class, Req, Dims) ->
-    ProxyProtocol = bondy_http_proxy_protocol:init(Req),
-    IP =
+    SourceIP = fun() ->
+        ProxyProtocol = bondy_http_proxy_protocol:init(Req),
         case bondy_http_proxy_protocol:source_ip(ProxyProtocol) of
-            {ok, SourceIP} -> SourceIP;
+            {ok, IP} -> IP;
             {error, _} -> element(1, peer(Req))
-        end,
+        end
+    end,
     %% The cowboy `ref` is the listener name — the listener-scope
     %% dimension of the rate-limit chain.
-    bondy_rate_limit:throttle(Class, IP, Dims#{
+    bondy_rate_limit:throttle_with(Class, SourceIP, Dims#{
         listener => maps:get(ref, Req, undefined)
     }).
 

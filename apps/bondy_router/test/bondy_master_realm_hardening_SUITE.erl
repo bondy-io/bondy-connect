@@ -154,7 +154,9 @@ legacy_password_warning_names_change_password(_Config) ->
         D
      || D <- Descriptions, string:find(D, "bondy-admin") =/= nomatch
     ],
-    ?assertNotEqual(nomatch, string:find(Warning, "bondy.user.change_password")),
+    ?assertNotEqual(
+        nomatch, string:find(Warning, "bondy.user.change_password")
+    ),
     ?assertEqual(
         [],
         [

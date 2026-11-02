@@ -403,7 +403,8 @@ In addition, Bondy Connect provides:
 * [bondy.io](https://www.bondy.io)
 * [WAMP specification](https://wamp-proto.org)
 * [@bondyIO](https://twitter.com/bondyIO)
-* Recorded webinar: [Implementing a polyglot microservices architecture](https://www.youtube.com/watch?v=XxJ1IS8mo84) (10 July 2019)
+* Recorded webinar: [Implementing a polyglot microservices architecture](https://www.youtube.com/watch?v=XxJ1IS8mo84) (2019)
+* Recorded Conference Talk: [Introducing Bondy: The IoT, Web and Mobile Platform](https://youtu.be/19neQdxbYGM?si=IIqo985FL29oiLAS) (2023)
 
 ## License
 

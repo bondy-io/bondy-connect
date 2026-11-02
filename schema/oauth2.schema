@@ -42,8 +42,14 @@
 {datatype, bytesize}
 ]}.
 
+%% The number of tokens a user may hold.
 {mapping, "oauth2.refresh_token.limit", "bondy_router.oauth2.max_tokens_per_user",
 [
 {default, "25"},
-{datatype, bytesize}
+{datatype, integer},
+{validators, ["positive_integer"]}
 ]}.
+
+{validator, "positive_integer", "must be a positive integer",
+  fun(V) -> is_integer(V) andalso V > 0 end
+}.

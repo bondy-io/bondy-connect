@@ -275,6 +275,8 @@ end#{
 -export([fetch/2]).
 -export([from_term/1]).
 -export([import_legacy/3]).
+-export([legacy_cell/2]).
+-export([put_legacy_cell/3]).
 -export([groups/1]).
 -export([has_authorized_keys/1]).
 -export([has_password/1]).
@@ -564,6 +566,9 @@ This change is globally replicated.
 
 `Data` cannot carry a `password`: the update returns an `invalid_argument`
 error and changes nothing. Use `change_password/3,4` to set a password.
+
+Returns `{error, reserved_name}` for a reserved name, `anonymous` included
+(`bondy_rbac_user_SUITE:reserved_names_answer_like_add`).
 """.
 -spec update(RealmUri :: uri(), Arg :: username() | t(), Data :: map()) ->
     {ok, NewUser :: t()} | {error, update_error()}.
@@ -602,8 +607,6 @@ update(RealmUri, Username0, Data0, Opts) when is_binary(Username0) ->
     try
         Data = maps_utils:validate(Data0, ?UPDATE_VALIDATOR),
         Username = normalise_username(Username0),
-
-        Username == anonymous andalso throw(not_allowed),
         ok = not_reserved_name_check(Username),
 
         ok = check_credentials_update(Data, Opts),
@@ -616,7 +619,7 @@ update(RealmUri, Username0, Data0, Opts) when is_binary(Username0) ->
             {error, Reason}
     end;
 update(_, anonymous, _, _) ->
-    {error, not_allowed}.
+    {error, reserved_name}.
 
 -doc """
 Removes user `Arg` from `RealmUri`. Equivalent to `remove/3` with default
@@ -669,10 +672,11 @@ remove(RealmUri, Username0, _Opts) when is_binary(Username0) ->
             end
         ],
         Linked =:= [] orelse throw({in_use, Linked}),
-        Aliases = maps:get(aliases, User, []),
+        ok = lists:foreach(
+            fun(Alias) -> ok = clear_alias(RealmUri, Alias, Username) end,
+            maps:get(aliases, User, [])
+        ),
         Table = table(),
-
-        _ = [bondy_db:apply(Table, RealmUri, Alias, clear) || Alias <- Aliases],
 
         ok = bondy_rbac_source:remove_all(RealmUri, Username),
 
@@ -1064,6 +1068,9 @@ to_external(#{type := ?USER_TYPE, version := ?VERSION} = User) ->
 -doc """
 Adds an alias to the user. If the user is an SSO user, the alias is
 added on the SSO Realm only.
+
+Returns `{error, {no_such_user, Username}}` when the realm holds no user named
+`Username`, and `{error, reserved_name}` for `anonymous`.
 """.
 -spec add_alias(
     RealmUri :: uri(), User :: t() | username(), Alias :: username()
@@ -1076,18 +1083,28 @@ add_alias(
     is_binary(RealmUri)
 ->
     Username = maps:get(username, User),
-    do_add_alias(RealmUri, fetch(RealmUri, Username), Alias);
+    add_alias(RealmUri, Username, Alias);
 add_alias(RealmUri, #{type := ?USER_TYPE} = User, Alias) ->
     do_add_alias(RealmUri, User, Alias);
 add_alias(RealmUri, Username, Alias) ->
-    add_alias(RealmUri, fetch(RealmUri, Username), Alias).
+    case lookup(RealmUri, Username) of
+        {ok, User} ->
+            add_alias(RealmUri, User, Alias);
+        {error, not_found} ->
+            {error, {no_such_user, Username}}
+    end.
 
 -doc """
 Removes `Alias` from `User`, so the name no longer resolves to them and is free
 for anyone else.
 
 For an SSO-backed user the alias belongs to the SSO realm and is removed there.
-Removing an alias the user does not hold succeeds.
+Removing an alias the user does not hold succeeds and changes nothing: a name
+held by another user, as an alias or as a username, stays with that user
+(`bondy_rbac_user_SUITE:remove_alias_leaves_other_owners_alone`).
+
+Returns `{error, {no_such_user, Username}}` when the realm holds no user named
+`Username`.
 """.
 -spec remove_alias(
     RealmUri :: uri(), User :: t() | username(), Alias :: username()
@@ -1104,7 +1121,12 @@ remove_alias(
 remove_alias(RealmUri, #{type := ?USER_TYPE} = User, Alias) ->
     do_remove_alias(RealmUri, User, Alias);
 remove_alias(RealmUri, Username, Alias) ->
-    remove_alias(RealmUri, fetch(RealmUri, Username), Alias).
+    case lookup(RealmUri, Username) of
+        {ok, User} ->
+            remove_alias(RealmUri, User, Alias);
+        {error, not_found} ->
+            {error, {no_such_user, Username}}
+    end.
 
 -doc """
 Adds group named `Groupname` to users `Users` in realm with uri
@@ -1923,37 +1945,60 @@ update_groups(RealmUri, Username, Groupnames, Fun) when is_binary(Username) ->
     update_groups(RealmUri, fetch(RealmUri, Username), Groupnames, Fun).
 
 -doc """
-Persists one cell of a legacy `security_users` backup — one written before the
-current storage layout — keyed by `Key` within `RealmUri`.
+Reads one cell of a legacy `security_users` backup, one written before the
+current storage layout, keyed by `Key`, and writes nothing.
 
 The table holds two kinds of cell, and this is the one place that decides which
 a value is, so a restore splits a record exactly as the live write path does.
+An alias-pointer cell (`#{type => alias, username => Target}`) is returned as
+`{alias, Entry}`. It names its target in the same field a user record names
+itself, so the `type` decides, never the presence of `username`. Any other
+value is a user record, upgraded to the current shape by `from_term/1` and
+returned as `{user, User}`; a value `from_term/1` cannot upgrade raises as it
+does.
+""".
+-spec legacy_cell(Key :: binary(), Value :: term()) ->
+    {alias, map()} | {user, t()} | no_return().
 
-**An alias-pointer cell** (`#{type => alias, username => Target}`) is written
-verbatim under its own key. It names its target in the same field a user record
-names itself, so the `type` decides, never the presence of `username`.
+legacy_cell(_Alias, Entry) when ?IS_ALIAS(Entry) ->
+    {alias, Entry};
+legacy_cell(Username, Value) ->
+    {user, from_term({Username, Value})}.
 
-**A user record** is upgraded to the current shape and routed through the
-declarative write path. A legacy record carries its groups inline, and `groups`
-is not a key of the user cell: they belong in the membership relation, which is
-where authorization reads them. Declarative is what a restore is — overwrite the
-record, reconcile the membership to what the backup declares, and fire no
-runtime lifecycle side-effects.
+-doc """
+Writes a cell `legacy_cell/2` returned under `Key` within `RealmUri`.
+
+An alias-pointer cell is written verbatim under its own key. A user record goes
+through the declarative write path. A legacy record carries its groups inline,
+and `groups` is not a key of the user cell: they belong in the membership
+relation, which is where authorization reads them. Declarative is what a
+restore is — overwrite the record, reconcile the membership to what the backup
+declares, and fire no runtime lifecycle side-effects.
 
 Not routed through `add/3`, which re-derives credentials and requires every
 named group to already exist. A restore must accept a record whose password
 shape it cannot re-derive and whose groups have not been read out of the backup
 yet.
 """.
--spec import_legacy(RealmUri :: uri(), Key :: binary(), Value :: term()) ->
-    ok | no_return().
+-spec put_legacy_cell(
+    RealmUri :: uri(), Key :: binary(), Cell :: {alias, map()} | {user, t()}
+) -> ok | {error, term()}.
 
-import_legacy(RealmUri, Alias, Entry) when ?IS_ALIAS(Entry) ->
+put_legacy_cell(RealmUri, Alias, {alias, Entry}) ->
     bondy_db:apply(table(), RealmUri, Alias, {set, Entry});
-import_legacy(RealmUri, Username, Value) ->
-    User = from_term({Username, Value}),
+put_legacy_cell(RealmUri, _Username, {user, User}) ->
     {ok, _} = store(RealmUri, User, #{declarative => true}),
     ok.
+
+-doc """
+Reads and writes one cell of a legacy `security_users` backup:
+`put_legacy_cell(RealmUri, Key, legacy_cell(Key, Value))`.
+""".
+-spec import_legacy(RealmUri :: uri(), Key :: binary(), Value :: term()) ->
+    ok | {error, term()}.
+
+import_legacy(RealmUri, Key, Value) ->
+    put_legacy_cell(RealmUri, Key, legacy_cell(Key, Value)).
 
 %% @private
 %% `groups` is NOT persisted in the user cell — membership is the authoritative
@@ -2116,7 +2161,7 @@ validate_alias(Alias0) ->
 
 %% @private
 do_add_alias(_, #{username := anonymous}, _) ->
-    {error, not_allowed};
+    {error, reserved_name};
 do_add_alias(RealmUri, User0, Alias0) ->
     try
         Alias = validate_alias(Alias0),
@@ -2149,15 +2194,13 @@ do_add_alias(RealmUri, User0, Alias0) ->
 do_remove_alias(RealmUri, User0, Alias0) ->
     try
         Alias = validate_alias(Alias0),
-        Table = table(),
+        Username = maps:get(username, User0),
+        ok = clear_alias(RealmUri, Alias, Username),
         Aliases0 = sets:from_list(maps:get(aliases, User0, [])),
         case sets:del_element(Alias, Aliases0) of
             Aliases0 ->
-                %% Delete anyway
-                _ = bondy_db:apply(Table, RealmUri, Alias, clear),
                 ok;
             Aliases ->
-                _ = bondy_db:apply(Table, RealmUri, Alias, clear),
                 User = User0#{aliases => sets:to_list(Aliases)},
                 _ = store(RealmUri, User, #{}),
                 ok
@@ -2165,6 +2208,23 @@ do_remove_alias(RealmUri, User0, Alias0) ->
     catch
         throw:invalid_alias ->
             {error, {invalid_value, alias, Alias0}}
+    end.
+
+%% @private
+%% The cell under `Alias` may be another user's alias or another user's record
+%% (`bondy_rbac_user_SUITE:user_removal_leaves_names_it_does_not_hold`); only
+%% this user's alias is cleared.
+clear_alias(RealmUri, Alias, Username) ->
+    Table = table(),
+    case bondy_db:read(Table, RealmUri, Alias) of
+        {ok, {#{type := ?ALIAS_TYPE, username := Username}, _Hlc}} ->
+            durable_apply(Table, RealmUri, Alias, clear);
+        {ok, {#{type := ?ALIAS_TYPE}, _Hlc}} ->
+            ok;
+        {ok, {#{type := ?USER_TYPE}, _Hlc}} ->
+            ok;
+        {error, not_found} ->
+            ok
     end.
 
 %% @private

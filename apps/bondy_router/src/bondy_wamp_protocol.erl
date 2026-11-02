@@ -693,13 +693,12 @@ maybe_auth_challenge(
     of
         {ok, AuthCtxt} ->
             St2 = St1#wamp_state{auth_context = AuthCtxt},
-            ReqMethods = [?WAMP_COOKIE_AUTH],
 
-            case bondy_auth:available_methods(ReqMethods, AuthCtxt) of
-                [] ->
-                    {error, {no_authmethod, ReqMethods}, St2};
-                [Method | _] ->
-                    auth_challenge(Method, St2)
+            case bondy_auth:check_credential(cookie, Claims, AuthCtxt) of
+                ok ->
+                    auth_challenge(?WAMP_COOKIE_AUTH, St2);
+                {error, no_authmethod} ->
+                    {error, {no_authmethod, [?WAMP_COOKIE_AUTH]}, St2}
             end;
         {error, Reason} ->
             {error, {authentication_failed, Reason}, St1}

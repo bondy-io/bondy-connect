@@ -9,8 +9,16 @@ Manages OIDC provider configuration and `oidcc_provider_configuration_worker`
 lifecycle.
 
 Provider workers are started lazily on first use and registered via gproc
-as `{bondy_oidc_provider, RealmUri, ProviderName}`. Each worker caches and
-periodically refreshes the provider metadata (JWKS, endpoints).
+as `{bondy_oidc_provider, RealmUri, ProviderName, Issuer, AllowUnsafeHttp}`.
+Each worker caches and periodically refreshes the provider metadata (JWKS,
+endpoints).
+
+A worker serves only the provider settings it was started with. A lookup
+names the realm's current issuer and `allow_unsafe_http`, so after a change
+it misses, and the pair's old worker is stopped before a new one starts
+(`bondy_realm_SUITE:oidc_provider_worker_follows_the_realm`). Deleting a realm
+stops its workers on every node through `bondy_realm:teardown/1`
+(`bondy_realm_cluster_SUITE:oidc_provider_workers_stop_with_their_realm`).
 """.
 
 -include_lib("kernel/include/logger.hrl").
@@ -23,6 +31,7 @@ periodically refreshes the provider metadata (JWKS, endpoints).
 -export([request_opts/1]).
 -export([start_provider_worker/3]).
 -export([stop_provider_worker/2]).
+-export([stop_realm_workers/1]).
 
 %% =============================================================================
 %% API
@@ -31,9 +40,9 @@ periodically refreshes the provider metadata (JWKS, endpoints).
 -doc """
 Starts an `oidcc_provider_configuration_worker` for the given provider.
 
-Registers via gproc as `{bondy_oidc_provider, RealmUri, ProviderName}`.
-If a worker is already running for this (realm, provider) pair, returns
-`{ok, Pid}` of the existing worker.
+If a worker started from the same issuer and `allow_unsafe_http` is running
+for this (realm, provider) pair, returns `{ok, Pid}` of that worker. Otherwise
+stops the pair's other workers and starts one from `Config`.
 """.
 -spec start_provider_worker(
     RealmUri :: uri(),
@@ -44,15 +53,17 @@ If a worker is already running for this (realm, provider) pair, returns
 start_provider_worker(RealmUri, ProviderName, Config) when
     is_binary(RealmUri) andalso is_binary(ProviderName) andalso is_map(Config)
 ->
-    case whereis_worker(RealmUri, ProviderName) of
+    case whereis_worker(RealmUri, ProviderName, Config) of
         undefined ->
+            ok = stop_provider_worker(RealmUri, ProviderName),
             do_start_worker(RealmUri, ProviderName, Config);
         Pid ->
             {ok, Pid}
     end.
 
 -doc """
-Stops the provider configuration worker for the given (realm, provider) pair.
+Stops this node's provider configuration workers for the given (realm,
+provider) pair.
 """.
 -spec stop_provider_worker(
     RealmUri :: uri(),
@@ -62,17 +73,16 @@ Stops the provider configuration worker for the given (realm, provider) pair.
 stop_provider_worker(RealmUri, ProviderName) when
     is_binary(RealmUri) andalso is_binary(ProviderName)
 ->
-    case whereis_worker(RealmUri, ProviderName) of
-        undefined ->
-            ok;
-        Pid ->
-            try
-                gen_server:stop(Pid, normal, 5000)
-            catch
-                exit:{noproc, _} -> ok;
-                exit:{normal, _} -> ok
-            end
-    end.
+    stop_workers(RealmUri, ProviderName).
+
+-doc """
+Stops this node's provider configuration workers for every provider of the
+realm.
+""".
+-spec stop_realm_workers(RealmUri :: uri()) -> ok.
+
+stop_realm_workers(RealmUri) when is_binary(RealmUri) ->
+    stop_workers(RealmUri, '_').
 
 -doc """
 Returns an `oidcc_client_context` for the given (realm, provider) pair.
@@ -119,12 +129,12 @@ Looks up provider configuration from the realm.
 get_provider_config(RealmUri, ProviderName) when
     is_binary(RealmUri) andalso is_binary(ProviderName)
 ->
-    try
-        Realm = bondy_realm:fetch(RealmUri),
-        bondy_realm:get_oidc_provider(Realm, ProviderName)
+    try bondy_realm:fetch(RealmUri) of
+        Realm ->
+            bondy_realm:get_oidc_provider(Realm, ProviderName)
     catch
-        error:{no_such_realm, _} = Reason ->
-            {error, Reason}
+        error:{not_found, RealmUri} ->
+            {error, {no_such_realm, RealmUri}}
     end.
 
 -doc """
@@ -169,25 +179,39 @@ request_opts(#{issuer := Issuer} = Config) ->
 %% =============================================================================
 
 %% @private
-whereis_worker(RealmUri, ProviderName) ->
-    Key = {bondy_oidc_provider, RealmUri, ProviderName},
+worker_key(RealmUri, ProviderName, #{issuer := Issuer} = Config) ->
+    AllowUnsafeHttp = maps:get(allow_unsafe_http, Config, false),
+    {bondy_oidc_provider, RealmUri, ProviderName, Issuer, AllowUnsafeHttp}.
+
+%% @private
+whereis_worker(RealmUri, ProviderName, Config) ->
     try
-        bondy_gproc:lookup_pid(Key)
+        bondy_gproc:lookup_pid(worker_key(RealmUri, ProviderName, Config))
     catch
         error:badarg ->
             undefined
     end.
 
 %% @private
+%% `ProviderName` is `'_'` to match every provider of the realm.
+stop_workers(RealmUri, ProviderName) ->
+    Key = {bondy_oidc_provider, RealmUri, ProviderName, '_', '_'},
+    Pids = gproc:select({l, n}, [{{{n, l, Key}, '$1', '_'}, [], ['$1']}]),
+    lists:foreach(
+        fun(Pid) ->
+            case supervisor:terminate_child(bondy_oidc_provider_sup, Pid) of
+                ok -> ok;
+                {error, not_found} -> ok
+            end
+        end,
+        Pids
+    ).
+
+%% @private
 ensure_worker(RealmUri, ProviderName, Config) ->
-    case whereis_worker(RealmUri, ProviderName) of
-        undefined ->
-            case do_start_worker(RealmUri, ProviderName, Config) of
-                {ok, Pid} -> Pid;
-                {error, Reason} -> error(Reason)
-            end;
-        Pid ->
-            Pid
+    case start_provider_worker(RealmUri, ProviderName, Config) of
+        {ok, Pid} -> Pid;
+        {error, Reason} -> error(Reason)
     end.
 
 %% @private
@@ -195,7 +219,7 @@ do_start_worker(RealmUri, ProviderName, Config) ->
     #{issuer := Issuer} = Config,
 
     GprocName =
-        {via, gproc, {n, l, {bondy_oidc_provider, RealmUri, ProviderName}}},
+        {via, gproc, {n, l, worker_key(RealmUri, ProviderName, Config)}},
 
     AllowUnsafeHttp = maps:get(allow_unsafe_http, Config, false),
 

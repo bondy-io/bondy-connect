@@ -35,7 +35,7 @@ Each class (`handshake`, `auth`, `connection`, `http`, `message`) has
 its own buckets keyed by the caller-supplied dimension (a source IP, or
 a session id for `message`). `http` is per-source-IP HTTP request
 admission — the API Gateway and admin API resources (via the
-`cowboy_rest` `rate_limited` hook) and the MCP endpoints; requests, not
+`bondy_http_admission` middleware) and the MCP endpoints; requests, not
 connections, so it is a separate class from `connection`. Config `rate`
 is tokens/SECOND (operator-friendly); the bucket wants
 tokens/millisecond.
@@ -44,8 +44,9 @@ The node scope's reader requires the `[security, rate_limit]` config
 value to be a MAP — the shape `schema/bondy.schema`'s
 `bondy_router.security.rate_limit` translation builds.
 
-It never raises — the underlying limiter fails open — so a limiter
-problem degrades to "no limit", never to a wedged inbound path.
+The limiter fails open, so a limiter problem degrades to "no limit", never
+to a wedged inbound path. Only an exception from a caller's `KeyFun`
+(`throttle_with/3`) leaves this module.
 """.
 
 -include_lib("kernel/include/logger.hrl").
@@ -72,6 +73,7 @@ does not drain the shared quota.
 
 -export([throttle/2]).
 -export([throttle/3]).
+-export([throttle_with/3]).
 -export([enabled/1]).
 -export([new_session_limiter/0]).
 -export([new_session_limiter/1]).
@@ -118,7 +120,21 @@ and `throttled` on the first refusal. `Key` is a source IP (for
     ok | throttled.
 
 throttle(Class, Key, Dims) ->
-    case do_throttle(Class, Key, Dims) of
+    throttle_with(Class, fun() -> Key end, Dims).
+
+-doc """
+Like `throttle/3`, with the key computed by `KeyFun`. `KeyFun` runs only when
+some scope the dimensions name configures `Class`, so a caller whose key is
+costly to derive pays nothing while rate limiting is off
+(`bondy_rate_limit_SUITE:http_throttle_resolves_the_source_ip_only_when_a_scope_is_on`).
+An exception `KeyFun` raises reaches the caller.
+""".
+-spec throttle_with(
+    Class :: class(), KeyFun :: fun(() -> term()), Dims :: dims()
+) -> ok | throttled.
+
+throttle_with(Class, KeyFun, Dims) ->
+    case admit(Class, KeyFun, Dims) of
         ok -> ok;
         {throttled, _Scope} -> throttled
     end.
@@ -200,22 +216,27 @@ allow_session([{Scope, T} | Rest]) ->
 %% PRIVATE
 %% =============================================================================
 
+-ifdef(TEST).
 %% @private
-%% The scope chain, exported under TEST so the falsifiers can pin WHICH
-%% scope refused (`{throttled, node | listener}` — the observable that
+%% `admit/3` with a plain key, exported under TEST so the falsifiers can pin
+%% WHICH scope refused (`{throttled, node | listener}` — the observable that
 %% proves consumption order and no-refund).
 -spec do_throttle(class(), term(), dims()) -> ok | {throttled, scope()}.
 
 do_throttle(Class, Key, Dims) ->
-    consume(
-        [
-            {Scope, Opts}
-         || {Scope, Opts} <- scope_opts(Class, Dims), Opts =/= disabled
-        ],
-        Class,
-        Key,
-        Dims
-    ).
+    admit(Class, fun() -> Key end, Dims).
+-endif.
+
+%% @private
+admit(Class, KeyFun, Dims) ->
+    Chain = [
+        {Scope, Opts}
+     || {Scope, Opts} <- scope_opts(Class, Dims), Opts =/= disabled
+    ],
+    case Chain of
+        [] -> ok;
+        _ -> consume(Chain, Class, KeyFun(), Dims)
+    end.
 
 %% @private
 consume([], _, _, _) ->

@@ -117,7 +117,6 @@ The status is derived from the error's URI by
 -export([options/2]).
 -export([previously_existed/2]).
 -export([provide/2]).
--export([rate_limited/2]).
 -export([resource_exists/2]).
 -export([to_json/2]).
 -export([to_msgpack/2]).
@@ -145,16 +144,6 @@ query params, bindings) and stores it in the handler state alongside
 the parsed API spec received from the dispatch table.
 """.
 init(Req, St0) ->
-    %% Expose the route template to the cowboy metrics stream handler so
-    %% the per-request HTTP metrics carry a bounded-cardinality `route`
-    %% label (raw paths are unbounded).
-    ok = cowboy_req:cast(
-        {set_options, #{
-            metrics_user_data => #{route => maps:get(route, St0, undefined)}
-        }},
-        Req
-    ),
-
     %% TODO Set session will now be required by bondy_auth:init
 
     %% TODO
@@ -308,20 +297,6 @@ expires(Req, St) ->
     {false, Req, St}.
 
 -doc """
-`cowboy_rest` rate-limiting hook: consumes one `http`-class token for the
-request's source IP (`security.rate_limit`, off by default) — the same
-inbound throttle the WS and raw-socket handlers apply per connection,
-applied here per request. Throttled requests answer `429` with a
-`retry-after` of one second, the class's refill granularity.
-""".
-rate_limited(Req, St) ->
-    Dims = #{realm => maps:get(realm_uri, St, undefined)},
-    case bondy_http_utils:throttle(http, Req, Dims) of
-        ok -> {false, Req, St};
-        throttled -> {{true, 1}, Req, St}
-    end.
-
--doc """
 Determines whether the resource exists.
 
 For collection resources (`is_collection` is `true`), returns `false`
@@ -449,7 +424,7 @@ is_authorized(_, Req, #{security := #{<<"type">> := <<"api_key">>}} = St) ->
             "Request is using unsupported api_key authentication scheme",
         request => Req
     }),
-    {false, Req, St};
+    deny_unenforced(<<"ApiKey">>, Req, St);
 is_authorized(Method, Req, #{security := #{<<"type">> := <<"oidc">>}} = St) ->
     authenticate_ticket_cookie(Method, Req, St);
 is_authorized(_, Req, #{security := #{<<"type">> := <<"basic">>}} = St) ->
@@ -462,7 +437,7 @@ is_authorized(_, Req, #{security := #{<<"type">> := <<"basic">>}} = St) ->
         type => <<"basic">>,
         request => Req
     }),
-    {false, Req, St};
+    deny_unenforced(<<"Basic">>, Req, St);
 is_authorized(_, Req, #{security := Security} = St0) when
     is_map(Security) andalso map_size(Security) == 0
 ->
@@ -480,7 +455,16 @@ is_authorized(_, Req, #{security := Security} = St) ->
         security => Security,
         request => Req
     }),
-    {false, Req, St}.
+    deny_unenforced(<<"Bearer">>, Req, St).
+
+%% @private
+deny_unenforced(Scheme, Req0, St) ->
+    Req1 = set_resp_headers(eval_headers(Req0, St), Req0),
+    RealmUri = maps:get(realm_uri, St),
+    Req2 = reply_auth_error(
+        authentication_failed, Scheme, RealmUri, json, Req1
+    ),
+    {stop, Req2, St}.
 
 %% @private
 authenticate_bearer(Req0, St0) ->
@@ -519,8 +503,8 @@ authenticate_bearer(Req0, St0) ->
 %% @private
 authenticate_ticket_cookie(Method, Req0, St0) ->
     %% The checks a WAMP session opened with the same cookie gets
-    %% (`bondy_wamp_protocol`'s cookie clause): the realm's methods through
-    %% `bondy_auth`, scope and issuer through the `cookie` method.
+    %% (`bondy_wamp_protocol`'s cookie clause): the credential's method and
+    %% `cookie` through `bondy_auth`, scope and issuer through `cookie`.
     RealmUri = maps:get(realm_uri, St0),
     SourceIP = maps:get(source_ip, St0),
 
@@ -543,11 +527,15 @@ authenticate_ticket_cookie(Method, Req0, St0) ->
                 {ok, InitCtxt} -> InitCtxt;
                 {error, InitReason} -> throw(InitReason)
             end,
+        case bondy_auth:check_credential(cookie, Claims, Ctxt0) of
+            ok -> ok;
+            {error, CheckReason} -> throw(CheckReason)
+        end,
         case bondy_auth:authenticate(?WAMP_COOKIE_AUTH, Claims, #{}, Ctxt0) of
             {ok, _, Ctxt1} ->
                 St1 = St0#{
                     is_anonymous => false,
-                    authid => Authid,
+                    authid => bondy_auth:user_id(Ctxt1),
                     authroles => bondy_auth:roles(Ctxt1)
                 },
                 {true, Req0, St1};

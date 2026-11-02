@@ -81,19 +81,38 @@ handle_call(?BONDY_USER_GET, #call{} = M, Ctxt) ->
     end;
 handle_call(?BONDY_USER_IS_ENABLED, #call{} = M, Ctxt) ->
     [Uri, Username] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
-    Res = bondy_rbac_user:is_enabled(Uri, Username),
-    R = bondy_wamp_message:result(M#call.request_id, #{}, [Res]),
-    {reply, R};
+
+    case bondy_rbac_user:lookup(Uri, Username) of
+        {ok, User} ->
+            Res = bondy_rbac_user:is_enabled(User),
+            R = bondy_wamp_message:result(M#call.request_id, #{}, [Res]),
+            {reply, R};
+        {error, not_found} ->
+            E = bondy_wamp_api_utils:error({no_such_user, Username}, M),
+            {reply, E}
+    end;
 handle_call(?BONDY_USER_ENABLE, #call{} = M, Ctxt) ->
     [Uri, Username] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
-    ok = bondy_rbac_user:enable(Uri, Username),
-    R = bondy_wamp_message:result(M#call.request_id, #{}),
-    {reply, R};
+
+    case bondy_rbac_user:enable(Uri, Username) of
+        ok ->
+            R = bondy_wamp_message:result(M#call.request_id, #{}),
+            {reply, R};
+        {error, Reason} ->
+            E = bondy_wamp_api_utils:error(Reason, M),
+            {reply, E}
+    end;
 handle_call(?BONDY_USER_DISABLE, #call{} = M, Ctxt) ->
     [Uri, Username] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 2),
-    ok = bondy_rbac_user:disable(Uri, Username),
-    R = bondy_wamp_message:result(M#call.request_id, #{}),
-    {reply, R};
+
+    case bondy_rbac_user:disable(Uri, Username) of
+        ok ->
+            R = bondy_wamp_message:result(M#call.request_id, #{}),
+            {reply, R};
+        {error, Reason} ->
+            E = bondy_wamp_api_utils:error(Reason, M),
+            {reply, E}
+    end;
 handle_call(?BONDY_USER_LIST, #call{} = M, Ctxt) ->
     [Uri] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 1),
 
@@ -174,9 +193,8 @@ handle_call(?BONDY_USER_REMOVE_GROUP, #call{} = M, Ctxt) ->
     ),
 
     case bondy_rbac_user:remove_group(Uri, Name, Groupname) of
-        {ok, Group} ->
-            Ext = bondy_rbac_user:to_external(Group),
-            R = bondy_wamp_message:result(M#call.request_id, #{}, [Ext]),
+        ok ->
+            R = bondy_wamp_message:result(M#call.request_id, #{}),
             {reply, R};
         {error, Reason} ->
             E = bondy_wamp_api_utils:error(Reason, M),
@@ -263,21 +281,19 @@ handle_call(?BONDY_GROUP_ADD_GROUP, #call{} = M, Ctxt) ->
     [Uri, Name, Group] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 3),
 
     case bondy_rbac_group:add_group(Uri, Name, Group) of
-        {ok, Group} ->
-            Ext = bondy_rbac_group:to_external(Group),
-            R = bondy_wamp_message:result(M#call.request_id, #{}, [Ext]),
+        ok ->
+            R = bondy_wamp_message:result(M#call.request_id, #{}),
             {reply, R};
         {error, Reason} ->
             E = bondy_wamp_api_utils:error(Reason, M),
             {reply, E}
     end;
 handle_call(?BONDY_GROUP_ADD_GROUPS, #call{} = M, Ctxt) ->
-    [Uri, Name, Group] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 3),
+    [Uri, Name, Groups] = bondy_wamp_api_utils:validate_call_args(M, Ctxt, 3),
 
-    case bondy_rbac_group:add_groups(Uri, Name, Group) of
+    case bondy_rbac_group:add_groups(Uri, Name, Groups) of
         ok ->
-            Ext = bondy_rbac_group:to_external(Group),
-            R = bondy_wamp_message:result(M#call.request_id, #{}, [Ext]),
+            R = bondy_wamp_message:result(M#call.request_id, #{}),
             {reply, R};
         {error, Reason} ->
             E = bondy_wamp_api_utils:error(Reason, M),
@@ -289,9 +305,8 @@ handle_call(?BONDY_GROUP_REMOVE_GROUP, #call{} = M, Ctxt) ->
     ),
 
     case bondy_rbac_group:remove_group(Uri, Name, Groupname) of
-        {ok, Group} ->
-            Ext = bondy_rbac_group:to_external(Group),
-            R = bondy_wamp_message:result(M#call.request_id, #{}, [Ext]),
+        ok ->
+            R = bondy_wamp_message:result(M#call.request_id, #{}),
             {reply, R};
         {error, Reason} ->
             E = bondy_wamp_api_utils:error(Reason, M),

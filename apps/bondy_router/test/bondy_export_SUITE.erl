@@ -22,7 +22,13 @@ all() ->
         legacy_user_alias_roundtrip,
         legacy_poison_record_is_skipped,
         legacy_token_refresh_roundtrip,
-        empty_file_is_refused_as_empty
+        empty_file_is_refused_as_empty,
+        truncated_last_record_imports_the_rest,
+        crashed_import_is_reported,
+        dry_run_reports_without_writing,
+        unimportable_entries_are_counted_as_skipped,
+        status_reads_another_file_during_an_import,
+        importing_a_file_again_writes_the_same_records
     ].
 
 init_per_suite(Config) ->
@@ -411,6 +417,324 @@ empty_file_is_refused_as_empty(Config) ->
     after
         meck:unload(bondy_event_manager)
     end.
+
+%% A backup whose last record was cut short reads back as bad bytes. The
+%% complete records before it, a refresh token among them, still import.
+truncated_last_record_imports_the_rest(Config) ->
+    Realm = <<"com.example.export_truncated">>,
+    ok = ensure_realm(Realm),
+    File = filename:join(?config(priv_dir, Config), "truncated.bak"),
+    _ = file:delete(File),
+    Now = erlang:system_time(second),
+    Legacy = <<"TRUNCATEDlegacyREFRESHtoken0123456789">>,
+    Token =
+        {bondy_oauth2_token, <<"client">>, <<"kept_user">>, [], #{}, 3600, Now,
+            true},
+    Good = [{<<"groups">>, []}, {<<"meta">>, #{}}],
+    {ok, Log} = disk_log:open([
+        {name, truncated_export_file},
+        {file, File},
+        {type, halt},
+        {size, infinity},
+        {head, #{format => dvvset_log, vsn => <<"1.2.0">>}}
+    ]),
+    ok = disk_log:log(Log, legacy_user_term(Realm, <<"kept_user">>, Good)),
+    Group = #{
+        type => group,
+        version => <<"1.1">>,
+        name => <<"kept_group">>,
+        groups => [],
+        meta => #{}
+    },
+    ok = disk_log:log(Log, {
+        {{security_groups, Realm}, <<"kept_group">>},
+        {object, {[{{1, node1}, 1, [{Group, {1700, 0, 0}}]}], []}}
+    }),
+    ok = disk_log:log(Log, {
+        {{oauth2_refresh_tokens, <<Realm/binary, ",client">>}, Legacy},
+        {object, {[{{1, node1}, 1, [{Token, {1700, 0, 0}}]}], []}}
+    }),
+    ok = disk_log:log(Log, legacy_user_term(Realm, <<"cut_user">>, Good)),
+    ok = disk_log:close(Log),
+    Size = filelib:file_size(File),
+    {ok, Fd} = file:open(File, [read, write, binary]),
+    {ok, _} = file:position(Fd, Size - 10),
+    ok = file:truncate(Fd),
+    ok = file:close(Fd),
+
+    ok = meck:new(bondy_event_manager, [passthrough, no_link]),
+    try
+        {ok, _} = bondy_export:import(#{filename => File}),
+        ok = wait_idle(100),
+        Outcomes = [
+            {Event, maps:get(reason, Info, maps:get(bad_bytes, Info, none))}
+         || {_,
+                {bondy_event_manager, notify, [
+                    {[bondy, export, import, Event], Info}
+                ]},
+                _} <- meck:history(bondy_event_manager),
+            Event =/= start
+        ],
+        ?assertMatch([{stop, BadBytes}] when BadBytes > 0, Outcomes)
+    after
+        meck:unload(bondy_event_manager)
+    end,
+    ?assertMatch({ok, _}, bondy_rbac_user:lookup(Realm, <<"kept_user">>)),
+    ?assertMatch(
+        #{name := <<"kept_group">>},
+        bondy_rbac_group:lookup(Realm, <<"kept_group">>)
+    ),
+    ?assertEqual(
+        {error, not_found}, bondy_rbac_user:lookup(Realm, <<"cut_user">>)
+    ),
+    {ok, #{import := Report}} = bondy_export:status(#{filename => File}),
+    ?assertMatch(
+        #{
+            outcome := finished,
+            bad_bytes := Bad,
+            written := #{
+                security_users := 1,
+                security_groups := 1,
+                bondy_oauth_token := 1
+            }
+        } when Bad > 0,
+        Report
+    ),
+    _ = json:encode(Report),
+    ?assertMatch({ok, _}, bondy_oauth_token:refresh(Realm, Legacy)).
+
+%% An import worker that exits mid-file is reported as an import exception
+%% carrying its exit reason, and the server goes back to idle. The status of
+%% the file reports what was written before the exit.
+crashed_import_is_reported(Config) ->
+    Realm = <<"com.example.export_crash">>,
+    ok = ensure_realm(Realm),
+    File = filename:join(?config(priv_dir, Config), "crash.bak"),
+    _ = file:delete(File),
+    {ok, Log} = disk_log:open([
+        {name, crash_export_file},
+        {file, File},
+        {type, halt},
+        {size, infinity},
+        {head, #{format => dvvset_log, vsn => <<"1.2.0">>}}
+    ]),
+    Good = [{<<"groups">>, []}, {<<"meta">>, #{}}],
+    ok = disk_log:log(Log, legacy_user_term(Realm, <<"written_user">>, Good)),
+    ok = disk_log:log(Log, legacy_user_term(Realm, <<"crash_user">>, Good)),
+    ok = disk_log:close(Log),
+    Server = whereis(bondy_export),
+    ok = meck:new(bondy_event_manager, [passthrough, no_link]),
+    ok = meck:new(bondy_rbac_user, [passthrough, no_link]),
+    try
+        ok = meck:expect(bondy_rbac_user, put_legacy_cell, fun
+            (_, <<"crash_user">>, _) -> exit(import_worker_crashed);
+            (Band, Key, Cell) -> meck:passthrough([Band, Key, Cell])
+        end),
+        {ok, _} = bondy_export:import(#{filename => File}),
+        ok = wait_idle(100),
+        Outcomes = [
+            {Event, maps:get(reason, Info, none)}
+         || {_,
+                {bondy_event_manager, notify, [
+                    {[bondy, export, import, Event], Info}
+                ]},
+                _} <- meck:history(bondy_event_manager),
+            Event =/= start
+        ],
+        ?assertEqual([{exception, import_worker_crashed}], Outcomes),
+        ?assertEqual(Server, whereis(bondy_export)),
+        {ok, #{import := Report}} = bondy_export:status(#{filename => File}),
+        ?assertMatch(
+            #{outcome := failed, written := #{security_users := 1}}, Report
+        )
+    after
+        meck:unload(bondy_rbac_user),
+        meck:unload(bondy_event_manager)
+    end.
+
+%% A dry run reads the whole file through the import loop and reports what the
+%% import would write and skip, a user record the import refuses included,
+%% while nothing is written.
+dry_run_reports_without_writing(Config) ->
+    Realm = <<"com.example.export_dry_run">>,
+    ok = ensure_realm(Realm),
+    %% The token's user exists, so only the dry run keeps the token unwritten.
+    ok = ensure_user(Realm, <<"dry_token_user">>),
+    File = filename:join(?config(priv_dir, Config), "dry_run.bak"),
+    _ = file:delete(File),
+    Now = erlang:system_time(second),
+    Legacy = <<"DRYRUNlegacyREFRESHtoken0123456789abc">>,
+    Token =
+        {bondy_oauth2_token, <<"client">>, <<"dry_token_user">>, [], #{}, 3600,
+            Now, true},
+    Group = #{
+        type => group,
+        version => <<"1.1">>,
+        name => <<"dry_group">>,
+        groups => [],
+        meta => #{}
+    },
+    Good = [{<<"groups">>, []}, {<<"meta">>, #{}}],
+    Object = fun(V) ->
+        {object, {[{{1, node1}, 1, [{V, {1700, 0, 0}}]}], []}}
+    end,
+    {ok, Log} = disk_log:open([
+        {name, dry_run_export_file},
+        {file, File},
+        {type, halt},
+        {size, infinity},
+        {head, #{format => dvvset_log, vsn => <<"1.2.0">>}}
+    ]),
+    ok = disk_log:log(Log, legacy_user_term(Realm, <<"dry_user">>, Good)),
+    ok = disk_log:log(
+        Log, legacy_user_term(Realm, <<"dry_poison">>, not_a_user_payload)
+    ),
+    ok = disk_log:log(
+        Log, {{{security_groups, Realm}, <<"dry_group">>}, Object(Group)}
+    ),
+    ok = disk_log:log(Log, {
+        {{oauth2_refresh_tokens, <<Realm/binary, ",client">>}, Legacy},
+        Object(Token)
+    }),
+    ok = disk_log:log(Log, {{{no_such_prefix, Realm}, <<"k">>}, Object(v)}),
+    ok = disk_log:close(Log),
+
+    ok = meck:new(bondy_event_manager, [passthrough, no_link]),
+    try
+        {ok, _} = bondy_export:import(#{
+            <<"filename">> => list_to_binary(File), <<"dry_run">> => true
+        }),
+        ok = wait_idle(100),
+        Events = [
+            {Event, maps:get(dry_run, Info, missing)}
+         || {_,
+                {bondy_event_manager, notify, [
+                    {[bondy, export, import, Event], Info}
+                ]},
+                _} <- meck:history(bondy_event_manager)
+        ],
+        ?assertEqual([{start, true}, {stop, true}], Events)
+    after
+        meck:unload(bondy_event_manager)
+    end,
+    {ok, #{import := Report}} = bondy_export:status(#{filename => File}),
+    ?assertMatch(
+        #{
+            outcome := finished,
+            dry_run := true,
+            read_count := 5,
+            written := #{
+                security_users := 1,
+                security_groups := 1,
+                bondy_oauth_token := 1
+            },
+            skipped := #{
+                <<"{unsupported_prefix,no_such_prefix}">> := 1,
+                <<"import_error">> := 1
+            }
+        },
+        Report
+    ),
+    ?assertEqual(
+        {error, not_found}, bondy_rbac_user:lookup(Realm, <<"dry_user">>)
+    ),
+    ?assertEqual(
+        {error, not_found}, bondy_rbac_group:lookup(Realm, <<"dry_group">>)
+    ),
+    ?assertMatch({error, _}, bondy_oauth_token:refresh(Realm, Legacy)).
+
+%% An entry for a table this node does not provision, and a term that is not
+%% an entry, are reported as skipped.
+unimportable_entries_are_counted_as_skipped(Config) ->
+    File = filename:join(?config(priv_dir, Config), "unimportable.bak"),
+    _ = file:delete(File),
+    {ok, Log} = disk_log:open([
+        {name, unimportable_export_file},
+        {file, File},
+        {type, halt},
+        {size, infinity},
+        {head, #{format => bondy_db_export, vsn => <<"2.0.0">>}}
+    ]),
+    ok = disk_log:log(Log, {entry, no_such_table, <<>>, <<"k">>, v}),
+    ok = disk_log:log(Log, not_an_entry),
+    ok = disk_log:close(Log),
+    {ok, _} = bondy_export:import(#{filename => File}),
+    ok = wait_idle(100),
+    {ok, #{import := Report}} = bondy_export:status(#{filename => File}),
+    ?assertMatch(
+        #{
+            outcome := finished,
+            read_count := 2,
+            written_count := 0,
+            skipped := #{
+                <<"{table_not_provisioned,no_such_table}">> := 1,
+                <<"unknown_term">> := 1
+            }
+        },
+        Report
+    ).
+
+%% While an import runs, the status of another file reads that file's header.
+status_reads_another_file_during_an_import(Config) ->
+    Realm = <<"com.example.export_status_other">>,
+    ok = ensure_realm(Realm),
+    Good = [{<<"groups">>, []}, {<<"meta">>, #{}}],
+    [Slow, Other] = [
+        begin
+            File = filename:join(?config(priv_dir, Config), Name),
+            _ = file:delete(File),
+            {ok, Log} = disk_log:open([
+                {name, list_to_atom(Name)},
+                {file, File},
+                {type, halt},
+                {size, infinity},
+                {head, #{format => dvvset_log, vsn => <<"1.2.0">>}}
+            ]),
+            ok = disk_log:log(Log, legacy_user_term(Realm, <<"u">>, Good)),
+            ok = disk_log:close(Log),
+            File
+        end
+     || Name <- ["status_slow.bak", "status_other.bak"]
+    ],
+    Self = self(),
+    ok = meck:new(bondy_rbac_user, [passthrough, no_link]),
+    try
+        ok = meck:expect(bondy_rbac_user, put_legacy_cell, fun(B, K, C) ->
+            Self ! {importing, self()},
+            receive
+                proceed -> meck:passthrough([B, K, C])
+            end
+        end),
+        {ok, _} = bondy_export:import(#{filename => Slow}),
+        Worker =
+            receive
+                {importing, Pid} -> Pid
+            after 10000 -> error(import_not_started)
+            end,
+        ?assertMatch(
+            {ok, #{status := ok, format := dvvset_log}},
+            bondy_export:status(#{filename => Other})
+        ),
+        Worker ! proceed,
+        ok = wait_idle(100)
+    after
+        meck:unload(bondy_rbac_user)
+    end.
+
+%% A file imported twice imports the same records the second time, and its
+%% legacy refresh token resolves again. This is the recovery for a node whose
+%% import of a truncated file stopped part way.
+importing_a_file_again_writes_the_same_records(Config) ->
+    File = filename:join(?config(priv_dir, Config), "truncated.bak"),
+    Reports = [
+        begin
+            truncated_last_record_imports_the_rest(Config),
+            {ok, #{import := Report}} = bondy_export:status(#{filename => File}),
+            Report
+        end
+     || _ <- [first, second]
+    ],
+    ?assertMatch([Same, Same], Reports).
 
 %% @private
 %% Polls the (async) export/import worker until it returns to idle.

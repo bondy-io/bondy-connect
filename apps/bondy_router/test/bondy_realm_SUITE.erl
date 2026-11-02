@@ -12,6 +12,8 @@
 -include("bondy_uris.hrl").
 -include("bondy_db_tables.hrl").
 -include("bondy_security.hrl").
+-include_lib("oidcc/include/oidcc_client_context.hrl").
+-include_lib("oidcc/include/oidcc_provider_configuration.hrl").
 
 -define(U1, <<"user_1">>).
 -define(U2, <<"user_2">>).
@@ -49,7 +51,9 @@ all() ->
         sso_switch_is_refused_while_users_link_to_the_sso_realm,
         prototype_sso_switch_is_refused_while_a_member_has_linked_users,
         sso_switch_cannot_hand_a_user_another_identity,
-        delete_api_reports_a_refusal_as_a_conflict
+        delete_api_reports_a_refusal_as_a_conflict,
+        oidc_provider_worker_follows_the_realm,
+        oidc_provider_answers_a_missing_realm_or_provider
     ].
 
 init_per_suite(Config) ->
@@ -732,3 +736,113 @@ catch_inconsistency(Fun) ->
     catch
         error:{inconsistency_error, [sso_realm_uri], _} = Reason -> Reason
     end.
+
+%% Provider metadata is mocked to echo the issuer it was loaded from, so the
+%% client context names the issuer its provider worker was started with, and
+%% the supervisor's count shows whether the previous worker was stopped.
+%% Covers a provider whose issuer changes and a realm deleted and created again
+%% under the same URI on one node; `bondy_realm_cluster_SUITE` covers peers.
+oidc_provider_worker_follows_the_realm(_) ->
+    Uri = gen_uri(),
+    Provider = ~"idp",
+    ok = meck:new(oidcc_provider_configuration, [passthrough, no_link]),
+    try
+        ok = meck:expect(
+            oidcc_provider_configuration,
+            load_configuration,
+            fun(Issuer, _) ->
+                Config = #oidcc_provider_configuration{
+                    issuer = Issuer, jwks_uri = <<Issuer/binary, "/jwks">>
+                },
+                {ok, {Config, 3600000}}
+            end
+        ),
+        ok = meck:expect(
+            oidcc_provider_configuration,
+            load_jwks,
+            fun(_, _) -> {ok, {jose_jwk:generate_key({oct, 32}), 3600000}} end
+        ),
+        Base = provider_workers(),
+        _ = bondy_realm:create(
+            oidc_realm(Uri, Provider, ~"http://127.0.0.1:1/a")
+        ),
+        First = {context_issuer(Uri, Provider), provider_workers() - Base},
+        _ = bondy_realm:update(
+            Uri,
+            maps:remove(uri, oidc_realm(Uri, Provider, ~"http://127.0.0.1:1/b"))
+        ),
+        Updated = {context_issuer(Uri, Provider), provider_workers() - Base},
+        ok = bondy_realm:delete(Uri),
+        Deleted = await_provider_workers(Base, 50),
+        _ = bondy_realm:create(
+            oidc_realm(Uri, Provider, ~"http://127.0.0.1:1/c")
+        ),
+        Recreated = {context_issuer(Uri, Provider), provider_workers() - Base},
+        ?assertEqual(
+            {
+                {~"http://127.0.0.1:1/a", 1},
+                {~"http://127.0.0.1:1/b", 1},
+                Base,
+                {~"http://127.0.0.1:1/c", 1}
+            },
+            {First, Updated, Deleted, Recreated}
+        )
+    after
+        ok = meck:unload(oidcc_provider_configuration)
+    end.
+
+oidc_provider_answers_a_missing_realm_or_provider(_) ->
+    Uri = gen_uri(),
+    Provider = ~"idp",
+    Missing = {error, {no_such_realm, Uri}},
+    Plain = gen_uri(),
+    _ = bondy_realm:create(Plain),
+    ?assertEqual(
+        {Missing, Missing, Missing, {error, not_found}, {error, not_found}},
+        {
+            bondy_oidc_provider:get_provider_config(Uri, Provider),
+            bondy_oidc_provider:get_client_context(Uri, Provider),
+            bondy_oidc_provider:get_refresh_jwks_fun(Uri, Provider),
+            bondy_oidc_provider:get_provider_config(
+                ?CONTROL_REALM_URI, Provider
+            ),
+            bondy_oidc_provider:get_provider_config(Plain, Provider)
+        }
+    ).
+
+oidc_realm(Uri, Provider, Issuer) ->
+    #{
+        uri => Uri,
+        info => #{
+            ~"oidc_providers" => #{
+                Provider => #{
+                    ~"issuer" => Issuer,
+                    ~"client_id" => ~"client",
+                    ~"client_secret" => ~"secret",
+                    ~"redirect_uri" => ~"http://127.0.0.1:18080/cb"
+                }
+            }
+        }
+    }.
+
+provider_workers() ->
+    proplists:get_value(
+        active, supervisor:count_children(bondy_oidc_provider_sup)
+    ).
+
+%% The realm's data is removed by a router worker after `delete/1` returns.
+await_provider_workers(Expected, 0) ->
+    {timeout, Expected, provider_workers()};
+await_provider_workers(Expected, N) ->
+    case provider_workers() of
+        Expected ->
+            Expected;
+        _ ->
+            timer:sleep(100),
+            await_provider_workers(Expected, N - 1)
+    end.
+
+context_issuer(Uri, Provider) ->
+    {ok, #oidcc_client_context{provider_configuration = Config}} =
+        bondy_oidc_provider:get_client_context(Uri, Provider),
+    Config#oidcc_provider_configuration.issuer.

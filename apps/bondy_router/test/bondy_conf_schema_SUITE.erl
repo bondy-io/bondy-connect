@@ -9,8 +9,8 @@
 %% as a standalone escript BEFORE the VM boots the release, so no runtime code
 %% path exercises a translation.
 %%
-%% Every assertion below is on `bondy_router.listeners'. That is the ONLY key
-%% the `listeners.$name.*' block renders. A cuttlefish mapping's target is
+%% Every listener assertion below is on `bondy_router.listeners'. That is the
+%% ONLY key the `listeners.$name.*' block renders. A cuttlefish mapping's target is
 %% tokenised literally and each token is passed through `list_to_atom/1'
 %% (cuttlefish_generator.erl:153 and :257-267), so a target cannot name a
 %% listener whose name is only known at render time; `$name' in a target
@@ -18,7 +18,7 @@
 %% nested inside its inventory entry. Nothing in this suite asserts on
 %% `bondy_router.<name>.*', because this schema does not write it.
 %% =============================================================================
--module(bondy_listener_schema_SUITE).
+-module(bondy_conf_schema_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
@@ -51,6 +51,10 @@
 -export([a_security_header_can_be_switched_off_on_its_own/1]).
 -export([all_116_keys_reach_their_documented_paths/1]).
 -export([the_generated_conf_names_no_instance/1]).
+-export([oidc_provider_keys_render/1]).
+-export([oidc_provider_without_issuer_is_left_out/1]).
+-export([oidc_provider_with_a_non_http_issuer_is_left_out/1]).
+-export([log/2]).
 
 all() ->
     [
@@ -77,7 +81,11 @@ all() ->
         linger_timeout_is_in_seconds,
         a_security_header_can_be_switched_off_on_its_own,
         all_116_keys_reach_their_documented_paths,
-        the_generated_conf_names_no_instance
+        the_generated_conf_names_no_instance,
+        oidc_provider_keys_render,
+        oidc_provider_without_issuer_is_left_out,
+        oidc_provider_with_a_non_http_issuer_is_left_out,
+        refresh_token_limit_is_a_token_count
     ].
 
 init_per_suite(Config) ->
@@ -944,6 +952,51 @@ the_generated_conf_names_no_instance(Config) ->
         cuttlefish_generator:map(Schema, cuttlefish_conf:file(File))
     ).
 
+oidc_provider_keys_render(Config) ->
+    Providers = oidc_providers(Config, [
+        "security.oidc.providers.okta.issuer = https://example.okta.com\n",
+        "security.oidc.providers.okta.client_id = bondy\n",
+        "security.oidc.providers.okta.client_secret = s3cret\n",
+        "security.oidc.providers.dev.issuer = http://localhost:8080/realms/dev\n",
+        "security.oidc.providers.dev.client_id = bondy-dev\n",
+        "security.oidc.providers.dev.allow_unsafe_http = on\n"
+    ]),
+    ?assertEqual(
+        #{
+            ~"okta" => #{
+                issuer => ~"https://example.okta.com",
+                client_id => ~"bondy",
+                client_secret => ~"s3cret",
+                allow_unsafe_http => false
+            },
+            ~"dev" => #{
+                issuer => ~"http://localhost:8080/realms/dev",
+                client_id => ~"bondy-dev",
+                allow_unsafe_http => true
+            }
+        },
+        Providers
+    ).
+
+oidc_provider_without_issuer_is_left_out(Config) ->
+    {Providers, Warnings} = oidc_providers_and_warnings(Config, [
+        "security.oidc.providers.okta.client_id = bondy\n",
+        "security.oidc.providers.corp.issuer = https://id.example.com\n",
+        "security.oidc.providers.corp.client_id = bondy\n"
+    ]),
+    ?assertEqual([~"corp"], maps:keys(Providers)),
+    ?assertMatch(["security.oidc.providers.okta is left out" ++ _], Warnings).
+
+oidc_provider_with_a_non_http_issuer_is_left_out(Config) ->
+    {Providers, Warnings} = oidc_providers_and_warnings(Config, [
+        "security.oidc.providers.okta.issuer = example.okta.com\n",
+        "security.oidc.providers.okta.client_id = bondy\n",
+        "security.oidc.providers.corp.issuer = https://id.example.com\n",
+        "security.oidc.providers.corp.client_id = bondy\n"
+    ]),
+    ?assertEqual([~"corp"], maps:keys(Providers)),
+    ?assertMatch(["security.oidc.providers.okta is left out" ++ _], Warnings).
+
 %% =============================================================================
 %% HELPERS
 %% =============================================================================
@@ -960,6 +1013,28 @@ render(Config, Lines) ->
     Conf = cuttlefish_conf:file(File),
     cuttlefish_generator:map(Schema, Conf).
 
+%% `oauth2.refresh_token.limit' is the number of tokens a user may hold
+%% (`bondy_oauth_token_store_SUITE' sets the same application key as a count).
+refresh_token_limit_is_a_token_count(Config) ->
+    Observed = [
+        {Line, max_tokens_per_user(Config, Line)}
+     || Line <- [
+            [],
+            ["oauth2.refresh_token.limit = 40\n"],
+            ["oauth2.refresh_token.limit = 25KB\n"],
+            ["oauth2.refresh_token.limit = 0\n"]
+        ]
+    ],
+    ?assertMatch(
+        [
+            {[], {ok, 25}},
+            {_, {ok, 40}},
+            {_, {refused, _}},
+            {_, {refused, _}}
+        ],
+        Observed
+    ).
+
 %% Renders and returns `bondy_router.listeners', failing the case if the render
 %% itself failed.
 inventory(Config, Lines) ->
@@ -973,6 +1048,46 @@ inventory(Config, Lines) ->
                 undefined
             )
     end.
+
+%% Renders and returns `bondy_router.security.oidc.providers', failing the case
+%% if the render itself failed.
+oidc_providers(Config, Lines) ->
+    case render(Config, Lines) of
+        {error, _, _} = Error ->
+            ct:fail({render_failed, Error});
+        AppEnv ->
+            Router = proplists:get_value(bondy_router, AppEnv, []),
+            key_value:get([security, oidc, providers], Router, undefined)
+    end.
+
+%% Renders `Lines' and returns `bondy_router.security.oidc.providers' with the
+%% warnings logged while rendering.
+oidc_providers_and_warnings(Config, Lines) ->
+    Id = conf_schema_suite_warnings,
+    ok = logger:add_handler(Id, ?MODULE, #{
+        level => warning, config => #{pid => self()}
+    }),
+    try
+        Providers = oidc_providers(Config, Lines),
+        {Providers, warnings([])}
+    after
+        ok = logger:remove_handler(Id)
+    end.
+
+warnings(Acc) ->
+    receive
+        {cuttlefish_warning, Text} -> warnings([Text | Acc])
+    after 200 ->
+        lists:reverse(Acc)
+    end.
+
+log(#{level := warning, msg := {Format, Args}}, #{config := #{pid := Pid}}) when
+    is_list(Format), is_list(Args)
+->
+    Text = lists:flatten(io_lib:format(Format, Args)),
+    Pid ! {cuttlefish_warning, Text};
+log(#{}, #{config := #{pid := _}}) ->
+    ok.
 
 %% Walks up from this module's beam and from the current directory looking for
 %% the directory that holds `schema/bondy.schema'. CT runs with its own working
@@ -1001,4 +1116,13 @@ walk_up(Dir, N) ->
                 Dir -> false;
                 Parent -> walk_up(Parent, N - 1)
             end
+    end.
+
+max_tokens_per_user(Config, Lines) ->
+    case render(Config, Lines) of
+        {error, Phase, _} ->
+            {refused, Phase};
+        AppEnv when is_list(AppEnv) ->
+            Router = proplists:get_value(bondy_router, AppEnv, []),
+            {ok, key_value:get([oauth2, max_tokens_per_user], Router)}
     end.

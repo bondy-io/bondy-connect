@@ -192,7 +192,7 @@ Controls the `Server` response header. This can be used to suppress infrastructu
 - Any other value -- emits that value verbatim
 
 `bondy.conf` has no spelling for an empty value: `key =` with nothing after it is
-a syntax error (`bondy_listener_schema_SUITE:an_empty_security_header_value_is_a_syntax_error`).
+a syntax error (`bondy_conf_schema_SUITE:an_empty_security_header_value_is_a_syntax_error`).
 The header can therefore be replaced through `bondy.conf` but not suppressed.
 
 ```
