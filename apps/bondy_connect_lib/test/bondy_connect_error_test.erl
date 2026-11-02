@@ -222,6 +222,13 @@ from_term_accepts_a_known_tag_with_a_message_test() ->
     ?assertEqual(not_found, maps:get(type, E)),
     ?assertEqual(~"No such widget.", maps:get(message, E)).
 
+from_term_maps_a_reserved_name_to_invalid_value_test() ->
+    E = bondy_connect_error:from_term(reserved_name),
+    ?assertEqual(
+        {invalid_value, ~"bondy.error.invalid_value", ~"The name is reserved."},
+        {maps:get(type, E), maps:get(uri, E), maps:get(description, E)}
+    ).
+
 from_exception_keeps_identity_and_adds_the_stacktrace_test() ->
     Stacktrace = [{m, f, 1, []}],
     E = bondy_connect_error:from_exception(

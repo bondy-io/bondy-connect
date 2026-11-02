@@ -47,7 +47,9 @@ all() ->
         recreated_user_inherits_nothing,
         remove_alias_leaves_other_owners_alone,
         alias_removal_survives_a_projection_timeout,
-        user_removal_leaves_names_it_does_not_hold
+        user_removal_leaves_names_it_does_not_hold,
+        user_procedures_answer_a_missing_user_like_update,
+        reserved_names_answer_like_add
     ].
 
 init_per_suite(Config) ->
@@ -958,6 +960,74 @@ user_removal_leaves_names_it_does_not_hold(_) ->
             {Name, owner(bondy_rbac_user:lookup(Uri, Name))}
          || Name <- [Alias, Other]
         ]
+    ).
+
+%% Through `bondy_wamp_api:handle_call/2`, for a username the realm does not
+%% hold. The bondy_docs WAMP API reference names `wamp.error.no_such_principal`
+%% for each of these procedures; `bondy.user.update` is the reference answer.
+user_procedures_answer_a_missing_user_like_update(_) ->
+    R = ~"com.example.test.enable_missing",
+    _ = bondy_realm:create(R),
+    Update = api_reply(?BONDY_USER_UPDATE, [R, ~"nobody", #{}]),
+    ?assertEqual({error, ?WAMP_NO_SUCH_PRINCIPAL}, Update),
+    Calls = [
+        {?BONDY_USER_ENABLE, [R, ~"nobody"]},
+        {?BONDY_USER_DISABLE, [R, ~"nobody"]},
+        {?BONDY_USER_IS_ENABLED, [R, ~"nobody"]},
+        {?BONDY_USER_ADD_ALIAS, [R, ~"nobody", ~"somealias"]},
+        {?BONDY_USER_REMOVE_ALIAS, [R, ~"nobody", ~"somealias"]}
+    ],
+    ?assertEqual(
+        [{P, Update} || {P, _} <- Calls],
+        [{P, api_reply(P, A)} || {P, A} <- Calls]
+    ),
+    ok = add_member(R, ~"somebody", []),
+    Toggled = [
+        {
+            api_reply(P, [R, ~"somebody"]),
+            api_reply(?BONDY_USER_IS_ENABLED, [R, ~"somebody"])
+        }
+     || P <- [?BONDY_USER_DISABLE, ?BONDY_USER_ENABLE]
+    ],
+    ?assertEqual(
+        [
+            {{result, undefined}, {result, [false]}},
+            {{result, undefined}, {result, [true]}}
+        ],
+        Toggled
+    ).
+
+%% A reserved name answers every write the way `bondy.user.add` answers it.
+%% Only `bondy_wamp_api:handle_call/2` runs here, so `add`'s validator raises
+%% and its URI is read from the raised error.
+reserved_names_answer_like_add(_) ->
+    R = ~"com.example.test.reserved_names",
+    _ = bondy_realm:create(R),
+    Add = #{~"username" => ~"all", ~"password" => ~"x1y2z3w4"},
+    {crashed, Raised} = api_reply(?BONDY_USER_ADD, [R, Add]),
+    #{uri := Uri} = bondy_connect_error:from_term(Raised),
+    Calls = [
+        {?BONDY_USER_ADD_ALIAS, [R, ~"anonymous", ~"somealias"]}
+        | [
+            C
+         || N <- [~"anonymous", ~"all"],
+            C <- [
+                {?BONDY_USER_UPDATE, [R, N, #{}]},
+                {?BONDY_USER_DELETE, [R, N]},
+                {?BONDY_USER_ENABLE, [R, N]},
+                {?BONDY_USER_DISABLE, [R, N]},
+                {?BONDY_GROUP_UPDATE, [R, N, #{}]},
+                {?BONDY_GROUP_DELETE, [R, N]},
+                {?BONDY_OAUTH2_CLIENT_UPDATE, [R, N, #{}]},
+                {?BONDY_OAUTH2_CLIENT_DELETE, [R, N]},
+                {?BONDY_OAUTH2_RES_OWNER_UPDATE, [R, N, #{}]},
+                {?BONDY_OAUTH2_RES_OWNER_DELETE, [R, N]}
+            ]
+        ]
+    ],
+    ?assertEqual(
+        [{P, A, {error, Uri}} || {P, A} <- Calls],
+        [{P, A, api_reply(P, A)} || {P, A} <- Calls]
     ).
 
 %% =============================================================================

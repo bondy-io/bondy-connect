@@ -564,6 +564,9 @@ This change is globally replicated.
 
 `Data` cannot carry a `password`: the update returns an `invalid_argument`
 error and changes nothing. Use `change_password/3,4` to set a password.
+
+Returns `{error, reserved_name}` for a reserved name, `anonymous` included
+(`bondy_rbac_user_SUITE:reserved_names_answer_like_add`).
 """.
 -spec update(RealmUri :: uri(), Arg :: username() | t(), Data :: map()) ->
     {ok, NewUser :: t()} | {error, update_error()}.
@@ -602,8 +605,6 @@ update(RealmUri, Username0, Data0, Opts) when is_binary(Username0) ->
     try
         Data = maps_utils:validate(Data0, ?UPDATE_VALIDATOR),
         Username = normalise_username(Username0),
-
-        Username == anonymous andalso throw(not_allowed),
         ok = not_reserved_name_check(Username),
 
         ok = check_credentials_update(Data, Opts),
@@ -616,7 +617,7 @@ update(RealmUri, Username0, Data0, Opts) when is_binary(Username0) ->
             {error, Reason}
     end;
 update(_, anonymous, _, _) ->
-    {error, not_allowed}.
+    {error, reserved_name}.
 
 -doc """
 Removes user `Arg` from `RealmUri`. Equivalent to `remove/3` with default
@@ -1065,6 +1066,9 @@ to_external(#{type := ?USER_TYPE, version := ?VERSION} = User) ->
 -doc """
 Adds an alias to the user. If the user is an SSO user, the alias is
 added on the SSO Realm only.
+
+Returns `{error, {no_such_user, Username}}` when the realm holds no user named
+`Username`, and `{error, reserved_name}` for `anonymous`.
 """.
 -spec add_alias(
     RealmUri :: uri(), User :: t() | username(), Alias :: username()
@@ -1081,7 +1085,12 @@ add_alias(
 add_alias(RealmUri, #{type := ?USER_TYPE} = User, Alias) ->
     do_add_alias(RealmUri, User, Alias);
 add_alias(RealmUri, Username, Alias) ->
-    add_alias(RealmUri, fetch(RealmUri, Username), Alias).
+    case lookup(RealmUri, Username) of
+        {ok, User} ->
+            add_alias(RealmUri, User, Alias);
+        {error, not_found} ->
+            {error, {no_such_user, Username}}
+    end.
 
 -doc """
 Removes `Alias` from `User`, so the name no longer resolves to them and is free
@@ -1091,6 +1100,9 @@ For an SSO-backed user the alias belongs to the SSO realm and is removed there.
 Removing an alias the user does not hold succeeds and changes nothing: a name
 held by another user, as an alias or as a username, stays with that user
 (`bondy_rbac_user_SUITE:remove_alias_leaves_other_owners_alone`).
+
+Returns `{error, {no_such_user, Username}}` when the realm holds no user named
+`Username`.
 """.
 -spec remove_alias(
     RealmUri :: uri(), User :: t() | username(), Alias :: username()
@@ -1107,7 +1119,12 @@ remove_alias(
 remove_alias(RealmUri, #{type := ?USER_TYPE} = User, Alias) ->
     do_remove_alias(RealmUri, User, Alias);
 remove_alias(RealmUri, Username, Alias) ->
-    remove_alias(RealmUri, fetch(RealmUri, Username), Alias).
+    case lookup(RealmUri, Username) of
+        {ok, User} ->
+            remove_alias(RealmUri, User, Alias);
+        {error, not_found} ->
+            {error, {no_such_user, Username}}
+    end.
 
 -doc """
 Adds group named `Groupname` to users `Users` in realm with uri
@@ -2119,7 +2136,7 @@ validate_alias(Alias0) ->
 
 %% @private
 do_add_alias(_, #{username := anonymous}, _) ->
-    {error, not_allowed};
+    {error, reserved_name};
 do_add_alias(RealmUri, User0, Alias0) ->
     try
         Alias = validate_alias(Alias0),
