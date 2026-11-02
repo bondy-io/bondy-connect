@@ -669,10 +669,11 @@ remove(RealmUri, Username0, _Opts) when is_binary(Username0) ->
             end
         ],
         Linked =:= [] orelse throw({in_use, Linked}),
-        Aliases = maps:get(aliases, User, []),
+        ok = lists:foreach(
+            fun(Alias) -> ok = clear_alias(RealmUri, Alias, Username) end,
+            maps:get(aliases, User, [])
+        ),
         Table = table(),
-
-        _ = [bondy_db:apply(Table, RealmUri, Alias, clear) || Alias <- Aliases],
 
         ok = bondy_rbac_source:remove_all(RealmUri, Username),
 
@@ -1087,7 +1088,9 @@ Removes `Alias` from `User`, so the name no longer resolves to them and is free
 for anyone else.
 
 For an SSO-backed user the alias belongs to the SSO realm and is removed there.
-Removing an alias the user does not hold succeeds.
+Removing an alias the user does not hold succeeds and changes nothing: a name
+held by another user, as an alias or as a username, stays with that user
+(`bondy_rbac_user_SUITE:remove_alias_leaves_other_owners_alone`).
 """.
 -spec remove_alias(
     RealmUri :: uri(), User :: t() | username(), Alias :: username()
@@ -2149,15 +2152,13 @@ do_add_alias(RealmUri, User0, Alias0) ->
 do_remove_alias(RealmUri, User0, Alias0) ->
     try
         Alias = validate_alias(Alias0),
-        Table = table(),
+        Username = maps:get(username, User0),
+        ok = clear_alias(RealmUri, Alias, Username),
         Aliases0 = sets:from_list(maps:get(aliases, User0, [])),
         case sets:del_element(Alias, Aliases0) of
             Aliases0 ->
-                %% Delete anyway
-                _ = bondy_db:apply(Table, RealmUri, Alias, clear),
                 ok;
             Aliases ->
-                _ = bondy_db:apply(Table, RealmUri, Alias, clear),
                 User = User0#{aliases => sets:to_list(Aliases)},
                 _ = store(RealmUri, User, #{}),
                 ok
@@ -2165,6 +2166,23 @@ do_remove_alias(RealmUri, User0, Alias0) ->
     catch
         throw:invalid_alias ->
             {error, {invalid_value, alias, Alias0}}
+    end.
+
+%% @private
+%% The cell under `Alias` may be another user's alias or another user's record
+%% (`bondy_rbac_user_SUITE:user_removal_leaves_names_it_does_not_hold`); only
+%% this user's alias is cleared.
+clear_alias(RealmUri, Alias, Username) ->
+    Table = table(),
+    case bondy_db:read(Table, RealmUri, Alias) of
+        {ok, {#{type := ?ALIAS_TYPE, username := Username}, _Hlc}} ->
+            durable_apply(Table, RealmUri, Alias, clear);
+        {ok, {#{type := ?ALIAS_TYPE}, _Hlc}} ->
+            ok;
+        {ok, {#{type := ?USER_TYPE}, _Hlc}} ->
+            ok;
+        {error, not_found} ->
+            ok
     end.
 
 %% @private
