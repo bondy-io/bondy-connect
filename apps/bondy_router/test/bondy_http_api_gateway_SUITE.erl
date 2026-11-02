@@ -615,7 +615,9 @@ unenforced_schemes_answer_unauthorized_test(_) ->
                     }
                 }
             }),
-            Url = <<"http://localhost:18080/", Name/binary, "_scheme/v1.0/thing">>,
+            Url =
+                <<"http://localhost:18080/", Name/binary,
+                    "_scheme/v1.0/thing">>,
             try
                 _ = bondy_http_gateway:rebuild_dispatch_tables(),
                 {Name, http_status(get, Url, [], <<>>)}

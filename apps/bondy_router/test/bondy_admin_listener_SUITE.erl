@@ -990,7 +990,8 @@ longpoll_hello(Realm, Claims) ->
     Ref = monitor(process, Pid),
     Self = self(),
     _ = spawn_link(fun() ->
-        Self ! {hello_reply, bondy_http_transport_session:poll_receive(Pid, 5000)}
+        Self !
+            {hello_reply, bondy_http_transport_session:poll_receive(Pid, 5000)}
     end),
     timer:sleep(100),
     ok = bondy_http_transport_session:handle_client_message(

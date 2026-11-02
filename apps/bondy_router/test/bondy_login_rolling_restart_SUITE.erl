@@ -53,7 +53,11 @@ suite() ->
 
 init_per_testcase(_Case, Config) ->
     Specs = bondy_ct:start_cluster(
-        [{bondy1, ?SHIPPED_ENV}, {bondy2, ?SHIPPED_ENV}, {bondy3, ?SHIPPED_ENV}],
+        [
+            {bondy1, ?SHIPPED_ENV},
+            {bondy2, ?SHIPPED_ENV},
+            {bondy3, ?SHIPPED_ENV}
+        ],
         Config
     ),
     ok = lists:foreach(fun({_, Node, _}) -> push_module(Node) end, Specs),
@@ -85,7 +89,9 @@ logins_survive_a_rolling_restart(Config) ->
         fun(Idx, {SpecsAcc, Acc}) ->
             Spec = lists:nth(Idx, SpecsAcc),
             Others = [S || S <- SpecsAcc, S =/= Spec],
-            New = bondy_ct:restart_node(Spec, Idx, ?SHIPPED_ENV, Config, graceful),
+            New = bondy_ct:restart_node(
+                Spec, Idx, ?SHIPPED_ENV, Config, graceful
+            ),
             ok = push_module(element(2, New)),
             ok = bondy_ct:rejoin(New, Others, 60000),
             SpecsAcc1 = replace(Spec, New, SpecsAcc),
@@ -245,19 +251,21 @@ failures(Round) ->
 %% =============================================================================
 
 do_setup() ->
-    _ = bondy_realm:exists(?REALM) orelse bondy_realm:create(#{
-        uri => ?REALM,
-        description => ~"login across a rolling restart",
-        security_enabled => true,
-        authmethods => [?PASSWORD_AUTH],
-        sources => [
-            #{
-                usernames => ~"all",
-                authmethod => ?PASSWORD_AUTH,
-                cidr => ~"0.0.0.0/0"
-            }
-        ]
-    }),
+    _ =
+        bondy_realm:exists(?REALM) orelse
+            bondy_realm:create(#{
+                uri => ?REALM,
+                description => ~"login across a rolling restart",
+                security_enabled => true,
+                authmethods => [?PASSWORD_AUTH],
+                sources => [
+                    #{
+                        usernames => ~"all",
+                        authmethod => ?PASSWORD_AUTH,
+                        cidr => ~"0.0.0.0/0"
+                    }
+                ]
+            }),
     ok = do_add_user(?USER),
     ok = bondy_http_gateway:load(#{
         ~"id" => ?SPEC_ID,
@@ -306,7 +314,9 @@ do_login() ->
     of
         {ok, Ctxt} ->
             case
-                bondy_auth:authenticate(?PASSWORD_AUTH, ?PASSWORD, undefined, Ctxt)
+                bondy_auth:authenticate(
+                    ?PASSWORD_AUTH, ?PASSWORD, undefined, Ctxt
+                )
             of
                 {ok, _, _} -> ok;
                 {error, Reason} -> {auth_error, Reason}

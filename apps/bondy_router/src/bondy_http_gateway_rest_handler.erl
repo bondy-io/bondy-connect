@@ -461,7 +461,9 @@ is_authorized(_, Req, #{security := Security} = St) ->
 deny_unenforced(Scheme, Req0, St) ->
     Req1 = set_resp_headers(eval_headers(Req0, St), Req0),
     RealmUri = maps:get(realm_uri, St),
-    Req2 = reply_auth_error(authentication_failed, Scheme, RealmUri, json, Req1),
+    Req2 = reply_auth_error(
+        authentication_failed, Scheme, RealmUri, json, Req1
+    ),
     {stop, Req2, St}.
 
 %% @private

@@ -729,8 +729,11 @@ oidc_paths_answer_a_missing_provider_or_realm(_) ->
     NoProvider = Get(Base ++ "/oidc/login"),
     {ok, OidcTicket, _} = issue_ticket(Realm, ~"tom"),
     {ok, LogoutStatus, _, LogoutRef} = hackney:request(
-        get, api_url(Base ++ "/oidc/logout"), cookie_header(Realm, OidcTicket),
-        <<>>, []
+        get,
+        api_url(Base ++ "/oidc/logout"),
+        cookie_header(Realm, OidcTicket),
+        <<>>,
+        []
     ),
     {ok, _} = hackney:body(LogoutRef),
     ?assertEqual(302, LogoutStatus),

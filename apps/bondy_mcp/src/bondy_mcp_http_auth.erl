@@ -20,9 +20,12 @@ orchestration.
 `authenticate/2` returns `#{authid, authroles, is_anonymous}` or THROWS
 `{unauthorized, Reason, Req}` with NOTHING started — no process, no
 stored session, no auth state outlives the throw. The handler turns that
-throw into a `401` with `WWW-Authenticate`.
+throw into a `401` with `WWW-Authenticate`. A proxy-protocol error is not a
+credential failure, so it throws the handler's `{reply, 403, Body, Req}`
+instead, the status every other HTTP surface answers it with.
 """.
 
+-include_lib("kernel/include/logger.hrl").
 -include_lib("bondy_router/include/bondy_security.hrl").
 
 -export([authenticate/2]).
@@ -42,9 +45,13 @@ carries a `sub` claim and a Bondy ticket otherwise, `Basic` is password
 authentication, and an absent header is the anonymous principal — which
 succeeds only where the realm admits `anonymous`.
 
-Throws `{unauthorized, Reason, Req}` on every failure, with nothing started:
-no process, no stored session, and no authentication state outlives the throw.
-The caller turns that into a `401` carrying `WWW-Authenticate`.
+Throws `{unauthorized, Reason, Req}` on every credential failure, with
+nothing started: no process, no stored session, and no authentication state
+outlives the throw. The caller turns that into a `401` carrying
+`WWW-Authenticate`. When the listener's `proxy_protocol` is in strict mode and
+a trusted proxy forwards no client address, it throws
+`{reply, 403, Body, Req}` instead
+(`bondy_mcp_modern_SUITE:sources_see_the_client_behind_a_trusted_proxy`).
 """.
 -spec authenticate(Req :: cowboy_req:req(), RealmUri :: binary()) ->
     #{
@@ -159,5 +166,19 @@ credential(RealmUri, UserId, Method, Credential, SourceIP, Req) ->
 
 %% @private
 source_ip(Req) ->
-    {IP, _} = cowboy_req:peer(Req),
-    IP.
+    ProxyProtocol = bondy_http_proxy_protocol:init(Req),
+    case bondy_http_proxy_protocol:source_ip(ProxyProtocol) of
+        {ok, IP} ->
+            IP;
+        {error, {protocol_error, Reason}} ->
+            ?LOG_INFO(#{
+                description =>
+                    "MCP request refused: the source IP could not be "
+                    "obtained because of a proxy protocol error",
+                reason => Reason
+            }),
+            Body = bondy_json_rpc:error_response(
+                undefined, -32000, <<"Proxy protocol error">>
+            ),
+            throw({reply, 403, Body, Req})
+    end.

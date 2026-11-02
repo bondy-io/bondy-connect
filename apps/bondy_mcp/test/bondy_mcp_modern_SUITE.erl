@@ -86,6 +86,7 @@ all() ->
         server_teardown_sends_completion,
         stream_survives_quiet_hold_at_connection_floor,
         requests_are_rate_limited,
+        sources_see_the_client_behind_a_trusted_proxy,
         server_discover_answers_the_probe,
         origin_policy_is_enforced
     ].
@@ -1855,6 +1856,58 @@ requests_are_rate_limited(Config) ->
     %% config-driven, no depleted bucket outlives the feature.
     {S1, _} = post(Config, ?OPEN_REALM, req(8, <<"tools/list">>, #{})),
     ?assertNotEqual(429, S1).
+
+%% The listener trusts 127.0.0.1, the test client's address, as a proxy.
+%% `?USER` is admitted only from 10.9.9.9 and `?USER2` only from 127.0.0.1;
+%% strict mode refuses `?USER2` when the proxy supplies no client address.
+sources_see_the_client_behind_a_trusted_proxy(Config) ->
+    Realm = <<"com.bondy.mcp.mod.proxied">>,
+    _ = bondy_realm:create(#{
+        uri => Realm,
+        authmethods => [?PASSWORD_AUTH],
+        security_enabled => true,
+        users => [
+            #{username => U, password => ?PASSWORD}
+         || U <- [?USER, ?USER2]
+        ],
+        sources => [
+            #{
+                usernames => [?USER],
+                authmethod => ?PASSWORD_AUTH,
+                cidr => <<"10.9.9.9/32">>
+            },
+            #{
+                usernames => [?USER2],
+                authmethod => ?PASSWORD_AUTH,
+                cidr => <<"127.0.0.1/32">>
+            }
+        ]
+    }),
+    Body = req(1, <<"tools/list">>, #{}),
+    Direct = fun(U) ->
+        H = std_headers(Body, #{auth => basic_auth(U, ?PASSWORD)}),
+        element(1, raw_post(Config, Realm, H, Body))
+    end,
+    Proxied = fun(U) ->
+        H = std_headers(Body, #{auth => basic_auth(U, ?PASSWORD)}),
+        element(
+            1,
+            raw_post(Config, Realm, [{"x-forwarded-for", "10.9.9.9"} | H], Body)
+        )
+    end,
+    Key = [?LISTENER, proxy_protocol],
+    Trusted = [{enabled, true}, {trusted_proxies, "127.0.0.1/32"}],
+    try
+        ?assertEqual({401, 200}, {Direct(?USER), Direct(?USER2)}),
+        ok = bondy_config:set(Key, Trusted),
+        ?assertEqual(
+            {200, 401, 200}, {Proxied(?USER), Direct(?USER), Direct(?USER2)}
+        ),
+        ok = bondy_config:set(Key, [{mode, strict} | Trusted]),
+        ?assertEqual({200, 403}, {Proxied(?USER), Direct(?USER2)})
+    after
+        ok = bondy_config:set(Key, [])
+    end.
 
 server_discover_answers_the_probe(Config) ->
     %% The official 2026-era client's negotiation probe in its wire

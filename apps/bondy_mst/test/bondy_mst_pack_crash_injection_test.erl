@@ -133,11 +133,11 @@ kill_at_each_seal_boundary() ->
      || Mode <- [sync, async],
         {Mod, Fun, Arity} <-
             [{bondy_mst_pack_manifest, write, 2}] ++
-            [
-                {bondy_mst_pack_seal, F, A}
-             || {F, A} <- bondy_mst_pack_seal:module_info(exports),
-                F =/= module_info
-            ],
+                [
+                    {bondy_mst_pack_seal, F, A}
+                 || {F, A} <- bondy_mst_pack_seal:module_info(exports),
+                    F =/= module_info
+                ],
         When <- [before, 'after']
     ],
     Outcomes = [{Point, kill_at(Point)} || Point <- Points],
@@ -149,9 +149,10 @@ kill_at_each_seal_boundary() ->
     [
         ?assertEqual(
             {Mode, When, killed},
-            {Mode, When, proplists:get_value(
-                {Mode, bondy_mst_pack_manifest, write, 2, When}, Outcomes
-            )}
+            {Mode, When,
+                proplists:get_value(
+                    {Mode, bondy_mst_pack_manifest, write, 2, When}, Outcomes
+                )}
         )
      || Mode <- [sync, async], When <- [before, 'after']
     ].
@@ -221,7 +222,9 @@ sealed_acks(Acc) ->
     end.
 
 pack_file(Dir, Id, Ext) ->
-    filename:join(Dir, lists:flatten(io_lib:format("pack-~4..0B~s", [Id, Ext]))).
+    filename:join(
+        Dir, lists:flatten(io_lib:format("pack-~4..0B~s", [Id, Ext]))
+    ).
 
 %% =============================================================================
 %% Peer-side entry
@@ -261,12 +264,16 @@ put_and_seal(Parent, Mode, N, Store0) ->
         Pages
     ),
     {PackId, Store2} = peer_seal(Mode, Store1),
-    Parent ! {pack_sealed, PackId, [bondy_mst_page:hash(P, sha256) || P <- Pages]},
+    Parent !
+        {pack_sealed, PackId, [bondy_mst_page:hash(P, sha256) || P <- Pages]},
     Store2.
 
-killing(2, When) -> fun(A, B) -> kill_around(When, [A, B]) end;
-killing(3, When) -> fun(A, B, C) -> kill_around(When, [A, B, C]) end;
-killing(4, When) -> fun(A, B, C, D) -> kill_around(When, [A, B, C, D]) end;
+killing(2, When) ->
+    fun(A, B) -> kill_around(When, [A, B]) end;
+killing(3, When) ->
+    fun(A, B, C) -> kill_around(When, [A, B, C]) end;
+killing(4, When) ->
+    fun(A, B, C, D) -> kill_around(When, [A, B, C, D]) end;
 killing(6, When) ->
     fun(A, B, C, D, E, F) -> kill_around(When, [A, B, C, D, E, F]) end.
 
@@ -289,7 +296,6 @@ peer_seal(async, Store0) ->
     ok = bondy_mst_pack_store:run_seal_job(Job),
     {ok, Store} = bondy_mst_pack_store:complete_seal(Store1, PackId),
     {PackId, Store}.
-
 
 %% Runs on the peer node. Opens the store with the manifest debounce
 %% effectively disabled, appends synced pages, stages a new root, and

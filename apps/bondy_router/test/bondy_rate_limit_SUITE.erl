@@ -24,6 +24,7 @@ all() ->
     [
         realm_budgets_enforce_in_order,
         parked_realm_class_is_inert,
+        http_throttle_resolves_the_source_ip_only_when_a_scope_is_on,
         update_clears_realm_budgets,
         session_chain_shares_the_realm_total,
         session_private_buckets_are_unregistered,
@@ -115,6 +116,28 @@ parked_realm_class_is_inert(_) ->
     ?assertEqual(ok, bondy_rate_limit:do_throttle(http, K, Dims)),
     ?assertEqual(ok, bondy_rate_limit:do_throttle(http, K, Dims)),
     ?assertEqual(ok, bondy_rate_limit:do_throttle(http, K, Dims)).
+
+%% A request without `peer` raises while its source IP is resolved, so the
+%% first assertion fails if the source IP is resolved while no scope
+%% the dimensions name configures `http`.
+http_throttle_resolves_the_source_ip_only_when_a_scope_is_on(_) ->
+    Uri = gen_uri(),
+    _ = bondy_realm:create(#{
+        uri => Uri,
+        rate_limit => #{http => #{per_caller => #{rate => 1, capacity => 1}}}
+    }),
+    NoPeer = #{ref => bondy_rate_limit_SUITE_listener},
+    ?assertEqual(ok, bondy_http_utils:throttle(http, NoPeer, #{})),
+    Req = NoPeer#{peer => {{10, 0, 0, 1}, 4000}},
+    Dims = #{realm => Uri},
+    ?assertEqual(ok, bondy_http_utils:throttle(http, Req, Dims)),
+    ?assertEqual(throttled, bondy_http_utils:throttle(http, Req, Dims)),
+    ?assertEqual(
+        ok,
+        bondy_http_utils:throttle(
+            http, Req#{peer => {{10, 0, 0, 2}, 4000}}, Dims
+        )
+    ).
 
 %% Updating `rate_limit` to `undefined` clears the property: a caller
 %% the old budget already refused is admitted again, because the chain
