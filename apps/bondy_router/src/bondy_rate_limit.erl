@@ -35,7 +35,7 @@ Each class (`handshake`, `auth`, `connection`, `http`, `message`) has
 its own buckets keyed by the caller-supplied dimension (a source IP, or
 a session id for `message`). `http` is per-source-IP HTTP request
 admission — the API Gateway and admin API resources (via the
-`cowboy_rest` `rate_limited` hook) and the MCP endpoints; requests, not
+`bondy_http_admission` middleware) and the MCP endpoints; requests, not
 connections, so it is a separate class from `connection`. Config `rate`
 is tokens/SECOND (operator-friendly); the bucket wants
 tokens/millisecond.

@@ -117,7 +117,6 @@ The status is derived from the error's URI by
 -export([options/2]).
 -export([previously_existed/2]).
 -export([provide/2]).
--export([rate_limited/2]).
 -export([resource_exists/2]).
 -export([to_json/2]).
 -export([to_msgpack/2]).
@@ -145,16 +144,6 @@ query params, bindings) and stores it in the handler state alongside
 the parsed API spec received from the dispatch table.
 """.
 init(Req, St0) ->
-    %% Expose the route template to the cowboy metrics stream handler so
-    %% the per-request HTTP metrics carry a bounded-cardinality `route`
-    %% label (raw paths are unbounded).
-    ok = cowboy_req:cast(
-        {set_options, #{
-            metrics_user_data => #{route => maps:get(route, St0, undefined)}
-        }},
-        Req
-    ),
-
     %% TODO Set session will now be required by bondy_auth:init
 
     %% TODO
@@ -306,20 +295,6 @@ forbidden(Req, St) ->
 expires(Req, St) ->
     %% TODO add feature to spec
     {false, Req, St}.
-
--doc """
-`cowboy_rest` rate-limiting hook: consumes one `http`-class token for the
-request's source IP (`security.rate_limit`, off by default) — the same
-inbound throttle the WS and raw-socket handlers apply per connection,
-applied here per request. Throttled requests answer `429` with a
-`retry-after` of one second, the class's refill granularity.
-""".
-rate_limited(Req, St) ->
-    Dims = #{realm => maps:get(realm_uri, St, undefined)},
-    case bondy_http_utils:throttle(http, Req, Dims) of
-        ok -> {false, Req, St};
-        throttled -> {{true, 1}, Req, St}
-    end.
 
 -doc """
 Determines whether the resource exists.

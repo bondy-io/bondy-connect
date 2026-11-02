@@ -57,6 +57,7 @@
 -define(ADMIN_API_PATH, "/realms").
 %% An administrator the Admin API cases authenticate as, and a realm holding a
 %% user of the same name, whose tokens the master realm must refuse.
+-define(LOOPBACK, {127, 0, 0, 1}).
 -define(OPERATOR, ~"adminsplit-operator").
 -define(OPERATOR_PASS, ~"adminsplit-Passw0rd").
 -define(FOREIGN_REALM, ~"com.example.adminsplit.foreign").
@@ -74,6 +75,7 @@ all() ->
         realm_scope_http_budget_is_enforced,
         oauth2_draws_from_the_auth_class,
         refused_requests_draw_from_the_budget,
+        throttled_requests_keep_their_route_label,
         the_ready_probe_follows_a_blocking_alarm,
         registry_routes_read_the_named_realm,
         admin_local_is_not_locked_out_by_rbac,
@@ -219,14 +221,11 @@ admin_local_socket_is_bound_and_serves(_Config) ->
     %% a node whose every TCP listener failed to bind is still administrable.
     assert_routed(uds_get(Path, ?ADMIN_API_PATH)).
 
-%% The gateway REST handler's `rate_limited` hook draws from the `http`
-%% class per source IP. Enabling ONLY that class both trips it and PINS
-%% it — a hook drawing from any other class would never see a 429 here.
-%% Statuses are not asserted before exhaustion: the `{http, 127.0.0.1}`
-%% bucket is shared with any other suite in a run, so only "rapid
-%% requests trip 429" and "off means served" are contract. Cowboy calls
-%% `rate_limited` after `is_authorized`, so this case and the next two
-%% authenticate: a request without a token is refused before any budget.
+%% Gateway routes draw from the `http` class per source IP. Enabling ONLY
+%% that class both trips it and PINS it: a route drawing from any other class
+%% would never see a 429 here. Statuses are not asserted before exhaustion:
+%% the `{http, 127.0.0.1}` bucket is shared with any other suite in a run, so
+%% only "rapid requests trip 429" and "off means served" are contract.
 http_requests_are_rate_limited(_) ->
     {ok, Before, _, _} = get_path(?ADMIN, ?ADMIN_API_PATH, operator_token()),
     ?assertNotEqual(429, Before),
@@ -305,48 +304,28 @@ realm_scope_http_budget_is_enforced(_) ->
     {ok, After, _, _} = get_path(?ADMIN, ?ADMIN_API_PATH, operator_token()),
     ?assertNotEqual(429, After).
 
-%% The OAuth2 endpoints draw from the `auth` class — the shared per-IP
-%% credential-guessing budget WAMP AUTHENTICATE consumes — while the
-%% gateway hook does NOT: with only `auth` enabled, the OAuth2 callback
-%% throttles and the gateway callback stays open. A distinct loopback
-%% peer keys buckets no other suite touches.
+%% The OAuth2 endpoints draw from the `auth` class, the per-IP
+%% credential-guessing budget WAMP AUTHENTICATE also consumes, and gateway
+%% routes do not. With only `auth` enabled the Admin API is never throttled;
+%% with only `http` enabled `/oauth/token` is never throttled. The positive
+%% sides are in `refused_requests_draw_from_the_budget`.
 oauth2_draws_from_the_auth_class(_) ->
-    Req = #{ref => ?ADMIN, peer => {{127, 0, 0, 88}, 5000}, headers => #{}},
-    %% The handler state is built by the handler itself — its
-    %% `rate_limited` reads the realm dimension from it, so a hand-rolled
-    %% stand-in would not exercise the real seat.
-    {cowboy_rest, _, OauthSt} = bondy_oauth2_rest_handler:init(Req, #{
-        realm_uri => <<"com.leapsight.bondy">>,
-        token_path => <<"/token">>,
-        revoke_path => <<"/revoke">>
-    }),
-    ok = bondy_config:set([security, rate_limit], #{
-        enabled => true,
-        auth => #{rate => 1, capacity => 1}
-    }),
-    try
-        ?assertMatch(
-            {false, _, _},
-            bondy_oauth2_rest_handler:rate_limited(Req, OauthSt)
-        ),
-        ?assertMatch(
-            {{true, _}, _, _},
-            bondy_oauth2_rest_handler:rate_limited(Req, OauthSt)
-        ),
-        ?assertMatch(
-            {false, _, _},
-            bondy_http_gateway_rest_handler:rate_limited(Req, #{})
-        )
-    after
-        ok = bondy_config:set([security, rate_limit], undefined)
-    end.
+    Gateway = burst(auth, fun() ->
+        get_path(?ADMIN, ?ADMIN_API_PATH, operator_token())
+    end),
+    Oauth2 = burst(http, fun() -> bad_client_token_request() end),
+    ?assertEqual(
+        {false, false},
+        {lists:member(429, Gateway), lists:member(429, Oauth2)},
+        {Gateway, Oauth2}
+    ).
 
 %% Requests that authentication refuses must still spend the budget, or a flood
 %% of missing or bad credentials is never throttled. A 429 among statuses that
 %% are otherwise 401 shows the throttle saw a refused request.
 refused_requests_draw_from_the_budget(_) ->
     Observed = [
-        {Kind, refused_burst(Class, Request)}
+        {Kind, burst(Class, Request)}
      || {Kind, Class, Request} <- [
             {no_token, http, fun() -> get_path(?ADMIN, ?ADMIN_API_PATH) end},
             {bad_token, http, fun() ->
@@ -360,6 +339,40 @@ refused_requests_draw_from_the_budget(_) ->
         [{Kind, lists:member(429, Statuses)} || {Kind, Statuses} <- Observed],
         Observed
     ).
+
+%% A request the rate limit refuses is reported under the same `route` metrics
+%% label as one it serves.
+throttled_requests_keep_their_route_label(_) ->
+    Self = self(),
+    Id = {?MODULE, route_label},
+    ok = telemetry:attach(
+        Id,
+        [bondy, http, request],
+        fun(_, _, #{req := #{path := Path}} = M, _) ->
+            Path =:= ~"/realms" andalso
+                (Self !
+                    {route_label, maps:get(resp_status, M),
+                        maps:get(route, maps:get(user_data, M), undefined)})
+        end,
+        undefined
+    ),
+    try
+        Statuses = burst(http, fun() ->
+            get_path(?ADMIN, ?ADMIN_API_PATH, operator_token())
+        end),
+        Labels = [
+            receive
+                {route_label, Status, Route} -> {Status, Route}
+            after 5000 -> {Status, timeout}
+            end
+         || Status <- Statuses
+        ],
+        Routes = lists:usort([R || {_, R} <- Labels]),
+        ?assert(lists:member(429, Statuses), Labels),
+        ?assertMatch([R] when is_binary(R), Routes, Labels)
+    after
+        ok = telemetry:detach(Id)
+    end.
 
 %% =============================================================================
 %% HELPERS
@@ -1249,8 +1262,16 @@ uds_get(Path, Target) ->
     Status.
 
 %% Six rapid requests with only `Class` enabled at one token a second and a
-%% capacity of two; returns their statuses.
-refused_burst(Class, Request) ->
+%% capacity of two; returns their statuses. A bucket keeps the limits it was
+%% created with (`bondy_rate_limiter:allow/3`), so the node-scope buckets of
+%% this source IP are forgotten first and every burst starts from its own.
+burst(Class, Request) ->
+    ok = lists:foreach(
+        fun(C) ->
+            ok = bondy_rate_limiter:forget({bondy_rate_limit, C, ?LOOPBACK})
+        end,
+        [http, auth]
+    ),
     ok = bondy_config:set([security, rate_limit], #{
         enabled => true,
         Class => #{rate => 1, capacity => 2}
@@ -1273,7 +1294,10 @@ bad_client_token_request() ->
         url(?ADMIN, "/oauth/token"),
         [
             {~"content-type", ~"application/x-www-form-urlencoded"},
-            {~"authorization", <<"Basic ", (base64:encode(~"nobody:wrong"))/binary>>}
+            {
+                ~"authorization",
+                <<"Basic ", (base64:encode(~"nobody:wrong"))/binary>>
+            }
         ],
         ~"grant_type=client_credentials",
         []

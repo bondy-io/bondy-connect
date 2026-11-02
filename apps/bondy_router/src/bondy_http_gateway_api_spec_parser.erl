@@ -1727,6 +1727,7 @@ dispatch_table_path(
         realm_uri => Realm,
         deprecated => Deprecated,
         security => Sec,
+        rate_limit_class => http,
         languages => Languages,
         %% The route TEMPLATE (bounded cardinality), used as the `route`
         %% label of the per-request HTTP metrics.
@@ -1760,6 +1761,7 @@ security_scheme_rules(
 
     St = #{
         realm_uri => Realm,
+        rate_limit_class => auth,
         token_path => Token,
         revoke_path => Revoke
     },
