@@ -86,6 +86,7 @@ groups() ->
             oidc_login_requires_the_realm_to_admit_oidcrp,
             malformed_credentials_never_500,
             deleted_realm_never_500,
+            oidc_paths_answer_a_missing_provider_or_realm,
             post_is_not_allowed
         ]},
         {sso, [], [
@@ -703,6 +704,56 @@ deleted_realm_never_500(_) ->
         ]
     ],
     ?assertEqual([401, 401, 401], Statuses).
+
+oidc_paths_answer_a_missing_provider_or_realm(_) ->
+    Realm = ~"com.example.verify.gone",
+    Base = "/vgone/v1.0",
+    ok = carrier_realm(Realm, [?OIDCRP_AUTH], list_to_binary(Base)),
+    ok = await_route(Base ++ "/oidc/verify", 50),
+    StateToken = bondy_router_utils:uuid(),
+    ok = bondy_oidc_state:new(
+        StateToken,
+        ~"nonce",
+        ~"verifier",
+        ?PROVIDER,
+        Realm,
+        ~"http://127.0.0.1/app",
+        ~"web",
+        ~"device"
+    ),
+    Get = fun(P) ->
+        {ok, Status, _, Ref} = hackney:request(get, api_url(P), [], <<>>, []),
+        {ok, Body} = hackney:body(Ref),
+        {Status, Body}
+    end,
+    NoProvider = Get(Base ++ "/oidc/login"),
+    {ok, OidcTicket, _} = issue_ticket(Realm, ~"tom"),
+    {ok, LogoutStatus, _, LogoutRef} = hackney:request(
+        get, api_url(Base ++ "/oidc/logout"), cookie_header(Realm, OidcTicket),
+        <<>>, []
+    ),
+    {ok, _} = hackney:body(LogoutRef),
+    ?assertEqual(302, LogoutStatus),
+    ok = bondy_realm:delete(Realm, #{force => true}),
+    Paths = [
+        Base ++ "/oidc/login",
+        Base ++ "/oidc/" ++ binary_to_list(?PROVIDER) ++
+            "/callback?code=c&state=" ++ binary_to_list(StateToken)
+    ],
+    Replies = [NoProvider | [Get(P) || P <- Paths]],
+    ?assertEqual([404, 404, 404], [S || {S, _} <- Replies], Replies),
+    ?assertEqual(
+        [
+            {~"unknown_provider", ~"bondy.error.unknown_provider"},
+            {~"no_such_realm", ~"wamp.error.no_such_realm"},
+            {~"no_such_realm", ~"wamp.error.no_such_realm"}
+        ],
+        [
+            {E, U}
+         || {_, B} <- Replies,
+            #{~"error" := E, ~"uri" := U} <- [json:decode(B)]
+        ]
+    ).
 
 post_is_not_allowed(_) ->
     {ok, Status, _, _} = hackney:request(

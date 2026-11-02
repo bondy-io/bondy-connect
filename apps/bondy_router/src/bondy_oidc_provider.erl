@@ -129,12 +129,12 @@ Looks up provider configuration from the realm.
 get_provider_config(RealmUri, ProviderName) when
     is_binary(RealmUri) andalso is_binary(ProviderName)
 ->
-    try
-        Realm = bondy_realm:fetch(RealmUri),
-        bondy_realm:get_oidc_provider(Realm, ProviderName)
+    try bondy_realm:fetch(RealmUri) of
+        Realm ->
+            bondy_realm:get_oidc_provider(Realm, ProviderName)
     catch
-        error:{no_such_realm, _} = Reason ->
-            {error, Reason}
+        error:{not_found, RealmUri} ->
+            {error, {no_such_realm, RealmUri}}
     end.
 
 -doc """

@@ -52,7 +52,8 @@ all() ->
         prototype_sso_switch_is_refused_while_a_member_has_linked_users,
         sso_switch_cannot_hand_a_user_another_identity,
         delete_api_reports_a_refusal_as_a_conflict,
-        oidc_provider_worker_follows_the_realm
+        oidc_provider_worker_follows_the_realm,
+        oidc_provider_answers_a_missing_realm_or_provider
     ].
 
 init_per_suite(Config) ->
@@ -789,6 +790,25 @@ oidc_provider_worker_follows_the_realm(_) ->
     after
         ok = meck:unload(oidcc_provider_configuration)
     end.
+
+oidc_provider_answers_a_missing_realm_or_provider(_) ->
+    Uri = gen_uri(),
+    Provider = ~"idp",
+    Missing = {error, {no_such_realm, Uri}},
+    Plain = gen_uri(),
+    _ = bondy_realm:create(Plain),
+    ?assertEqual(
+        {Missing, Missing, Missing, {error, not_found}, {error, not_found}},
+        {
+            bondy_oidc_provider:get_provider_config(Uri, Provider),
+            bondy_oidc_provider:get_client_context(Uri, Provider),
+            bondy_oidc_provider:get_refresh_jwks_fun(Uri, Provider),
+            bondy_oidc_provider:get_provider_config(
+                ?CONTROL_REALM_URI, Provider
+            ),
+            bondy_oidc_provider:get_provider_config(Plain, Provider)
+        }
+    ).
 
 oidc_realm(Uri, Provider, Issuer) ->
     #{

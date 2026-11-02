@@ -1521,10 +1521,10 @@ rate_limit(Uri) when is_binary(Uri) ->
 Returns the OIDC providers configuration map for the given realm.
 Returns an empty map if no providers are configured.
 """.
--spec oidc_providers(Realm :: t() | uri()) -> [map()].
+-spec oidc_providers(Realm :: t() | uri()) -> #{binary() => map()}.
 
 oidc_providers(#realm{info = Info}) ->
-    maps:get(oidc_providers, Info, []);
+    maps:get(oidc_providers, Info, #{});
 oidc_providers(Uri) when is_binary(Uri) ->
     oidc_providers(fetch(Uri)).
 
