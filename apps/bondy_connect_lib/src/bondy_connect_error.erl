@@ -701,6 +701,8 @@ convert({no_such_realm, Uri}) ->
     new(no_such_realm, #{details => #{realm_uri => Uri}});
 convert({no_such_user, Authid}) ->
     new(no_such_user, #{details => #{authid => Authid}});
+convert(reserved_name) ->
+    new(invalid_value, #{description => ~"The name is reserved."});
 convert({badarg, {decoding, Format}}) ->
     new(invalid_data, #{details => #{format => Format}});
 convert({badarg, {body_max_bytes_exceeded, Max}}) ->

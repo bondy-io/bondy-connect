@@ -48,7 +48,7 @@ producer's raise site from its compiled abstract code and fails if a declared
 key is not among the literal keys of the `details` map passed there. It checks
 that direction only: a producer may carry more than it declares.
 
-**Ten of the fourteen entries declare keys and four declare `[]`**, so the
+**Eleven of the fifteen entries declare keys and four declare `[]`**, so the
 check runs over most of the table but not all of it. Some of the four are
 correct as they stand — `bondy_mcp_name_collision` carries its realm and name
 in the ID, and says so at its entry — but the rest are producers that pass no
@@ -83,13 +83,13 @@ Bondy Lang one points the opposite way: these references are pulled, not
 pushed. `bondy_task_catalogue` already used `observe_with` for the same kind of
 thing, so the rename removes a synonym rather than adding a word.
 
-**Twelve of the fourteen entries have no task at all, and that is the finding
+**Thirteen of the fifteen entries have no task at all, and that is the finding
 rather than an omission.** Only the mail relay and the MCP collision have a
 sanctioned remediation in the WAMP API; nothing in `bondy.*` fixes a stalled
 drain, an unopenable main DB, an unwritable retirement set, an oversized sync
 item, a retention ceiling, a frontier hole, a receipt-derived frontier, a
-shard instance that will not start or an undeclared table a peer replicates
-into. An empty list is the answer an agent
+shard instance that will not start, an undeclared table a peer replicates
+into or a closed authentication fence. An empty list is the answer an agent
 needs — it stops looking rather than improvising.
 
 The join KEY is `bondy_alarm_api`'s `catalogue_id`, stamped on every rendered
@@ -358,6 +358,28 @@ list() ->
             observe_with => [],
             tasks => [],
             config_keys => [<<"db.frontier.hole_alarm">>]
+        },
+        %% Raised by `bondy_aae_reactor`. Not readiness-affecting: the fence is
+        %% closed at every boot, so it would stop a StatefulSet starting the
+        %% peer it needs, and hide the S005 that names the cause.
+        #{
+            id_pattern => bondy_auth_fence_closed,
+            severity => critical,
+            class => node,
+            affects_ready => false,
+            summary =>
+                <<
+                    "The node has refused every new authentication for longer "
+                    "than the alarm threshold"
+                >>,
+            detail_keys => [namespaces, threshold_ms],
+            observe_with => [],
+            tasks => [],
+            config_keys => [
+                <<"db.aae.fence.alarm">>,
+                <<"db.aae.fence.max_lag">>,
+                <<"db.aae.fence.on_isolation">>
+            ]
         },
         %% Raised by `bondy_oplog_instance`, once at
         %% instance start. Not readiness-affecting: the node serves correctly

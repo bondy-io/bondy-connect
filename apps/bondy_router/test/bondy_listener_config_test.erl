@@ -741,7 +741,7 @@ carrier_key_set_nowhere_gets_the_code_default_test() ->
     %% Equality with the whole table, not a spot check: the failure this is for
     %% is a key missing from one side, and asserting a handful of keys would
     %% miss it. That the table holds the values the schema renders is asserted
-    %% where cuttlefish is available, in `bondy_listener_schema_SUITE'.
+    %% where cuttlefish is available, in `bondy_conf_schema_SUITE'.
     Inventory = [
         {pub, #{
             transport => tcp, protocol => http, port => 1, services => [wamp_ws]
@@ -1580,7 +1580,7 @@ an_explicit_undefined_hsts_still_disables_it_test() ->
     %% `Header/1` renders as the `undefined` used here. NOT
     %% `security_headers.hsts =` with nothing after it, which is a cuttlefish
     %% CONF SYNTAX ERROR (`an_empty_security_header_value_is_a_syntax_error`
-    %% in `bondy_listener_schema_SUITE`).
+    %% in `bondy_conf_schema_SUITE`).
     Spec = #{
         transport => tls,
         protocol => http,

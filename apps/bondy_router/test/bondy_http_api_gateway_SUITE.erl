@@ -6,6 +6,8 @@
 -module(bondy_http_api_gateway_SUITE).
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+
+-define(COOKIE, ~"cookie").
 -compile([nowarn_export_all, export_all]).
 
 all() ->
@@ -552,20 +554,310 @@ invalid_json_body_is_a_bad_request_test(_) ->
     end.
 
 http_status(Method, Url, Body) ->
-    http_status(Method, Url, Body, 50).
+    http_status(Method, Url, [], Body).
+
+http_status(Method, Url, Headers, Body) ->
+    http_status(Method, Url, Headers, Body, 50).
 
 %% Dispatch table rebuilds are debounced, so the route answers 404 until it is
 %% mounted; a 404 never reaches the action.
-http_status(_, _, _, 0) ->
+http_status(_, _, _, _, 0) ->
     ct:fail(route_not_mounted);
-http_status(Method, Url, Body, N) ->
-    Headers = [{<<"content-type">>, <<"application/json">>}],
+http_status(Method, Url, Headers0, Body, N) ->
+    Headers = [{<<"content-type">>, <<"application/json">>} | Headers0],
     {ok, Status, _, Ref} = hackney:request(Method, Url, Headers, Body, []),
     {ok, _} = hackney:body(Ref),
     case Status of
         404 ->
             timer:sleep(100),
-            http_status(Method, Url, Body, N - 1);
+            http_status(Method, Url, Headers0, Body, N - 1);
         _ ->
             Status
     end.
+
+%% A route whose scheme the gateway does not enforce at runtime, `basic` or
+%% `api_key`, refuses every request with 401, whatever credential it carries.
+unenforced_schemes_answer_unauthorized_test(_) ->
+    Realm = ~"com.example.test.unenforced_schemes",
+    _ = bondy_realm:create(#{uri => Realm, security_enabled => true}),
+    Schemes = [
+        {~"basic", #{<<"type">> => <<"basic">>}},
+        {~"api_key", #{
+            <<"type">> => <<"api_key">>, <<"header_name">> => <<"x-api-key">>
+        }}
+    ],
+    Statuses = [
+        begin
+            Api = <<"com.example.test.unenforced_schemes.", Name/binary>>,
+            ok = bondy_http_gateway:load(#{
+                <<"id">> => Api,
+                <<"name">> => Api,
+                <<"host">> => <<"_">>,
+                <<"realm_uri">> => Realm,
+                <<"defaults">> => #{
+                    <<"security">> => Security,
+                    <<"schemes">> => [<<"http">>]
+                },
+                <<"versions">> => #{
+                    <<"1.0.0">> => #{
+                        <<"base_path">> => <<"/", Name/binary, "_scheme/v1.0">>,
+                        <<"paths">> => #{
+                            <<"/thing">> => #{
+                                <<"get">> => #{
+                                    <<"action">> => call_action(#{}),
+                                    <<"response">> => #{
+                                        <<"on_error">> => #{},
+                                        <<"on_result">> => #{}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            Url =
+                <<"http://localhost:18080/", Name/binary,
+                    "_scheme/v1.0/thing">>,
+            try
+                _ = bondy_http_gateway:rebuild_dispatch_tables(),
+                {Name, http_status(get, Url, [], <<>>)}
+            after
+                bondy_http_gateway:delete(Api)
+            end
+        end
+     || {Name, Security} <- Schemes
+    ],
+    ?assertEqual([{~"basic", 401}, {~"api_key", 401}], Statuses).
+
+%% A ticket in the cookie of an `oidc` route needs `cookie` and its own
+%% method. A ticket from `bondy.ticket.issue` is refused until a source allows
+%% `ticket`. The two tickets name different users: a user's second ticket in a
+%% realm replaces the first.
+oidc_scheme_checks_a_wamp_ticket_cookie_under_ticket_test(_) ->
+    Realm = ~"com.example.test.oidc_cookie_kind",
+    Api = ~"com.example.test.oidc_cookie_kind.api",
+    Proc = ~"com.example.test.oidc_cookie_kind.thing",
+    User = ~"frank@example.com",
+    OidcUser = ~"oidc-frank@example.com",
+    _ = bondy_realm:create(#{
+        uri => Realm,
+        authmethods => [?COOKIE, ~"oidcrp", ~"ticket", ~"wampcra"],
+        security_enabled => true,
+        sources => [
+            #{
+                usernames => ~"all",
+                authmethod => ?COOKIE,
+                cidr => ~"127.0.0.0/8",
+                meta => #{}
+            }
+        ],
+        users => [#{username => User, password => ~"frank-secret"}],
+        grants => [
+            #{
+                permissions => [~"bondy.issue", ~"wamp.call"],
+                uri => ~"",
+                match => ~"prefix",
+                roles => ~"all"
+            }
+        ]
+    }),
+    {ok, _} = bondy_dealer:register(
+        Proc, #{}, Realm, bondy_ref:new(internal, {?MODULE, on_call})
+    ),
+    ok = bondy_http_gateway:load(#{
+        <<"id">> => Api,
+        <<"name">> => Api,
+        <<"host">> => <<"_">>,
+        <<"realm_uri">> => Realm,
+        <<"defaults">> => #{
+            <<"security">> => #{
+                <<"type">> => <<"oidc">>, <<"provider">> => <<"idp">>
+            },
+            <<"schemes">> => [<<"http">>]
+        },
+        <<"versions">> => #{
+            <<"1.0.0">> => #{
+                <<"base_path">> => <<"/oidc_cookie_kind/v1.0">>,
+                <<"paths">> => #{
+                    <<"/thing">> => #{
+                        <<"get">> => #{
+                            <<"action">> => #{
+                                <<"type">> => <<"wamp_call">>,
+                                <<"procedure">> => Proc
+                            },
+                            <<"response">> => #{
+                                <<"on_error">> => #{},
+                                <<"on_result">> => #{<<"status_code">> => 200}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }),
+    {ok, OidcTicket, _} = bondy_oidc_ticket:issue(
+        Realm, OidcUser, ~"idp", #{}, #{authroles => []}
+    ),
+    Session = bondy_session:new(Realm, #{
+        peer => {{127, 0, 0, 1}, 0},
+        authrealm => Realm,
+        authid => User,
+        authmethod => ~"wampcra",
+        security_enabled => true,
+        authroles => [],
+        roles => #{caller => #{}}
+    }),
+    true = ets:insert(
+        bondy_session:table(bondy_session:external_id(Session)), Session
+    ),
+    {ok, WampTicket, #{authmethod := ~"wampcra"}} = bondy_ticket:issue(
+        Session, #{}
+    ),
+    Cookie = fun(Ticket) ->
+        {<<"cookie">>,
+            iolist_to_binary([
+                bondy_http_utils:ticket_cookie_name(Realm), "=", Ticket
+            ])}
+    end,
+    Url = <<"http://localhost:18080/oidc_cookie_kind/v1.0/thing">>,
+    Statuses = fun() ->
+        {
+            http_status(get, Url, [Cookie(OidcTicket)], <<>>),
+            http_status(get, Url, [Cookie(WampTicket)], <<>>)
+        }
+    end,
+    try
+        _ = bondy_http_gateway:rebuild_dispatch_tables(),
+        Before = Statuses(),
+        {ok, _} = bondy_rbac_source:add(Realm, #{
+            ~"usernames" => ~"all",
+            ~"authmethod" => ~"ticket",
+            ~"cidr" => ~"127.0.0.0/8",
+            ~"meta" => #{}
+        }),
+        ?assertEqual({{200, 401}, {200, 200}}, {Before, Statuses()})
+    after
+        bondy_http_gateway:delete(Api)
+    end.
+
+%% An `oidc` route authenticates with the realm's OIDC ticket cookie, through
+%% the realm's own rules: the `cookie` method must be allowed, the ticket must
+%% be scoped to the realm, and a request that changes state must echo the CSRF
+%% cookie in `x-csrf-token`. The subject has no local user, so its roles come
+%% from the ticket, and the realm's `all` source admits it from loopback.
+oidc_scheme_authenticates_with_the_realm_cookie_test(_) ->
+    Realm = ~"com.example.test.oidc_scheme",
+    Other = ~"com.example.test.oidc_scheme.other",
+    Api = ~"com.example.test.oidc_scheme.api",
+    Proc = ~"com.example.test.oidc_scheme.thing",
+    Group = ~"oidc_readers",
+    Methods = [?COOKIE, ~"oidcrp"],
+    [
+        _ = bondy_realm:create(#{
+            uri => R,
+            authmethods => Methods,
+            security_enabled => true,
+            sources => [
+                #{
+                    usernames => ~"all",
+                    authmethod => ?COOKIE,
+                    cidr => ~"127.0.0.0/8",
+                    meta => #{}
+                }
+            ],
+            groups => [#{name => Group}],
+            grants => [
+                #{
+                    permissions => [~"wamp.call"],
+                    uri => Proc,
+                    match => ~"exact",
+                    roles => [Group]
+                }
+            ]
+        })
+     || R <- [Realm, Other]
+    ],
+    {ok, _} = bondy_dealer:register(
+        Proc, #{}, Realm, bondy_ref:new(internal, {?MODULE, on_call})
+    ),
+    Action = #{
+        <<"action">> => #{
+            <<"type">> => <<"wamp_call">>,
+            <<"procedure">> => Proc
+        },
+        <<"response">> => #{
+            <<"on_error">> => #{
+                <<"status_code">> => <<"{{action.error.status_code}}">>,
+                <<"body">> => <<"{{action.error.error_uri}}">>
+            },
+            <<"on_result">> => #{<<"status_code">> => 200}
+        }
+    },
+    ok = bondy_http_gateway:load(#{
+        <<"id">> => Api,
+        <<"name">> => Api,
+        <<"host">> => <<"_">>,
+        <<"realm_uri">> => Realm,
+        <<"defaults">> => #{
+            <<"security">> => #{
+                <<"type">> => <<"oidc">>, <<"provider">> => <<"idp">>
+            },
+            <<"schemes">> => [<<"http">>]
+        },
+        <<"versions">> => #{
+            <<"1.0.0">> => #{
+                <<"base_path">> => <<"/oidc_scheme/v1.0">>,
+                <<"paths">> => #{
+                    <<"/thing">> => #{<<"get">> => Action, <<"post">> => Action}
+                }
+            }
+        }
+    }),
+    Url = <<"http://localhost:18080/oidc_scheme/v1.0/thing">>,
+    Csrf = ~"csrf-token-value",
+    Cookie = fun(TicketRealm) ->
+        {ok, Ticket, _} = bondy_oidc_ticket:issue(
+            TicketRealm, ~"alice@example.com", ~"idp", #{}, #{
+                authroles => [Group]
+            }
+        ),
+        {<<"cookie">>,
+            iolist_to_binary([
+                bondy_http_utils:ticket_cookie_name(Realm),
+                "=",
+                Ticket,
+                "; ",
+                bondy_http_utils:csrf_cookie_name(Realm),
+                "=",
+                Csrf
+            ])}
+    end,
+    CsrfHeader = {<<"x-csrf-token">>, Csrf},
+    try
+        _ = bondy_http_gateway:rebuild_dispatch_tables(),
+        ?assertEqual(401, http_status(get, Url, [], <<>>)),
+        ?assertEqual(200, http_status(get, Url, [Cookie(Realm)], <<>>)),
+        ?assertEqual(
+            403, http_status(post, Url, [Cookie(Realm)], <<"{}">>)
+        ),
+        ?assertEqual(
+            204,
+            http_status(post, Url, [Cookie(Realm), CsrfHeader], <<"{}">>)
+        ),
+        ?assertEqual(401, http_status(get, Url, [Cookie(Other)], <<>>)),
+        _ = bondy_realm:update(Realm, #{~"authmethods" => [~"oidcrp"]}),
+        ?assertEqual(401, http_status(get, Url, [Cookie(Realm)], <<>>))
+    after
+        bondy_http_gateway:delete(Api)
+    end.
+
+%% The dealer applies an internal callee to the call's arguments, so it answers
+%% at each arity the gateway's calls produce.
+on_call() ->
+    {ok, #{}, [], #{}}.
+
+on_call(_) ->
+    on_call().
+
+on_call(_, _) ->
+    on_call().

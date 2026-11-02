@@ -57,6 +57,7 @@ all() ->
         recreated_group_inherits_nothing,
         every_publishing_table_has_a_live_subscriber,
         security_disabled_allows_all,
+        claim_identities_are_subject_to_sources,
         session_rbac_invalidated_on_revoke,
         session_rbac_invalidated_on_grant_to_all,
         session_rbac_invalidated_on_group_inheritance_change
@@ -1999,3 +2000,41 @@ security_disabled_allows_all(_) ->
         ok,
         bondy_rbac:authorize(<<"wamp.register">>, <<"com.any.thing">>, Ctxt)
     ).
+
+%% The check a WAMP session opened with the ticket cookie makes
+%% (`bondy_wamp_protocol`): `bondy_auth:init/6` with the ticket's claims, then
+%% `available_methods/2` for `cookie`. A subject Bondy holds no record for is
+%% matched against the realm's `all` sources, as a stored user is.
+claim_identities_are_subject_to_sources(_) ->
+    Uri = ~"com.test.claim_sources",
+    Cidr = ~"10.0.0.0/8",
+    _ = bondy_realm:create(#{
+        uri => Uri,
+        authmethods => [?WAMP_COOKIE_AUTH],
+        security_enabled => true
+    }),
+    Authid = ~"external@example.com",
+    Methods = fun(IP) ->
+        {ok, Ctxt} = bondy_auth:init(
+            bondy_session_id:new(),
+            Uri,
+            Authid,
+            [],
+            IP,
+            #{claims => #{authid => Authid, authroles => []}}
+        ),
+        bondy_auth:available_methods([?WAMP_COOKIE_AUTH], Ctxt)
+    end,
+    ?assertEqual([], Methods({10, 1, 2, 3})),
+    {ok, _} = bondy_rbac_source:add(Uri, #{
+        ~"usernames" => ~"all",
+        ~"authmethod" => ?WAMP_COOKIE_AUTH,
+        ~"cidr" => Cidr,
+        ~"meta" => #{}
+    }),
+    try
+        ?assertEqual([?WAMP_COOKIE_AUTH], Methods({10, 1, 2, 3})),
+        ?assertEqual([], Methods({127, 0, 0, 1}))
+    after
+        ok = bondy_rbac_source:remove(Uri, all, Cidr)
+    end.

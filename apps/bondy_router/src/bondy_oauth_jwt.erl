@@ -34,13 +34,29 @@ encode(Claims, PrivKey) ->
     {_, JWT} = jose_jws:compact(jose_jwt:sign(PrivKey, Claims)),
     JWT.
 
--spec decode(binary()) -> claims().
+-doc """
+Returns the claims of `JWT` without verifying its signature, or
+`{error, invalid}` when `JWT` is not a compact JWS whose payload is a JSON
+object.
 
-decode(JWT) when is_binary(JWT) andalso byte_size(JWT) >= 32 ->
-    {jose_jwt, Map} = jose_jwt:peek(JWT),
-    Map;
-decode(Term) ->
-    error({badarg, [Term]}).
+The input is untrusted. The errors handled are those `jose_jwt:peek/1` raises
+on malformed input when jose decodes JSON with OTP's `json` module, its choice
+when no `json_module` is configured (`bondy_oauth_jwt_test`). Any other error
+propagates.
+""".
+-spec decode(binary()) -> {ok, claims()} | {error, invalid}.
+
+decode(JWT) when is_binary(JWT) ->
+    try jose_jwt:peek(JWT) of
+        {jose_jwt, Claims} -> {ok, Claims}
+    catch
+        error:{badarg, _} -> {error, invalid};
+        error:{case_clause, _} -> {error, invalid};
+        error:function_clause -> {error, invalid};
+        error:unexpected_end -> {error, invalid};
+        error:{invalid_byte, _} -> {error, invalid};
+        error:{unexpected_sequence, _} -> {error, invalid}
+    end.
 
 -spec verify(binary(), binary()) -> {ok, map()} | {error, error()}.
 
@@ -109,7 +125,11 @@ matches(RealmUri, Claims, Spec) ->
 
 do_verify(RealmUri, JWT, Spec) ->
     try
-        {jose_jwt, Claims} = jose_jwt:peek(JWT),
+        Claims =
+            case decode(JWT) of
+                {ok, Decoded} -> Decoded;
+                {error, invalid} -> throw(oauth2_invalid_grant)
+            end,
         #{
             ~"aud" := AuthRealmUri,
             ~"kid" := Kid

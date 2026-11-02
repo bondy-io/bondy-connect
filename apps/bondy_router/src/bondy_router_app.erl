@@ -431,6 +431,7 @@ start_services(_) ->
 %% @private
 configure_services() ->
     ok = bondy_message_id:init(),
+    ok = bondy_auth:init_tables(),
 
     %% Every step below reads and writes the durable realm tables, so it is
     %% gated on the `main` DB actually being open. When the catalogue stood

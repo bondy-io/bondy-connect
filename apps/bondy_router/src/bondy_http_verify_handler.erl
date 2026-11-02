@@ -46,9 +46,17 @@ Signature, expiry and revocation, via `bondy_ticket:verify/1` or
   below — still exists
 - the realm still allows connections
 - for access tokens, the `token_version` gate in `bondy_auth_oauth2`
+- the realm's `authmethods` and sources admit, from the caller's address, the
+  credential's own method, and `cookie` as well when the credential came in
+  the ticket cookie (`bondy_auth:check_credential/3`,
+  `credential_is_subject_to_the_realms_sources`)
 
-Without the last three a ticket would keep opening the gate after the user was
-disabled or removed, until it expired.
+Without the user, realm and `token_version` checks a ticket would keep opening
+the gate after the user was disabled or removed, until it expired.
+
+The caller's address is the listener's source IP. Behind a reverse proxy it is
+the proxy's, unless the listener trusts the proxy's forwarding headers
+(`proxy_protocol.trusted_proxies`).
 
 Authorization is out of scope: this answers who the caller is, not what they
 may do.
@@ -149,7 +157,7 @@ handle(_, Req, _) ->
 %% @private
 do_verify(RealmUri, Req) ->
     try
-        Credential = credential(RealmUri, Req),
+        {Carrier, Credential} = credential(RealmUri, Req),
         Credential =/= undefined orelse throw(no_credential),
 
         Identity =
@@ -164,24 +172,12 @@ do_verify(RealmUri, Req) ->
 
         ok = check_principal(RealmUri, Identity),
         ok = check_realm(RealmUri),
+        ok = check_method(RealmUri, Carrier, Identity, Req),
 
         {ok, Identity}
     catch
         throw:Reason ->
-            {error, Reason};
-        Class:Reason:Stacktrace ->
-            %% Nothing may escape as a 5xx: a proxy cannot act on one, and an
-            %% unauthenticated caller must not be able to provoke crash reports.
-            %% Reachable when the realm is removed after the dispatch table was
-            %% compiled, since the realm and user lookups then raise.
-            ?LOG_WARNING(#{
-                description => "Error while verifying credential",
-                realm_uri => RealmUri,
-                class => Class,
-                reason => Reason,
-                stacktrace => Stacktrace
-            }),
-            {error, invalid}
+            {error, Reason}
     end.
 
 %% -----------------------------------------------------------------------------
@@ -197,22 +193,22 @@ credential(RealmUri, Req) ->
         undefined ->
             header_or_cookie_credential(RealmUri, Req);
         Token ->
-            Token
+            {direct, Token}
     end.
 
 %% @private
 header_or_cookie_credential(RealmUri, Req) ->
     case cowboy_req:header(?TICKET_HEADER, Req, undefined) of
         Ticket when is_binary(Ticket), Ticket =/= <<>> ->
-            Ticket;
+            {direct, Ticket};
         _ ->
             Cookies = bondy_http_utils:safe_parse_cookies(Req),
 
             case bondy_http_utils:find_ticket_cookie(RealmUri, Cookies) of
                 {value, {_, Value}} when is_binary(Value), Value =/= <<>> ->
-                    Value;
+                    {cookie, Value};
                 _ ->
-                    undefined
+                    {cookie, undefined}
             end
     end.
 
@@ -221,21 +217,16 @@ header_or_cookie_credential(RealmUri, Req) ->
 %% Bondy ticket carries `authrealm` and `scope`, an access token carries `aud`
 %% and `kid`. This runs on unverified input and only picks the verifier — both
 %% verifiers re-read and check the signature themselves, so nothing here is
-%% trusted. `jose_jwt:peek/1` decodes JSON through the adapter `jose` selects
-%% at runtime, so its error space has no fixed set of shapes.
+%% trusted.
 classify(Credential) ->
-    try jose_jwt:peek(Credential) of
-        {jose_jwt, #{~"authrealm" := R, ~"scope" := _}} when is_binary(R) ->
+    case bondy_oauth_jwt:decode(Credential) of
+        {ok, #{~"authrealm" := R, ~"scope" := _}} when is_binary(R) ->
             ticket;
-        {jose_jwt, #{~"aud" := A, ~"kid" := _}} when is_binary(A) ->
+        {ok, #{~"aud" := A, ~"kid" := _}} when is_binary(A) ->
             oauth2;
-        {jose_jwt, #{}} ->
-            unknown
-    catch
-        %% The reason can carry fragments of the credential, so it is not
-        %% logged.
-        error:_Reason ->
-            ?LOG_DEBUG(#{description => "Credential is not a decodable JWT"}),
+        {ok, #{}} ->
+            unknown;
+        {error, invalid} ->
             unknown
     end.
 
@@ -334,6 +325,37 @@ check_realm(RealmUri) ->
     bondy_realm:allow_connections(RealmUri) orelse
         throw(connections_not_allowed),
     ok.
+
+%% @private
+check_method(
+    RealmUri, Carrier, #{authid := Authid, authroles := Roles} = Identity, Req
+) ->
+    case
+        bondy_auth:init(
+            bondy_session_id:new(),
+            RealmUri,
+            Authid,
+            Roles,
+            source_ip(Req),
+            #{claims => Identity}
+        )
+    of
+        {ok, Ctxt} ->
+            case bondy_auth:check_credential(Carrier, Identity, Ctxt) of
+                ok -> ok;
+                {error, Reason} -> throw(Reason)
+            end;
+        {error, Reason} ->
+            throw(Reason)
+    end.
+
+%% @private
+source_ip(Req) ->
+    ProxyProtocol = bondy_http_proxy_protocol:init(Req),
+    case bondy_http_proxy_protocol:source_ip(ProxyProtocol) of
+        {ok, SourceIP} -> SourceIP;
+        {error, {protocol_error, _}} -> throw(proxy_protocol_error)
+    end.
 
 %% -----------------------------------------------------------------------------
 %% Replies

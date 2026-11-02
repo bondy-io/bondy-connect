@@ -118,6 +118,28 @@ after it has been emptied
 (`JoinInstall_Truncation_CompactMembers_Leave_JoinAny` violates
 `noStrandedRecord`).
 
+## Restarting a member
+
+Keep `cluster.automatic_leave` off on a node that restarts with its data
+directory, such as a Kubernetes StatefulSet pod that keeps its
+PersistentVolumeClaim. With `on`, every graceful shutdown is a leave, so each
+routine restart returns a node that has left, still holding its data. That is
+the return the joining rule forbids
+(`JoinInstall_Truncation_CompactMembers_Leave_JoinAny` violates
+`noStrandedRecord`). Bondy does not check the rule; a return that breaks it
+can leave the node and the cluster refusing each other's snapshots with
+`source_behind_truncation`. Turn `automatic_leave` on only for a node you are
+decommissioning.
+
+Under the default `db.aae.fence.on_isolation = refuse`, a restarted member
+refuses new authentication until its first sync round with a peer (the
+[authentication freshness fence](database_options.md#authentication-freshness-fence)).
+Bondy does not set Partisan's `partisan_data_dir`, so a node keeps no cluster
+membership across a restart. A node that finds its
+peers through discovery cannot start that round before its first lookup, which
+runs `cluster.peer_discovery.initial_delay` (default `10s`) after start. That
+delay adds to the time the node refuses authentication.
+
 ## See also
 
 - [Reclamation configuration reference](reclamation_options.md) — the

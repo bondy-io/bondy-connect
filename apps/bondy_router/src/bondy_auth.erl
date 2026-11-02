@@ -28,6 +28,7 @@ system and the user's password capabilities.
 %% against; revocation rides the per-user token_version fence and the
 %% merge-reactor RBAC invalidation, not this bound.
 -define(AUTH_MAX_LAG, 60000).
+-define(LEGACY_COOKIE_TAB, bondy_auth_legacy_cookie_realms).
 
 -type context() :: #{
     realm_uri := uri(),
@@ -36,6 +37,7 @@ system and the user's password capabilities.
     source_ip := inet:ip_address(),
     user_id := binary(),
     user := optional(bondy_rbac_user:t()),
+    admitted_methods := [binary()],
     available_methods := [binary()],
     role := optional(binary()),
     roles := optional([binary()]),
@@ -66,6 +68,9 @@ system and the user's password capabilities.
 
 %% BONDY_SENSITIVE CALLBACKS
 -export([format_status/1]).
+-export([admits/2]).
+-export([check_credential/3]).
+-export([init_tables/0]).
 
 %% API
 -export([authenticate/4]).
@@ -74,9 +79,8 @@ system and the user's password capabilities.
 -export([available_methods/2]).
 -export([challenge/3]).
 -export([decoy/5]).
+-export([fence_freshness/1]).
 -export([host/1]).
--export([init/3]).
--export([init/4]).
 -export([init/5]).
 -export([init/6]).
 -export([issuer/1]).
@@ -88,6 +92,7 @@ system and the user's password capabilities.
 -export([realm_uri/1]).
 -export([role/1]).
 -export([roles/1]).
+-export([security_fence/0]).
 -export([session_id/1]).
 -export([source_ip/1]).
 -export([sso_realm_uri/1]).
@@ -136,75 +141,6 @@ format_status(Ctxt) ->
 %% =============================================================================
 %% API
 %% =============================================================================
-
--doc """
-Only valid for transport-level authentication e.g. cookie
-""".
--spec init(
-    SessionId :: bondy_session_id:t(),
-    Realm :: bondy_realm:t() | uri(),
-    SourceIP :: inet:ip_address()
-) ->
-    {ok, context()}
-    | {error,
-        {no_such_user, binary()}
-        | {no_such_realm, binary()}
-        | {no_such_groups, [bondy_rbac_group:name()]}}
-    | no_return().
-
-init(SessionId, Uri, SourceIP) ->
-    init(SessionId, Uri, SourceIP, #{}).
-
--doc """
-Only valid for transport-level authentication e.g. cookie
-""".
--spec init(
-    SessionId :: bondy_session_id:t(),
-    Realm :: bondy_realm:t() | uri(),
-    SourceIP :: inet:ip_address(),
-    Opts :: opts()
-) ->
-    {ok, context()}
-    | {error,
-        {no_such_user, binary()}
-        | {no_such_realm, binary()}
-        | {no_such_groups, [bondy_rbac_group:name()]}}
-    | no_return().
-
-init(SessionId, Uri, SourceIP, Opts) when
-    is_binary(SessionId), is_binary(Uri), ?IS_IP(SourceIP)
-->
-    case bondy_realm:lookup(string:casefold(Uri)) of
-        {ok, Realm} ->
-            init(SessionId, Realm, SourceIP, Opts);
-        {error, not_found} ->
-            {error, {no_such_realm, Uri}}
-    end;
-init(SessionId, Realm, SourceIP, Opts) when
-    is_binary(SessionId), is_tuple(Realm), ?IS_IP(SourceIP), is_map(Opts)
-->
-    try
-        RealmUri = bondy_realm:uri(Realm),
-        SSORealmUri = bondy_realm:sso_realm_uri(Realm),
-
-        Ctxt = #{
-            provider => ?BONDY_AUTH_PROVIDER,
-            session_id => SessionId,
-            realm_uri => RealmUri,
-            sso_realm_uri => SSORealmUri,
-            source_ip => SourceIP,
-            host => maps:get(host, Opts, undefined),
-            user_id => undefined,
-            user => undefined,
-            role => undefined,
-            roles => undefined
-        },
-        Methods = compute_available_methods(Realm, Ctxt),
-        {ok, maps:put(available_methods, Methods, Ctxt)}
-    catch
-        throw:Reason ->
-            {error, Reason}
-    end.
 
 -doc """
 WAMP-level authentication.
@@ -352,6 +288,7 @@ decoy(SessionId, Realm, Authid0, Method, SourceIP) when
         roles => [],
         source_ip => SourceIP,
         host => undefined,
+        admitted_methods => [Method],
         available_methods => [Method],
         decoy => true
     }.
@@ -402,6 +339,61 @@ available_methods(List, #{available_methods := Available}) ->
     sets:to_list(
         sets:intersection(sets:from_list(List), sets:from_list(Available))
     ).
+
+-doc """
+Returns `true` when the realm admits `Method` for the context's user from its
+source IP address: the realm lists it, a source allows it, and the user meets
+its requirements. Unlike `available_methods/1`, this includes methods that are
+not offered in a WAMP HELLO, such as `oidcrp`.
+""".
+-spec admits(Method :: binary(), Ctxt :: context()) -> boolean().
+
+admits(Method, #{admitted_methods := Admitted}) when is_binary(Method) ->
+    lists:member(Method, Admitted).
+
+-doc """
+Checks that the realm admits a credential presented outside a WAMP HELLO, a
+Bondy ticket, an OAuth2 access token or the identity an OIDC login
+established, given its verified claims.
+
+The credential is checked under its own method, read from its `authmethod`
+claim: `oidcrp` for an identity from the OIDC login flow, `oauth2` for an
+access token, and `ticket` for any other ticket. `Carrier` is `cookie` for a
+credential that arrived in a cookie, which also needs `cookie`, the WAMP
+transport-level method, and `direct` for one that reached Bondy any other
+way: a request header, or the OIDC login's exchange with the provider.
+
+`cookie` also admits an OIDC credential the realm does not admit under
+`oidcrp`. That use is deprecated: Bondy logs a warning the first time it
+happens for a realm on a node.
+""".
+-spec check_credential(
+    Carrier :: cookie | direct, Claims :: map(), Ctxt :: context()
+) -> ok | {error, no_authmethod}.
+
+check_credential(Carrier, #{authmethod := Authmethod}, Ctxt) when
+    (Carrier == cookie orelse Carrier == direct) andalso is_binary(Authmethod)
+->
+    Method = credential_method(Authmethod),
+    Carried = Carrier == direct orelse admits(?WAMP_COOKIE_AUTH, Ctxt),
+
+    case Carried andalso admits_credential(Method, Ctxt) of
+        true -> ok;
+        false -> {error, no_authmethod}
+    end.
+
+-doc """
+Creates the table that records which realms have admitted an OIDC credential
+through the deprecated use of `cookie`. Called once at application start.
+""".
+-spec init_tables() -> ok.
+
+init_tables() ->
+    Opts = [set, named_table, public, {read_concurrency, true}],
+    {ok, ?LEGACY_COOKIE_TAB} = bondy_connect_table_manager:add_or_claim(
+        ?LEGACY_COOKIE_TAB, Opts
+    ),
+    ok.
 
 -spec provider(context()) -> [binary()].
 
@@ -558,38 +550,54 @@ authenticate(Method, Signature, DataIn, Ctxt) ->
             {error, Reason}
     end.
 
-%% =============================================================================
-%% PRIVATE
-%% =============================================================================
+-doc """
+The authentication freshness fence. On a node whose view of the security
+tables (users and grants) is staler than `db.aae.fence.max_lag` — a lagging
+or partitioned node — every new authentication is refused, whatever the
+method: such a node must not authenticate against a view that may predate a
+credential or permission change made elsewhere.
 
-%% @private
-%% §9.8 AE auth fence. On a node whose view of the security tables (users /
-%% grants) is staler than `auth_max_lag` — a lagging or partitioned node —
-%% refuse ALL new authentication regardless of method: such a node must not
-%% authenticate against a security view that may predate a credential or
-%% permission change made elsewhere.
-%%
-%% A no-op unless the AAE phase is enabled (`db.aae`): with AAE off, local
-%% writes are synchronous and there is no cross-node staleness window. The
-%% per-shard freshness signal is produced AE-side (`bondy_oplog_sync_session`),
-%% honouring the `db.aae.fence.on_isolation` policy; this fence only reads it.
+Admits everything unless anti-entropy is enabled (`db.aae`): with it off,
+local writes are synchronous and there is no cross-node staleness window. The
+per-shard freshness signal is produced by anti-entropy
+(`bondy_oplog_sync_session`), under the `db.aae.fence.on_isolation` policy;
+the fence only reads it.
+""".
 -spec security_fence() -> ok | {error, temporarily_unavailable}.
 
 security_fence() ->
+    case fence_freshness(auth_max_lag()) of
+        disabled -> ok;
+        ok -> ok;
+        {stale, _NSs} -> {error, temporarily_unavailable}
+    end.
+
+-doc """
+Evaluates the authentication freshness fence against `MaxLag` milliseconds.
+
+Returns `disabled` when anti-entropy is off, `ok` when every primary shard of
+the user, user-grant and group-grant tables completed an anti-entropy round
+within `MaxLag`, and `{stale, Namespaces}` otherwise. `Namespaces` is empty
+when the catalogue has not provisioned those tables. Authentication is refused
+while this returns `{stale, _}` at `db.aae.fence.max_lag`.
+""".
+-spec fence_freshness(MaxLag :: non_neg_integer() | infinity) ->
+    disabled | ok | {stale, [atom()]}.
+
+fence_freshness(MaxLag) ->
     case aae_enabled() of
         false ->
-            ok;
+            disabled;
         true ->
             case fence_tables() of
-                [] ->
-                    {error, temporarily_unavailable};
-                Tables ->
-                    case bondy_db:ensure_fresh(Tables, auth_max_lag()) of
-                        ok -> ok;
-                        {stale, _NSs} -> {error, temporarily_unavailable}
-                    end
+                [] -> {stale, []};
+                Tables -> bondy_db:ensure_fresh(Tables, MaxLag)
             end
     end.
+
+%% =============================================================================
+%% PRIVATE
+%% =============================================================================
 
 %% @private
 %% The security tables the fence checks for freshness. Fails closed (empty list
@@ -691,22 +699,19 @@ callback_mod(Method, Fun) when is_function(Fun, 1) ->
     end.
 
 %% @private
-compute_available_methods(Realm, Ctxt) ->
+compute_methods(Realm, Ctxt) ->
     RealmAllowed = bondy_realm:authmethods(Realm),
 
     case bondy_realm:is_security_enabled(Realm) of
         true ->
-            do_compute_available_methods(Ctxt, RealmAllowed);
+            Admitted = admitted_methods(Ctxt, RealmAllowed),
+            {Admitted, [M || M <- Admitted, has_wamp_auth(M)]};
         false ->
-            RealmAllowed
+            {RealmAllowed, RealmAllowed}
     end.
 
 %% @private
-
-do_compute_available_methods(#{user := undefined}, RealmAllowed) ->
-    %% Not perfect, this is the case of cookies.
-    RealmAllowed;
-do_compute_available_methods(#{user_id := UserId} = Ctxt, RealmAllowed) ->
+admitted_methods(#{user_id := UserId} = Ctxt, RealmAllowed) ->
     #{
         realm_uri := RealmUri,
         source_ip := IPAddress
@@ -745,7 +750,8 @@ do_compute_available_methods(#{user_id := UserId} = Ctxt, RealmAllowed) ->
             bondy_rbac:anonymous_allowed(source_ip(Ctxt)) andalso
                 matches_requirements(Method, Ctxt);
         ({_Order, Method}) ->
-            has_wamp_auth(Method) andalso matches_requirements(Method, Ctxt)
+            not has_wamp_auth(Method) orelse
+                matches_requirements(Method, Ctxt)
     end,
 
     Available = lists:usort(lists:filtermap(Filter, Allowed)),
@@ -753,8 +759,38 @@ do_compute_available_methods(#{user_id := UserId} = Ctxt, RealmAllowed) ->
     [Method || {_, Method} <- Available].
 
 %% @private
+credential_method(?OIDCRP_AUTH) -> ?OIDCRP_AUTH;
+credential_method(?OAUTH2_AUTH) -> ?OAUTH2_AUTH;
+credential_method(Authmethod) when is_binary(Authmethod) -> ?WAMP_TICKET_AUTH.
+
+%% @private
+admits_credential(?OIDCRP_AUTH = Method, Ctxt) ->
+    admits(Method, Ctxt) orelse
+        (admits(?WAMP_COOKIE_AUTH, Ctxt) andalso legacy_cookie(Ctxt));
+admits_credential(Method, Ctxt) ->
+    admits(Method, Ctxt).
+
+%% @private
+legacy_cookie(#{realm_uri := RealmUri}) ->
+    case ets:insert_new(?LEGACY_COOKIE_TAB, {RealmUri}) of
+        true ->
+            ?LOG_WARNING(#{
+                description =>
+                    "The realm admitted an OIDC credential through the "
+                    "'cookie' method, which is deprecated for this use. "
+                    "Add 'oidcrp' to the realm's authmethods and a source "
+                    "for it.",
+                realm_uri => RealmUri
+            });
+        false ->
+            ok
+    end,
+    true.
+
+%% @private
 %% `tls` and `oidcrp` name how a user may authenticate outside a WAMP HELLO, so
-%% they have no callback module and are never offered to a session.
+%% they have no callback module, no requirements on the user record, and are
+%% never offered to a session.
 has_wamp_auth(Method) ->
     case maps:get(Method, ?BONDY_AUTHMETHODS_INFO) of
         #{callback_mod := undefined} -> false;
@@ -763,7 +799,13 @@ has_wamp_auth(Method) ->
 
 %% @private
 matches_requirements(Method, #{user_id := UserId, user := User}) ->
-    Password = bondy_rbac_user:password(User),
+    %% `undefined` is an identity the ticket claims carry and Bondy holds no
+    %% record for, so a requirement on the record is unmet.
+    Password =
+        case User of
+            undefined -> undefined;
+            _ -> bondy_rbac_user:password(User)
+        end,
 
     Requirements = maps:to_list((callback_mod(Method)):requirements()),
 
@@ -776,7 +818,8 @@ matches_requirements(Method, #{user_id := UserId, user := User}) ->
             Match({identification, true}) ->
                 UserId =/= anonymous;
             Match({authorized_keys, true}) ->
-                bondy_rbac_user:has_authorized_keys(User);
+                User =/= undefined andalso
+                    bondy_rbac_user:has_authorized_keys(User);
             Match({password, true}) ->
                 Password =/= undefined;
             Match({password, {true, #{protocols := Ps}}}) ->
@@ -835,12 +878,16 @@ init_from_claims(
             throw:{no_such_user, _} -> undefined
         end,
 
-    {Role, ValidRoles} =
+    %% A stored user is named by its casefolded username, the key of its named
+    %% sources; the claims carry the IdP's spelling. Evidence:
+    %% `named_source_matches_an_authid_in_any_case`, admin listener suite.
+    {UserId, Role, ValidRoles} =
         case User of
             undefined ->
-                {undefined, Roles};
+                {Username, undefined, Roles};
             _ ->
-                valid_roles(Roles, User)
+                {UserRole, UserRoles} = valid_roles(Roles, User),
+                {bondy_rbac_user:username(User), UserRole, UserRoles}
         end,
 
     Ctxt = #{
@@ -848,15 +895,15 @@ init_from_claims(
         session_id => SessionId,
         realm_uri => RealmUri,
         sso_realm_uri => SSORealmUri,
-        user_id => Username,
+        user_id => UserId,
         user => User,
         role => Role,
         roles => ValidRoles,
         source_ip => SourceIP,
         host => maps:get(host, Opts, undefined)
     },
-    Methods = compute_available_methods(Realm, Ctxt),
-    {ok, maps:put(available_methods, Methods, Ctxt)}.
+    {Admitted, Available} = compute_methods(Realm, Ctxt),
+    {ok, Ctxt#{admitted_methods => Admitted, available_methods => Available}}.
 
 %% @private
 init_from_user(
@@ -886,8 +933,8 @@ init_from_user(
         source_ip => SourceIP,
         host => maps:get(host, Opts, undefined)
     },
-    Methods = compute_available_methods(Realm, Ctxt),
-    {ok, maps:put(available_methods, Methods, Ctxt)}.
+    {Admitted, Available} = compute_methods(Realm, Ctxt),
+    {ok, Ctxt#{admitted_methods => Admitted, available_methods => Available}}.
 
 %% @private
 maybe_set_method(Method, #{method := Method} = Ctxt) ->

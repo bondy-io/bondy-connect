@@ -1159,8 +1159,9 @@ close(RealmUri, Reason) ->
     bondy_session_manager:close_all(RealmUri, Reason).
 
 -doc """
-Removes realm `RealmUri` from THIS node: closes its sessions and deletes its
-registry entries, including the router's own session-less ones.
+Removes realm `RealmUri` from THIS node: closes its sessions, deletes its
+registry entries, including the router's own session-less ones, and stops its
+OIDC provider workers.
 
 This is the half of realm deletion that does not replicate. `delete/2` clears
 the realm's `m:bondy_db` cells and every node converges on those, but sessions
@@ -1178,9 +1179,11 @@ exists and must keep its entries.
 
 Pinned by `bondy_session_cleanup_SUITE:realm_delete_purges_registry` (the
 deleting node) and
-`bondy_aae_cluster_SUITE:remote_realm_delete_purges_peer_registry` (a peer).
+`bondy_aae_cluster_SUITE:remote_realm_delete_purges_peer_registry` (a peer);
+the provider workers by
+`bondy_realm_cluster_SUITE:oidc_provider_workers_stop_with_their_realm`.
 
-Both suites cover the delete arriving as an event. A catalogue-snapshot
+These suites cover the delete arriving as an event. A catalogue-snapshot
 bootstrap replaces a table's projection wholesale and emits no per-cell merge
 event (`bondy_aae_reactor` handles `bondy_oplog_core_bootstrap_event`
 separately), so a live node recovering that way does not learn of a realm
@@ -1198,6 +1201,7 @@ teardown(RealmUri) ->
     %% path can reach those.
     ok = bondy_registry:remove_all(registration, RealmUri, '_', undefined),
     ok = bondy_registry:remove_all(subscription, RealmUri, '_', undefined),
+    ok = bondy_oidc_provider:stop_realm_workers(RealmUri),
 
     %% Must move with the entries: the table only caches which realms already
     %% have their wildcard registered, so a realm reclaiming this URI while the
@@ -1517,10 +1521,10 @@ rate_limit(Uri) when is_binary(Uri) ->
 Returns the OIDC providers configuration map for the given realm.
 Returns an empty map if no providers are configured.
 """.
--spec oidc_providers(Realm :: t() | uri()) -> [map()].
+-spec oidc_providers(Realm :: t() | uri()) -> #{binary() => map()}.
 
 oidc_providers(#realm{info = Info}) ->
-    maps:get(oidc_providers, Info, []);
+    maps:get(oidc_providers, Info, #{});
 oidc_providers(Uri) when is_binary(Uri) ->
     oidc_providers(fetch(Uri)).
 
@@ -2131,7 +2135,7 @@ remediate_legacy_anon(#realm{uri = Uri} = Realm) ->
     _ = update(Uri, #{<<"authmethods">> => NewMethods}),
     ?LOG_WARNING(#{
         description =>
-            "Master realm hardening (D-2): removed anonymous authentication from "
+            "Master realm hardening: removed anonymous authentication from "
             "the master realm. Anonymous clients can no longer connect to the "
             "administrative control plane.",
         realm => Uri
@@ -2151,14 +2155,14 @@ remediate_legacy_anon(#realm{uri = Uri} = Realm) ->
         ok ->
             ?LOG_WARNING(#{
                 description =>
-                    "Master realm hardening (D-2): revoked the anonymous wamp.* "
+                    "Master realm hardening: revoked the anonymous wamp.* "
                     "grant on the master realm.",
                 realm => Uri
             });
         {error, Reason} ->
             ?LOG_WARNING(#{
                 description =>
-                    "Master realm hardening (D-2): could not auto-revoke the "
+                    "Master realm hardening: could not auto-revoke the "
                     "anonymous master-realm grant; remove it manually.",
                 realm => Uri,
                 reason => Reason
@@ -2179,10 +2183,9 @@ maybe_warn_legacy_admin_password(#realm{uri = Uri}) ->
                             ?LOG_WARNING(#{
                                 description =>
                                     "The master realm 'admin' user still uses the "
-                                    "legacy default password 'bondy-admin' (D-1). "
-                                    "Rotate it immediately via "
-                                    "'security.admin_user.password' or the admin "
-                                    "API.",
+                                    "legacy default password 'bondy-admin'. "
+                                    "Change it now by calling "
+                                    "'bondy.user.change_password' on this realm.",
                                 realm => Uri,
                                 username => <<"admin">>
                             }),
@@ -2191,7 +2194,7 @@ maybe_warn_legacy_admin_password(#realm{uri = Uri}) ->
                             ok
                     end
             end;
-        _ ->
+        {error, not_found} ->
             ok
     end.
 

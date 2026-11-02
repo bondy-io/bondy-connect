@@ -36,7 +36,7 @@ every `task` names a catalogued task, that every `observe_with` procedure
 exists and is *not* a task, and that every declared detail key is delivered at
 the raise site.
 
-That last check is narrower than it sounds: ten of the fourteen entries declare
+That last check is narrower than it sounds: eleven of the fifteen entries declare
 detail keys and four declare none, so it proves an entry cannot lie about what
 it declares — not that every alarm carries structured detail.
 
@@ -51,6 +51,7 @@ it declares — not that every alarm carries structured detail.
 | `{bondy_oplog_bucket_unroutable, InstanceId}` | major | node | A catalogue bootstrap received cells for a table this node does not declare; the instance does not adopt the peer's frontier and bootstraps again |
 | `{bondy_oplog_drain_stalled, InstanceId}` | major | node | A WAL drain processes frames without committing a new position for `db.drain.stall_alarm` |
 | `{bondy_oplog_frontier_hole, InstanceId}` | major | node | A shard has carried a gap in its applied frontier for `db.frontier.hole_alarm` |
+| `bondy_auth_fence_closed` | critical | node | The node has refused every new authentication for `db.aae.fence.alarm` |
 | `{bondy_oplog_frontier_receipt_derived, InstanceId}` | major | node | A shard restored an applied frontier derived from receipt |
 | `bondy_db_main_unavailable` | critical | node | The durable `main` database could not be opened |
 | `{bondy_oplog_instance_down, InstanceId}` | critical | node | A shard instance has stopped and is not running again yet; its tables are unavailable |
@@ -76,7 +77,7 @@ an unreachable upstream connector must not drain the node, since the WAMP data
 plane is unaffected; a node whose durable store failed to open must leave the
 load balancer.
 
-Every current entry declares `affects_ready => false`. Of the fourteen
+Every current entry declares `affects_ready => false`. Of the fifteen
 conditions, two take the node out of rotation, and neither does so through
 its alarm: `bondy_db_main_unavailable` and `{bondy_oplog_instance_down, _}`.
 Their readiness is read from `bondy_namespace_catalog:main_status/0` and
@@ -113,7 +114,7 @@ that poll behind whatever else the shared `alarm_handler` manager is doing.
   an entry in `m:bondy_task_catalogue`, which carries its `impact` and
   `blast_radius`.
 
-Twelve of the fourteen entries have no task, and that is the answer rather than
+Thirteen of the fifteen entries have no task, and that is the answer rather than
 a gap. Only the mail relay and the MCP name collision have a remediation in the
 WAMP API; nothing in `bondy.*` fixes the others, from a failing HTTP connector
 service to a stopped shard instance. An empty list stops the search rather
@@ -181,7 +182,7 @@ the occurrence that raised the condition. It survives restatement exactly as
 
 Most alarms will not have one. Bondy has no ambient trace context — a trace
 rides in a message's options — and only the two retained-message ceilings are
-raised with one; the other twelve entries are raised with no request to
+raised with one; the other thirteen entries are raised with no request to
 inherit from. The field is absent there rather than filled with a freshly
 minted id that would correlate with nothing.
 

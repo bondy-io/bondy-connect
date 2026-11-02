@@ -19,10 +19,10 @@
 %% replicated tables. On by default. This is the single master switch: the sync
 %% scheduler process always runs, but with AAE off
 %% `bondy_router_app:maybe_setup_oplog_replication/0` wires no Partisan peer source, so
-%% the scheduler has no peers and stays inert. A single-node deployment is
-%% unaffected either way — it has no peer to sync with, and the authentication
-%% freshness fence treats a lone node as vacuously fresh (see
-%% `db.aae.fence.on_isolation`).
+%% the scheduler has no peers and stays inert. A lone node
+%% (`cluster.enabled = off`) is unaffected either way — it has no peer to sync
+%% with, and the authentication freshness fence treats it as vacuously fresh
+%% (see `db.aae.fence.on_isolation`).
 %% @end
 %% -----------------------------------------------------------------------------
 {mapping, "db.aae", "bondy_oplog.aae_enabled", [
@@ -184,14 +184,17 @@
 ]}.
 
 %% -----------------------------------------------------------------------------
-%% @doc What the authentication AE fence does on a node in a multi-node cluster
-%% that currently cannot confirm freshness with any peer — partitioned into a
-%% minority, or cold-started before its first AE round completes. Such a node
-%% still lists its peers in its Partisan membership, so it knows it may be
-%% lagging a security change made elsewhere. A genuine single-node deployment
-%% (membership is just this node) is NOT governed by this policy: with no peer
-%% to lag, its view is vacuously fresh and it always authenticates — so flipping
-%% `db.aae` on does not lock out a lone node.
+%% @doc What the authentication AE fence does on a clustered node
+%% (`cluster.enabled = on`) that currently cannot confirm freshness with any
+%% peer — partitioned into a minority, or cold-started before its first AE round
+%% completes. The policy governs such a node even when its membership lists only
+%% itself: a just-restarted member lists only itself, so a one-node membership
+%% is no evidence that no peer exists. A clustered node that never gains a peer
+%% therefore refuses authentication under `refuse`.
+%%
+%% A lone node (`cluster.enabled = off`) is NOT governed by this policy: with
+%% no peer to lag, its view is vacuously fresh and it always authenticates — so
+%% flipping `db.aae` on does not lock out a lone node.
 %%
 %% Only relevant when `db.aae` is on.
 %%
@@ -215,6 +218,19 @@
 {mapping, "db.aae.fence.on_isolation", "bondy_oplog.aae_fence_on_isolation", [
   {datatype, {enum, [refuse, proceed, quorum]}},
   {default, refuse}
+]}.
+
+%% -----------------------------------------------------------------------------
+%% @doc How long the authentication AE fence may stay closed before the node
+%% raises the bondy_auth_fence_closed alarm. The alarm is cleared when the
+%% fence admits again, and is not raised until the node has been up for this
+%% long, since the fence is closed at every boot until the first AE round.
+%% `0` disables the alarm. Only relevant when `db.aae` is on.
+%% @end
+%% -----------------------------------------------------------------------------
+{mapping, "db.aae.fence.alarm", "bondy_router.auth_fence_alarm_ms", [
+  {datatype, {duration, ms}},
+  {default, "5m"}
 ]}.
 
 
@@ -1753,76 +1769,102 @@ end}.
   end
 }.
 
-{mapping, "security.oidc.providers.enabled",
-"bondy_router.security.oidc.providers.enabled", [
-    {default, off},
-    {datatype, flag}
-]}.
-
-%% $provider_id will be used together with login_path and redirect_path to build
-%% the login and redirect callbacks.
+%% @doc The issuer URL of an OIDC provider the operator registers under
+%% $provider_id. The `security.oidc.providers.*' keys are reserved for a node
+%% registry of OIDC providers: this release validates them and does not use
+%% them. OIDC providers are configured on the realm, in `info.oidc_providers'.
 {mapping, "security.oidc.providers.$provider_id.issuer",
 "bondy_router.security.oidc.providers", [
   {datatype, string}
 ]}.
 
+%% @doc The OAuth2 client ID registered with the provider. Reserved, see
+%% `security.oidc.providers.$provider_id.issuer'.
 {mapping, "security.oidc.providers.$provider_id.client_id",
 "bondy_router.security.oidc.providers", [
   {datatype, string}
 ]}.
 
+%% @doc The OAuth2 client secret registered with the provider. Reserved, see
+%% `security.oidc.providers.$provider_id.issuer'.
 {mapping, "security.oidc.providers.$provider_id.client_secret",
 "bondy_router.security.oidc.providers", [
   {datatype, string}
 ]}.
 
-%% Example:  /oidc/aws_cognito/login
-{mapping, "security.oidc.providers.$provider_id.login_path",
+%% @doc Whether the provider may be reached over plain HTTP. Defaults to off.
+%% Reserved, see `security.oidc.providers.$provider_id.issuer'.
+{mapping, "security.oidc.providers.$provider_id.allow_unsafe_http",
 "bondy_router.security.oidc.providers", [
-    {datatype, string}
+  {datatype, flag}
 ]}.
 
-%% Example:  security.oidc.providers.aws.client_id = /oidc/aws_cognito/callback
-{mapping, "security.oidc.providers.$provider_id.redirect_path",
-"bondy_router.security.oidc.providers", [
-    {datatype, string}
-]}.
-
-
-{translation, "bondy_router.security.oidc.providers", fun(Conf0) ->
-    Conf = cuttlefish_variable:filter_by_prefix("security.oidc.providers", Conf0),
-
-    {Enabled, Providers0} = lists:foldl(
-        fun
-            ({["security", "oidc", "providers", "enabled" = Key], Value}, {Flag, Map}) ->
-                {Value, Map};
-
-            ({["security", "oidc", "providers", ProviderId0, Key], Value}, {Flag, Map0})
-            when Key == "client_id" orelse
-            Key == "client_secret" orelse
-            Key == "login_path" orelse
-            Key == "redirect_path" ->
-                ProviderId = list_to_binary(ProviderId0),
-                Update = #{list_to_atom(Key) => list_to_binary(Value)},
-                Map = maps:update_with(
-                    ProviderId,
-                    fun(ProviderConf) -> maps:merge(ProviderConf, Update) end,
-                    Update,
-                    Map0
-                ),
-                {Flag, Map}
+%% A provider without `issuer', an http or https URL with a host, or without
+%% `client_id' is left out with a warning rather than refused: nothing reads
+%% these keys yet, so they must not stop a configuration from generating. The
+%% checks live here: cuttlefish looks a validated value up by the mapping's
+%% literal `$provider_id' variable, so a validator on these keys never runs
+%% (cuttlefish_generator.erl:612-615).
+{translation, "bondy_router.security.oidc.providers", fun(Conf) ->
+    Root = ["security", "oidc", "providers"],
+    Entries = [
+        {list_to_binary(Id), list_to_atom(Key), Value}
+     || Key <- ["issuer", "client_id", "client_secret", "allow_unsafe_http"],
+        {_, Id} <- cuttlefish_variable:fuzzy_matches(
+            Root ++ ["$provider_id", Key], Conf
+        ),
+        Value <- [
+            case cuttlefish:conf_get(Root ++ [Id, Key], Conf) of
+                Flag when is_boolean(Flag) -> Flag;
+                String -> list_to_binary(String)
+            end
+        ]
+    ],
+    Providers = lists:foldl(
+        fun({Id, Key, Value}, Acc) ->
+            maps:update_with(
+                Id, fun(P) -> P#{Key => Value} end, #{Key => Value}, Acc
+            )
         end,
-        {false, maps:new()},
-        Conf
+        #{},
+        Entries
     ),
-    Providers = maps:fold(
-        fun(ProviderId, ProviderConf, Acc) ->
-            [#{id => ProviderId, config => ProviderConf} | Acc]
+    IsHttpUrl = fun(Url) ->
+        case uri_string:parse(Url) of
+            #{scheme := Scheme, host := Host} when
+                (Scheme == <<"http">> orelse Scheme == <<"https">>) andalso
+                    Host =/= <<>>
+            ->
+                true;
+            #{} ->
+                false;
+            {error, _, _} ->
+                false
+        end
+    end,
+    IsValid = fun
+        (#{issuer := Issuer, client_id := _}) -> IsHttpUrl(Issuer);
+        (#{}) -> false
+    end,
+    {Valid, Invalid} = maps:fold(
+        fun(Id, P, {V, I}) ->
+            case IsValid(P) of
+                true -> {V#{Id => maps:merge(#{allow_unsafe_http => false}, P)}, I};
+                false -> {V, [Id | I]}
+            end
         end,
-        [],
-        Providers0
+        {#{}, []},
+        Providers
     ),
-    #{enabled => Enabled, providers => Providers}
+    _ = [
+        cuttlefish:warn(
+            "security.oidc.providers." ++ binary_to_list(Id) ++
+                " is left out: it needs issuer, an http or https URL with a"
+                " host, and client_id"
+        )
+     || Id <- lists:sort(Invalid)
+    ],
+    Valid
 end}.
 
 %% =============================================================================

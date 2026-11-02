@@ -366,7 +366,7 @@ protocol_opts(#{name := Name}) ->
         stream_handlers => [
             cowboy_metrics_h, cowboy_compress_h, cowboy_stream_h
         ],
-        middlewares => [cowboy_router, cowboy_handler],
+        middlewares => [cowboy_router, bondy_http_admission, cowboy_handler],
         hibernate => true
     }.
 

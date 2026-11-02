@@ -347,8 +347,8 @@ rate).
 |---|---|---|---|---|
 | `connection` | source IP | transport handler, before any per-connection work | 20/s, burst 100 | TCP: socket closed. WebSocket: HTTP `429` |
 | `handshake` | source IP | `HELLO`, after the load admission gate | 10/s, burst 50 | `ABORT` with `wamp.error.unavailable` |
-| `auth` | source IP | `AUTHENTICATE`, before credential verification | 5/s, burst 20 | `ABORT` with `wamp.error.unavailable` |
-| `http` | source IP | every HTTP request — API Gateway, Admin API and MCP endpoints | 100/s, burst 500 | HTTP `429` with a `retry-after` header |
+| `auth` | source IP | `AUTHENTICATE`, before credential verification; the OAuth2 endpoints (`/oauth/token`, `/oauth/revoke`, `/oauth/jwks`), before any credential check | 5/s, burst 20 | `ABORT` with `wamp.error.unavailable`; HTTP `429` with a `retry-after` header on the OAuth2 endpoints |
+| `http` | source IP | API Gateway, Admin API and MCP requests, before authentication, so refused requests count too | 100/s, burst 500 | HTTP `429` with a `retry-after` header |
 | `message` | session | `CALL` / `PUBLISH` / `SUBSCRIBE` / `REGISTER` | 1000/s, burst 2000 | `ERROR` with `wamp.error.unavailable`, or a silent drop |
 
 The `auth` limit applies *before* verification, which is the point:

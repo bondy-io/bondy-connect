@@ -10,12 +10,20 @@ on:
       # Named pre-releases (1.0.0-rc.amber). The ordinal form above only
       # accepts digits after the final dot.
       - '[0-9]+.[0-9]+.[0-9]+-[a-zA-Z0-9]+.[a-zA-Z0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+.[0-9]+'
 
 jobs:
 
   build-push-arm64:
     runs-on: ubuntu-24-arm64-4x
+    strategy:
+      matrix:
+        include:
+          - variant: debian
+            file: ./deployment/Dockerfile
+            suffix: ''
+          - variant: alpine
+            file: ./deployment/alpine.Dockerfile
+            suffix: '-alpine'
 
     steps:
       # Not strictly required as it should default based on runner)
@@ -58,11 +66,11 @@ jobs:
           flavor: |
             latest=false
             prefix=
-            suffix=
+            suffix=${{ matrix.suffix }}
           labels: |
             maintainer=Leapsight
             org.opencontainers.image.title=Bondy Connect
-            org.opencontainers.image.description=Bondy is an open source, always-on and scalable application networking platform connecting all elements of a distributed application—offering event and service mesh capabilities combined. From web and mobile apps to IoT devices and backend microservices, Bondy allows everything to talk using one simple communication protocol.
+            org.opencontainers.image.description=Bondy Connect is an open-source application networking platform. It connects the parts of a distributed application — web and mobile apps, IoT devices, backend services and AI agents — through one protocol.
             org.opencontainers.image.vendor=Leapsight
 
       - name: Build and push
@@ -72,11 +80,21 @@ jobs:
           provenance: mode=max
           push: true
           context: .
-          file: ./deployment/Dockerfile
+          file: ${{ matrix.file }}
           tags: leapsight/${{ steps.meta.outputs.tags }}-arm64
+          labels: ${{ steps.meta.outputs.labels }}
 
   build-push-x64:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - variant: debian
+            file: ./deployment/Dockerfile
+            suffix: ''
+          - variant: alpine
+            file: ./deployment/alpine.Dockerfile
+            suffix: '-alpine'
 
     steps:
       # Not strictly required as it should default based on runner)
@@ -119,11 +137,11 @@ jobs:
           flavor: |
             latest=false
             prefix=
-            suffix=
+            suffix=${{ matrix.suffix }}
           labels: |
             maintainer=Leapsight
             org.opencontainers.image.title=Bondy Connect
-            org.opencontainers.image.description=Bondy is an open source, always-on and scalable application networking platform connecting all elements of a distributed application—offering event and service mesh capabilities combined. From web and mobile apps to IoT devices and backend microservices, Bondy allows everything to talk using one simple communication protocol.
+            org.opencontainers.image.description=Bondy Connect is an open-source application networking platform. It connects the parts of a distributed application — web and mobile apps, IoT devices, backend services and AI agents — through one protocol.
             org.opencontainers.image.vendor=Leapsight
 
       - name: Build and push
@@ -133,13 +151,22 @@ jobs:
           provenance: mode=max
           push: true
           context: .
-          file: ./deployment/Dockerfile
+          file: ${{ matrix.file }}
           tags: leapsight/${{ steps.meta.outputs.tags }}-amd64
           labels: ${{ steps.meta.outputs.labels }}
 
   create-manifests:
     runs-on: ubuntu-latest
     needs: [build-push-x64, build-push-arm64]
+    strategy:
+      matrix:
+        include:
+          - variant: debian
+            file: ./deployment/Dockerfile
+            suffix: ''
+          - variant: alpine
+            file: ./deployment/alpine.Dockerfile
+            suffix: '-alpine'
 
     steps:
       - uses: actions/checkout@v6
@@ -167,11 +194,11 @@ jobs:
           flavor: |
             latest=false
             prefix=
-            suffix=
+            suffix=${{ matrix.suffix }}
           labels: |
             maintainer=Leapsight
             org.opencontainers.image.title=Bondy Connect
-            org.opencontainers.image.description=Bondy is an open source, always-on and scalable application networking platform connecting all elements of a distributed application—offering event and service mesh capabilities combined. From web and mobile apps to IoT devices and backend microservices, Bondy allows everything to talk using one simple communication protocol.
+            org.opencontainers.image.description=Bondy Connect is an open-source application networking platform. It connects the parts of a distributed application — web and mobile apps, IoT devices, backend services and AI agents — through one protocol.
             org.opencontainers.image.vendor=Leapsight
 
       - name: Create branch/tag manifest and push
@@ -197,3 +224,19 @@ jobs:
           docker buildx imagetools create \
             --tag ghcr.io/bondy-io/${{ steps.meta.outputs.tags }} \
             docker.io/leapsight/${{ steps.meta.outputs.tags }}
+
+      # A final release (a version tag without a pre-release suffix) also
+      # makes its Debian image `latest`. A separate step because the steps above take
+      # `steps.meta.outputs.tags` as a single tag.
+      - name: Tag a final release as latest
+        if: >-
+          matrix.variant == 'debian' &&
+          startsWith(github.ref, 'refs/tags/') &&
+          !contains(github.ref_name, '-')
+        run: |
+          docker buildx imagetools create \
+            --tag docker.io/leapsight/bondy-connect:latest \
+            docker.io/leapsight/bondy-connect:${{ github.ref_name }}
+          docker buildx imagetools create \
+            --tag ghcr.io/bondy-io/bondy-connect:latest \
+            ghcr.io/bondy-io/bondy-connect:${{ github.ref_name }}

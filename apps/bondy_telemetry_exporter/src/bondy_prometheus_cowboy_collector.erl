@@ -274,7 +274,7 @@ label_value(port, #{listener_port := Port}) ->
 label_value(method, #{req := Req}) ->
     cowboy_req:method(Req);
 label_value(route, #{user_data := UserData}) when is_map(UserData) ->
-    %% Route TEMPLATE injected by the gateway rest handler via
+    %% Route TEMPLATE set by `bondy_http_admission` via
     %% `metrics_user_data` (undefined for non-gateway requests).
     maps:get(route, UserData, undefined);
 label_value(route, _) ->

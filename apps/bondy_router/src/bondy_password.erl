@@ -196,14 +196,23 @@ is_type(#{type := password}) ->
 is_type(_) ->
     false.
 
--spec protocol(t()) -> protocol() | undefined.
+-doc """
+Returns the protocol a stored password can serve.
+
+A record from before version 1.2 (`1.0` or `1.1`) returns `legacy`. It is a
+PBKDF2 hash that `verify_string/2` checks, but it does not carry the CRA or
+SCRAM data a challenge needs: its hash function and salt need not be the ones
+a WAMP-CRA client derives with, so it can serve the password method only.
+A password change stores a current record.
+""".
+-spec protocol(t()) -> protocol() | legacy | undefined.
 
 protocol(#{type := password, version := ?VERSION, protocol := Value}) ->
     Value;
 protocol(#{version := <<"1.0">>}) ->
-    cra;
+    legacy;
 protocol(#{version := <<"1.1">>}) ->
-    cra;
+    legacy;
 protocol(_) ->
     undefined.
 

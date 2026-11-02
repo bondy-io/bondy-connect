@@ -190,6 +190,7 @@ stays opaque.
 -export([lookup/2]).
 -export([new/2]).
 -export([new/3]).
+-export([new_local_operator/2]).
 -export([node/1]).
 -export([nodestring/1]).
 -export([peer/1]).
@@ -251,6 +252,20 @@ new(RealmUri, Opts) when is_binary(RealmUri) ->
     new(bondy_session_id:new(), bondy_realm:fetch(RealmUri), Opts);
 new(Realm, Opts) when is_map(Opts) ->
     new(bondy_session_id:new(), Realm, Opts).
+
+-doc """
+Creates a transient session that RBAC does not apply to, for a request on the
+`admin_local` listener. Only the node's Unix user and root can connect to that
+listener: its socket is mode 0600
+(`bondy_admin_listener_SUITE:admin_local_socket_is_bound_and_serves`). No RBAC
+change can lock them out
+(`bondy_admin_listener_SUITE:admin_local_is_not_locked_out_by_rbac`).
+""".
+-spec new_local_operator(uri(), properties()) -> t() | no_return().
+
+new_local_operator(RealmUri, Opts) when is_binary(RealmUri) ->
+    Session = new(RealmUri, Opts),
+    Session#session{security_enabled = false}.
 
 -spec new(bondy_session_id:t(), uri() | bondy_realm:t(), properties()) ->
     t() | no_return().

@@ -21,7 +21,10 @@ all() ->
     [
         no_anonymous_authmethod,
         admin_grant_is_scoped,
-        migration_removes_legacy_anon_and_is_idempotent
+        migration_removes_legacy_anon_and_is_idempotent,
+        hardening_warnings_name_no_review_ids,
+        legacy_password_warning_names_change_password,
+        hardening_tolerates_a_deleted_admin_user
     ].
 
 init_per_suite(Config) ->
@@ -96,3 +99,109 @@ migration_removes_legacy_anon_and_is_idempotent(_Config) ->
 
     ok = bondy_realm:harden_master_realm(),
     ?assertNot(lists:member(?WAMP_ANON_AUTH, bondy_realm:authmethods(Uri))).
+
+%% A legacy master realm (the anonymous authmethod and grant, and the
+%% `bondy-admin` password) gets the three hardening warnings. Operators read
+%% them, so none names an internal review finding such as "(D-1)".
+hardening_warnings_name_no_review_ids(_Config) ->
+    Uri = ?MASTER_REALM_URI,
+    _ = bondy_realm:update(Uri, #{
+        ~"authmethods" => bondy_realm:authmethods(Uri) ++ [?WAMP_ANON_AUTH]
+    }),
+    ok = bondy_rbac:grant(Uri, #{
+        ~"permissions" => [~"wamp.call"],
+        ~"uri" => ~"",
+        ~"match" => ~"prefix",
+        ~"roles" => [~"anonymous"]
+    }),
+    ok = bondy_rbac_user:change_password(Uri, ~"admin", ~"bondy-admin"),
+
+    #{level := Primary} = logger:get_primary_config(),
+    ok = logger:set_primary_config(level, all),
+    ok = logger:add_handler(?MODULE, ?MODULE, #{config => #{pid => self()}}),
+    try
+        ok = bondy_realm:harden_master_realm()
+    after
+        ok = logger:remove_handler(?MODULE),
+        ok = logger:set_primary_config(level, Primary)
+    end,
+
+    Descriptions = hardening_warnings([]),
+    ?assertEqual(3, length(Descriptions), Descriptions),
+    ?assertEqual(
+        [], [D || D <- Descriptions, string:find(D, "(D-") =/= nomatch]
+    ).
+
+%% The legacy-password warning fires for a realm that already exists, so it
+%% must name `bondy.user.change_password`, not the configuration key that
+%% seeds the password of a new master realm.
+legacy_password_warning_names_change_password(_Config) ->
+    Uri = ?MASTER_REALM_URI,
+    ok = bondy_rbac_user:change_password(Uri, ~"admin", ~"bondy-admin"),
+
+    #{level := Primary} = logger:get_primary_config(),
+    ok = logger:set_primary_config(level, all),
+    ok = logger:add_handler(?MODULE, ?MODULE, #{config => #{pid => self()}}),
+    try
+        ok = bondy_realm:harden_master_realm()
+    after
+        ok = logger:remove_handler(?MODULE),
+        ok = logger:set_primary_config(level, Primary)
+    end,
+
+    Descriptions = hardening_warnings([]),
+    [Warning] = [
+        D
+     || D <- Descriptions, string:find(D, "bondy-admin") =/= nomatch
+    ],
+    ?assertNotEqual(
+        nomatch, string:find(Warning, "bondy.user.change_password")
+    ),
+    ?assertEqual(
+        [],
+        [
+            D
+         || D <- Descriptions,
+            string:find(D, "security.admin_user.password") =/= nomatch
+        ]
+    ).
+
+%% An operator may delete the master `admin` user; the boot migration must
+%% still succeed.
+hardening_tolerates_a_deleted_admin_user(_Config) ->
+    Uri = ?MASTER_REALM_URI,
+    ok = bondy_rbac_user:remove(Uri, ~"admin"),
+    try
+        ?assertEqual(ok, bondy_realm:harden_master_realm())
+    after
+        {ok, _} = bondy_rbac_user:add(
+            Uri,
+            bondy_rbac_user:new(#{
+                username => ~"admin",
+                password => ~"aDminPassw0rd",
+                groups => [~"bondy.administrators"]
+            })
+        )
+    end.
+
+hardening_warnings(Acc) ->
+    receive
+        {hardening_warning, D} -> hardening_warnings([D | Acc])
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+%% logger handler callback for the case above: forwards the warnings
+%% `bondy_realm' logs, and nothing else, to the test process.
+log(
+    #{
+        level := warning,
+        msg := {report, #{description := D}},
+        meta := #{mfa := {bondy_realm, _, _}}
+    },
+    #{config := #{pid := Pid}}
+) ->
+    Pid ! {hardening_warning, lists:flatten(D)},
+    ok;
+log(_Event, _Config) ->
+    ok.

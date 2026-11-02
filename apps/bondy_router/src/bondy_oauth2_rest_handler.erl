@@ -148,7 +148,6 @@ credentials, resource owner password and refresh token grant flows.
 -export([is_authorized/2]).
 -export([options/2]).
 -export([provide/2]).
--export([rate_limited/2]).
 -export([resource_existed/2]).
 -export([resource_exists/2]).
 
@@ -231,16 +230,6 @@ is_authorized(Req0, St0) ->
 
 forbidden(Req, St) ->
     {false, Req, St}.
-
-%% These endpoints verify credentials, so they draw from the `auth`
-%% class — the same per-source-IP credential-guessing budget WAMP
-%% AUTHENTICATE consumes (`security.rate_limit.auth.*`, off by default).
-rate_limited(Req, St) ->
-    Dims = #{realm => St#state.realm_uri},
-    case bondy_http_utils:throttle(auth, Req, Dims) of
-        ok -> {false, Req, St};
-        throttled -> {{true, 1}, Req, St}
-    end.
 
 resource_exists(Req, St) ->
     {true, Req, St}.
@@ -480,7 +469,7 @@ token_flow(#{?GRANT_TYPE := <<"password">>} = Map, Req0, St0) ->
                 reason => EReason,
                 device_id => DeviceId,
                 realm_uri => RealmUri,
-                cient_ip => inet_utils:ip_address_to_binary(SourceIP)
+                client_ip => inet_utils:ip_address_to_binary(SourceIP)
             }),
             {stop, reply(oauth2_invalid_grant, Req0), St0}
     end;

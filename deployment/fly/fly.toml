@@ -16,7 +16,9 @@ kill_timeout = "30s"
   image = "leapsight/bondy-connect:develop-alpine"
 
 [deploy]
-  strategy = "rolling"
+  # Bondy does not support rolling upgrades, so a deploy replaces every
+  # machine at once.
+  strategy = "immediate"
 
 [env]
   BONDY_DATA_DIR = "/bondy/data"

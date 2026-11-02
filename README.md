@@ -3,10 +3,9 @@
 ![Version](https://img.shields.io/badge/version-1.0.0-blue?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=for-the-badge)<br>
 ![Docker Pulls](https://img.shields.io/docker/pulls/leapsight/bondy-connect?style=for-the-badge)
-![Docker Build (master)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy-connect/docker-debian.yaml?&branch=master&label=docker-master&style=for-the-badge)
+![Docker Build (main)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy-connect/docker-debian.yaml?&branch=main&label=docker-main&style=for-the-badge)
 ![Docker Build (develop)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy-connect/docker-debian.yaml?&branch=develop&label=docker-develop&style=for-the-badge)
 <br>![Architectures](https://img.shields.io/badge/architecture-linux%2Famd64%20%7C%20linux%2Farm64%20%7C%20macOS%2Fintel%20%7C%20macOS%2Fapple%20silicon-lightgrey?style=for-the-badge)
-
 
 # Bondy Connect
 
@@ -167,6 +166,7 @@ default listeners:
 
 The images are built for `linux/amd64` and `linux/arm64`. They are published as
 `leapsight/bondy-connect:<version>` and `ghcr.io/bondy-io/bondy-connect:<version>`.
+From 1.0.1, each version also has an Alpine Linux image, `<version>-alpine`.
 
 ### Building from source
 
@@ -245,10 +245,12 @@ just node1
 
 ### Create a realm
 
-Every WAMP session belongs to a realm. Create one through the Admin API:
+Every WAMP session belongs to a realm. Create one through the Admin API on the
+node's local socket, which needs no credentials:
 
 ```shell
-curl -X POST "http://localhost:18081/realms" \
+SOCK=_build/node1/rel/bondy-connect/run/bondy_admin.sock
+curl --unix-socket "$SOCK" -X POST "http://localhost/realms" \
      -H 'Content-Type: application/json; charset=utf-8' \
      -H 'Accept: application/json; charset=utf-8' \
      -d '{"uri": "com.myrealm", "description": "My first realm"}'
@@ -258,9 +260,13 @@ While you experiment, disable security on the realm so that clients can connect
 without credentials:
 
 ```shell
-curl -X DELETE "http://localhost:18081/realms/com.myrealm/security_enabled" \
+curl --unix-socket "$SOCK" \
+     -X DELETE "http://localhost/realms/com.myrealm/security_enabled" \
      -H 'Accept: application/json; charset=utf-8'
 ```
+
+On port 18081 the Admin API needs a bearer token from the master realm. See
+[Authenticating to the Admin API](doc/guides/configuration/listeners.md#authenticating-to-the-admin-api).
 
 ### Start a second node
 
@@ -397,7 +403,8 @@ In addition, Bondy Connect provides:
 * [bondy.io](https://www.bondy.io)
 * [WAMP specification](https://wamp-proto.org)
 * [@bondyIO](https://twitter.com/bondyIO)
-* Recorded webinar: [Implementing a polyglot microservices architecture](https://www.youtube.com/watch?v=XxJ1IS8mo84) (10 July 2019)
+* Recorded webinar: [Implementing a polyglot microservices architecture](https://www.youtube.com/watch?v=XxJ1IS8mo84) (2019)
+* Recorded Conference Talk: [Introducing Bondy: The IoT, Web and Mobile Platform](https://youtu.be/19neQdxbYGM?si=IIqo985FL29oiLAS) (2023)
 
 ## License
 
