@@ -201,6 +201,7 @@ volume.
 -export([seal_job_pack_id/1]).
 -export([complete_seal/2]).
 -export([seal_in_flight/1]).
+-export([sealed_record_count/1]).
 
 -ifdef(TEST).
 %% The page codec is the durability contract with the on-disk format; the
@@ -845,6 +846,22 @@ instance_id(#?MODULE{writer = W}) -> bondy_mst_pack_writer:instance_id(W).
 -spec sealed_pack_ids(t()) -> [non_neg_integer()].
 sealed_pack_ids(#?MODULE{sealed_views = Views}) ->
     [V#sealed_view.pack_id || V <- Views].
+
+-doc """
+The number of records across the mounted sealed packs, summed from their
+in-memory indexes (no I/O). A page held by more than one sealed pack is
+counted once per pack, so this is an upper bound on the distinct pages
+the sealed set holds.
+""".
+-spec sealed_record_count(t()) -> non_neg_integer().
+sealed_record_count(#?MODULE{sealed_views = Views}) ->
+    lists:foldl(
+        fun(#sealed_view{idx = Idx}, N) ->
+            N + bondy_mst_pack_index:record_count(Idx)
+        end,
+        0,
+        Views
+    ).
 
 -doc """
 Returns a snapshot of the per-instance gauges listed below.

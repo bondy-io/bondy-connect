@@ -64,12 +64,23 @@
 %% pages; 100 MB is generous slack over that while sitting orders of
 %% magnitude below the orphaned-page-leak failure shape.
 -define(PAGE_BYTES_CEILING, 100 * 1024 * 1024).
+%% Write-volume reclamation case: the record floor it lowers the trigger to,
+%% and the write rounds it drives before giving up. With the trigger a shard
+%% shrank in round 3; without it no shard shrank in 9 rounds and the writes
+%% then slowed past `?RECLAIM_ROUND_TIMEOUT`, so the cap sits below that.
+-define(RECLAIM_MIN_RECORDS, 200).
+-define(RECLAIM_ROUNDS, 8).
+-define(RECLAIM_WRITES, 2000).
+-define(RECLAIM_VALUE_BYTES, 1024).
+-define(RECLAIM_ROUND_TIMEOUT, 120_000).
+-define(GC_PROBE_TAB, reclaim_gc_probe).
 
 all() ->
     [
         sustained_writes_registry_history_stays_bounded,
         silent_member_holds_compaction_and_rejoins,
-        truncated_prefix_is_held_and_repaired_by_rebootstrap
+        truncated_prefix_is_held_and_repaired_by_rebootstrap,
+        write_volume_reclaims_durable_packs_before_the_interval
     ].
 
 suite() ->
@@ -1861,6 +1872,179 @@ do_gap_forensics() ->
         )
     ]),
     #{gaps => Gaps, doored => Doored, timeline => Timeline}.
+
+%% =============================================================================
+%% DURABLE PACK RECLAMATION UNDER WRITE VOLUME
+%% =============================================================================
+
+%% A burst of writes (a restore, a re-sync) grows a `main/*` shard's sealed
+%% MST packs far faster than the hourly durable collection drains them; a
+%% 30 GB volume filled within 50 minutes of boot that way, with every shard's
+%% oldest live pack dated after the boot. The time trigger is pushed out of
+%% reach here, so only the write-volume trigger can collect: if the sealed
+%% pack set of some `main/*` shard on the writer never shrinks while the
+%% writes run, write volume does not trigger reclamation. Packs leave a
+%% store only through a collection (`bondy_mst_pack_store:gc/2`), so a
+%% shrinking pack count is a collection. Writes go through the real
+%% `bondy_db` API on one node; the schedulers run at their normal cadences.
+%%
+%% Exercises the trigger with a lowered record floor, so the suite's write
+%% volume crosses it; the default floor is not exercised.
+write_volume_reclaims_durable_packs_before_the_interval(Config) ->
+    [N1 | _] = Nodes = nodes_of(Config),
+    Env = [
+        {durable_gc_interval_ms, 86_400_000},
+        {durable_gc_min_records, ?RECLAIM_MIN_RECORDS}
+    ],
+    _ = [
+        ok = erpc:call(N, application, set_env, [bondy_oplog, K, V])
+     || N <- Nodes, {K, V} <- Env
+    ],
+    ok = erpc:call(N1, ?MODULE, do_gc_probe_start, []),
+    try
+        Shrunk = reclaim_rounds(
+            N1, 1, erpc:call(N1, ?MODULE, do_main_packs, [])
+        ),
+        ?assertMatch(
+            {shrunk, _, _},
+            Shrunk,
+            "no main/* shard's sealed pack set shrank under write volume"
+        ),
+        ?assertEqual([], erpc:call(N1, ?MODULE, do_unservable_roots, []))
+    after
+        ct:pal("collections after the last round: ~p", [
+            erpc:call(N1, ?MODULE, do_gc_probe_drain, [])
+        ]),
+        ok = erpc:call(N1, ?MODULE, do_gc_probe_stop, []),
+        _ = [
+            ok = erpc:call(N, application, unset_env, [bondy_oplog, K])
+         || N <- Nodes, {K, _} <- Env
+        ]
+    end.
+
+%% @private
+%% One write round per call; stops at the first `main/*` shard whose sealed
+%% pack count fell since the previous sample, or after `?RECLAIM_ROUNDS`.
+reclaim_rounds(_Node, Round, Before) when Round > ?RECLAIM_ROUNDS ->
+    {not_shrunk, Before};
+reclaim_rounds(Node, Round, Before) ->
+    {WriteUs, ok} = timer:tc(fun() ->
+        erpc:call(
+            Node, ?MODULE, do_reclaim_writes, [Round], ?RECLAIM_ROUND_TIMEOUT
+        )
+    end),
+    %% The gc scheduler ticks every second; give every shard a few ticks.
+    timer:sleep(3000),
+    After = erpc:call(Node, ?MODULE, do_main_packs, []),
+    ct:pal("round ~p: writes took ~p ms; collections: ~p", [
+        Round,
+        WriteUs div 1000,
+        erpc:call(Node, ?MODULE, do_gc_probe_drain, [])
+    ]),
+    Shrunk = [
+        {Leaf, B, A}
+     || {Leaf, A} <- maps:to_list(After),
+        B <- [maps:get(Leaf, Before, 0)],
+        A < B
+    ],
+    ct:pal("round ~p: ~p sealed packs on ~p shards, shrunk: ~p", [
+        Round, lists:sum(maps:values(After)), map_size(After), Shrunk
+    ]),
+    case Shrunk of
+        [] -> reclaim_rounds(Node, Round + 1, After);
+        [_ | _] -> {shrunk, Round, Shrunk}
+    end.
+
+%% @private
+%% Records every durable collection on this node: one row per
+%% `[bondy_mst, gc, stop]` span (the whole `bondy_mst:gc/2`, mark included)
+%% and per `[bondy_mst, page_store, gc]` event (the pack store's rewrite).
+%% A holder process owns the table so rows outlive the handler's caller.
+do_gc_probe_start() ->
+    Self = self(),
+    Holder = spawn(fun() ->
+        _ = ets:new(?GC_PROBE_TAB, [ordered_set, public, named_table]),
+        Self ! {?GC_PROBE_TAB, ready},
+        receive
+            stop -> ok
+        end
+    end),
+    receive
+        {?GC_PROBE_TAB, ready} -> ok
+    after 5000 -> error({gc_probe_start_timeout, Holder})
+    end,
+    true = register(?GC_PROBE_TAB, Holder),
+    ok = telemetry:attach_many(
+        ?GC_PROBE_TAB,
+        [[bondy_mst, gc, stop], [bondy_mst, page_store, gc]],
+        fun ?MODULE:handle_gc_probe_event/4,
+        undefined
+    ).
+
+%% @private
+handle_gc_probe_event([bondy_mst, gc, stop], #{duration := D}, Meta, _) ->
+    Ms = erlang:convert_time_unit(D, native, millisecond),
+    Row = {span, Ms, maps:get(name, Meta, undefined), Meta},
+    true = ets:insert(?GC_PROBE_TAB, {erlang:unique_integer([monotonic]), Row});
+handle_gc_probe_event([bondy_mst, page_store, gc], M, Meta, _) ->
+    Row = {
+        pack,
+        maps:get(duration_us, M) div 1000,
+        maps:get(instance_id, Meta),
+        maps:get(reason, Meta),
+        maps:with([packs_retired, pages_kept, pages_dropped, bytes_freed], M)
+    },
+    true = ets:insert(?GC_PROBE_TAB, {erlang:unique_integer([monotonic]), Row}).
+
+%% @private
+%% The rows recorded since the last drain, oldest first, then removed.
+do_gc_probe_drain() ->
+    Rows = ets:select(?GC_PROBE_TAB, [{{'$1', '$2'}, [], [{{'$1', '$2'}}]}]),
+    _ = [ets:delete(?GC_PROBE_TAB, K) || {K, _} <- Rows],
+    [Row || {_, Row} <- Rows].
+
+%% @private
+do_gc_probe_stop() ->
+    ok = telemetry:detach(?GC_PROBE_TAB),
+    ?GC_PROBE_TAB ! stop,
+    ok.
+
+%% @private
+%% `?RECLAIM_WRITES` distinct keys with a padded value, spread over every
+%% `main/*` shard by key.
+do_reclaim_writes(Round) ->
+    Band = stale_band(1),
+    Pad = binary:copy(<<"x">>, ?RECLAIM_VALUE_BYTES),
+    R = integer_to_binary(Round),
+    lists:foreach(
+        fun(I) ->
+            Key = <<"rk_", R/binary, "_", (integer_to_binary(I))/binary>>,
+            ok = do_stale_apply(Band, Key, #{pad => Pad})
+        end,
+        lists:seq(1, ?RECLAIM_WRITES)
+    ).
+
+%% @private
+%% `#{Leaf => SealedPackCount}` for every `main-*` MST leaf directory under
+%% this node's `<data>/bondy_db/mst`.
+do_main_packs() ->
+    DataDir = application:get_env(bondy_router, platform_data_dir, "data"),
+    Root = filename:join([DataDir, "bondy_db", "mst"]),
+    filelib:fold_files(
+        Root,
+        "^pack-[0-9]+\\.pack$",
+        true,
+        fun(F, Acc) ->
+            Leaf = filename:basename(filename:dirname(F)),
+            case Leaf of
+                "main-" ++ _ ->
+                    maps:update_with(Leaf, fun(C) -> C + 1 end, 1, Acc);
+                _ ->
+                    Acc
+            end
+        end,
+        #{}
+    ).
 
 %% =============================================================================
 %% MISC HELPERS

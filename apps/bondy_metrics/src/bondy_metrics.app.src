@@ -9,7 +9,7 @@
    "`counters`/`atomics` modules, with a declaration registry for "
    "exposition. Self-contained (no Bondy dependencies) and reusable "
    "outside Bondy as a git dependency."},
-  {vsn, "1.0.0"},
+  {vsn, "1.0.2"},
   %% Library application: the `bondy_metrics` gen_server is started by the
   %% consumer's supervision tree via `bondy_metrics:child_spec/0` (in
   %% Bondy, by `bondy_oplog_sup`). No `{mod, _}` — starting this app does
