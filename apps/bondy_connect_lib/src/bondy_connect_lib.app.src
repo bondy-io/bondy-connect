@@ -9,7 +9,7 @@
    "bondy_connect_table_manager, the ETS owner-of-last-resort every Bondy app "
    "borrows tables from, started by this app's supervisor so it is up "
    "before any of them."},
-  {vsn, "1.0.0"},
+  {vsn, "1.0.2"},
   {registered, [bondy_connect_lib_sup, bondy_connect_table_manager]},
   {mod, {bondy_connect_lib_app, []}},
   {applications,

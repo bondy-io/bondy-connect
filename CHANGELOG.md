@@ -1,4 +1,9 @@
 # CHANGELOG
+## 1.0.2
+
+### Fixes
+* The pages a durable table's anti-entropy tree no longer used were reclaimed at most once an hour, and never in a node's first hour after boot, while they grow with every write. A burst of writes, such as a restore or a re-sync, could fill the data volume under `bondy_db/mst` before the first reclamation, and a node that then restarted onto the full volume could not open its storage. Reclamation now also runs once a shard's tree has doubled since the last one, so the space it holds follows the write volume instead of the clock.
+
 ## 1.0.1
 
 ### Action required

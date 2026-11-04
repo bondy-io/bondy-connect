@@ -65,12 +65,21 @@
 %% costs only a few retained pages for this long.
 -define(PEER_ROOT_PIN_TTL_MS, 120_000).
 
-%% Minimum gap between durable (pack) page reclamations — see
-%% `maybe_collect_durable/1`. A collection rewrites every sealed pack, so this
-%% is deliberately coarse: the leak it drains is slow (durable namespaces are
-%% low write-volume) and the rewrite is the most expensive thing the instance
-%% can do. Override with `bondy_oplog.durable_gc_interval_ms`.
+%% The two triggers of a durable (pack) page reclamation — see
+%% `maybe_collect_durable/1`. A collection rewrites every sealed pack, the most
+%% expensive thing the instance can do, so the time trigger is coarse. Write
+%% volume has its own trigger: a collection is also due once the sealed packs
+%% hold `?DURABLE_GC_GROWTH_FACTOR` times the records they held after the last
+%% one, never below `?DURABLE_GC_MIN_RECORDS`. The intent: a rewrite runs once
+%% per constant-factor growth, so its cost is spread over the writes that grew
+%% the set, and the sealed record count between collections is bounded by the
+%% factor times the post-collection count, plus what one compaction tick
+%% appends. Override with
+%% `bondy_oplog.durable_gc_interval_ms`, `bondy_oplog.durable_gc_growth_factor`
+%% and `bondy_oplog.durable_gc_min_records`.
 -define(DURABLE_GC_INTERVAL_MS, 3_600_000).
+-define(DURABLE_GC_GROWTH_FACTOR, 2).
+-define(DURABLE_GC_MIN_RECORDS, 10_000).
 
 %% Async pack-store seal: how many times the instance re-runs a failed seal
 %% job before giving up and stopping so the supervisor restart + reopen
@@ -223,6 +232,10 @@ behind that barrier.
     %% Monotonic ms of the last durable (pack) page reclamation. See
     %% `maybe_collect_durable/1`.
     last_durable_gc = undefined :: undefined | integer(),
+    %% `bondy_mst_pack_store:sealed_record_count/1` when the clock was armed or
+    %% after the last durable reclamation; the write-volume trigger's
+    %% reference point. See `maybe_collect_durable/1`.
+    durable_gc_baseline = 0 :: non_neg_integer(),
     backend :: backend(),
     validator_module :: module(),
     validator_state :: term(),
@@ -6076,43 +6089,70 @@ cut(MST, Point, #state{instance_id = Id}) ->
 %% the ETS backend; on the pack backend truncation merely unlinks the dropped
 %% subtrees. Runs on the compaction tick rather than per truncation because a
 %% pack collection is a full sealed-pack REWRITE that the store coalesces
-%% whenever more than one sealed pack exists. Gated on a pack store, no seal in
-%% flight, and at most one collection per `durable_gc_interval_ms`. Must run in
-%% this process: the sealed-pack fds are owned here (`process_bound_reads`).
+%% whenever more than one sealed pack exists. Gated on a pack store and no seal
+%% in flight; due when `durable_gc_interval_ms` has passed or the sealed set
+%% has grown past the write-volume trigger (`?DURABLE_GC_GROWTH_FACTOR`). Must
+%% run in this process: the sealed-pack fds are owned here
+%% (`process_bound_reads`).
 maybe_collect_durable(#state{mst = undefined} = State) ->
     State;
 maybe_collect_durable(#state{mst = MST} = State) ->
     case pack_backend(MST) of
-        undefined ->
-            State;
-        Backend ->
-            Now = erlang:monotonic_time(millisecond),
-            Interval = application:get_env(
-                bondy_oplog, durable_gc_interval_ms, ?DURABLE_GC_INTERVAL_MS
-            ),
-            case State#state.last_durable_gc of
-                undefined ->
-                    %% ARM the clock, do not collect. A shard that has been
-                    %% running for months reopens with many sealed packs, and
-                    %% the collection coalesces whenever there is more than
-                    %% one, so firing on the first tick after boot would stall
-                    %% the instance on a full sealed-pack rewrite exactly when
-                    %% it is trying to come up.
-                    State#state{last_durable_gc = Now};
-                Last when Now - Last < Interval ->
-                    State;
-                _ ->
-                    case bondy_mst_pack_store:seal_in_flight(Backend) of
-                        true ->
-                            %% Leave the clock alone so the next tick retries
-                            %% rather than waiting out another whole interval.
-                            State;
-                        false ->
-                            MST1 = bondy_mst:gc(MST, pinned_roots(State)),
-                            State#state{mst = MST1, last_durable_gc = Now}
-                    end
-            end
+        undefined -> State;
+        Backend -> maybe_collect_durable(MST, Backend, State)
     end.
+
+%% @private
+maybe_collect_durable(_MST, Backend, #state{last_durable_gc = undefined} = S) ->
+    %% ARM the clock and the baseline, do not collect. A shard that has been
+    %% running for months reopens with many sealed packs, and the collection
+    %% coalesces whenever there is more than one, so firing on the first tick
+    %% after boot would stall the instance on a full sealed-pack rewrite
+    %% exactly when it is trying to come up.
+    S#state{
+        last_durable_gc = erlang:monotonic_time(millisecond),
+        durable_gc_baseline = bondy_mst_pack_store:sealed_record_count(Backend)
+    };
+maybe_collect_durable(MST, Backend, State) ->
+    Now = erlang:monotonic_time(millisecond),
+    Due =
+        is_durable_gc_due(Now, Backend, State) andalso
+            %% Leave the clock alone so the next tick retries rather than
+            %% waiting out another whole interval.
+            not bondy_mst_pack_store:seal_in_flight(Backend),
+    case Due of
+        false ->
+            State;
+        true ->
+            MST1 = bondy_mst:gc(MST, pinned_roots(State)),
+            %% The baseline is what the collection left, whether it rewrote,
+            %% skipped under the dead-fraction threshold or aborted, so a
+            %% collection that reclaims nothing is not re-run every tick.
+            Count = bondy_mst_pack_store:sealed_record_count(
+                pack_backend(MST1)
+            ),
+            State#state{
+                mst = MST1,
+                last_durable_gc = Now,
+                durable_gc_baseline = Count
+            }
+    end.
+
+%% @private
+is_durable_gc_due(Now, Backend, #state{} = State) ->
+    #state{last_durable_gc = Last, durable_gc_baseline = Baseline} = State,
+    Interval = application:get_env(
+        bondy_oplog, durable_gc_interval_ms, ?DURABLE_GC_INTERVAL_MS
+    ),
+    Factor = application:get_env(
+        bondy_oplog, durable_gc_growth_factor, ?DURABLE_GC_GROWTH_FACTOR
+    ),
+    Floor = application:get_env(
+        bondy_oplog, durable_gc_min_records, ?DURABLE_GC_MIN_RECORDS
+    ),
+    Now - Last >= Interval orelse
+        bondy_mst_pack_store:sealed_record_count(Backend) >=
+            Factor * max(Baseline, Floor).
 
 %% @private
 %% The pack store's backend state, or `undefined` for any other store. Keyed

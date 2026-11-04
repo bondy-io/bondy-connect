@@ -80,7 +80,7 @@ project, depend on it via `git_subdir` in `rebar.config`:
 {deps, [
     {bondy_connect_sdk,
         {git_subdir, "https://github.com/bondy-io/bondy-connect.git",
-            {tag, "1.0.0"}, "apps/bondy_connect_sdk"}}
+            {tag, "1.0.2"}, "apps/bondy_connect_sdk"}}
 ]}.
 ```
 
