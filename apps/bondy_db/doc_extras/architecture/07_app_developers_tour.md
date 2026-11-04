@@ -211,8 +211,8 @@ with `db.main.shard_count` and `registry` with `db.registry.shard_count`;
 both default to 16.
 
 Each oplog instance runs its own anti-entropy sessions, so more shards
-means more sessions. The node-wide caps `db.aae.max_concurrency`
-(default 3) and `db.aae.max_pages_in_flight` (default 2048) bound how
+means more sessions. The node-wide caps `db.oplog.aae.max_concurrency`
+(default 3) and `db.oplog.aae.max_pages_in_flight` (default 2048) bound how
 many sessions run at once and how many MST pages they hold, so extra
 shards take turns rather than run in parallel
 ([chapter 06](06_compaction_and_bootstrap.md#keeping-anti-entropy-subordinate-to-routing)).
@@ -619,10 +619,10 @@ security decision has to stay correct across nodes without waiting for
 consensus. Bondy combines three measures: **fence the read, version the
 token, react to the merge.**
 
-**Fence the read.** When `db.aae` is on, `bondy_auth` calls
+**Fence the read.** When `db.oplog.aae` is on, `bondy_auth` calls
 `bondy_db:ensure_fresh/2` before authentication, with the
 `security_users`, `security_user_grants` and `security_group_grants`
-tables and the bound `db.aae.fence.max_lag` (default `60s`). If a primary
+tables and the bound `db.oplog.aae.fence.max_lag` (default `60s`). If a primary
 shard of one of those tables has not completed an anti-entropy round
 within the bound, authentication fails with
 `temporarily_unavailable`. The check reads one atomic counter per primary
@@ -677,7 +677,7 @@ current grants.
   must be bounded. It returns `ok` or `{stale, Namespaces}`. A shard is
   fresh within `MaxLagMs` of its last completed anti-entropy round. A
   local commit does not refresh it, so with anti-entropy off every primary
-  shard reads as stale. Gate the call on `db.aae`, as `bondy_auth` does.
+  shard reads as stale. Gate the call on `db.oplog.aae`, as `bondy_auth` does.
 - **`bondy_oplog_core:read_batch/2` for an explicitly fenced multi-cell
   read.** It reads several cells as of one HLC fence, with optional
   freshness and skew checks. It takes `{Namespace, Index, Bucket, Key}`

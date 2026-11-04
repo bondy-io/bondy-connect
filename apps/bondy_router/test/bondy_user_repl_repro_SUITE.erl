@@ -18,10 +18,10 @@
 %% takes more than one distinct value across the scraped nodes; this suite
 %% computes that quantity from `bondy_oplog_registry:frontier/1`, the source
 %% the exporter reads. Unlike `bondy_aae_cluster_SUITE`, this suite runs the
-%% SHIPPED `db.aae.*` defaults, not the `bondy_ct:node_env/2` overrides, and
-%% writes users through `bondy_rbac_user:add/2`.
+%% SHIPPED `db.oplog.aae.*` defaults, not the `bondy_ct:node_env/2` overrides,
+%% and writes users through `bondy_rbac_user:add/2`.
 
-%% schema/bondy.schema defaults for the `db.aae.*` keys the customer does
+%% schema/bondy.schema defaults for the `db.oplog.aae.*` keys the customer does
 %% not set (their bondy.conf carries no `db.*` key at all).
 -define(PROD_AAE_ENV, [
     {[bondy_oplog, aae_enabled], true},

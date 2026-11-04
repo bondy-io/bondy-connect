@@ -22,10 +22,10 @@
 %% the scheduler has no peers and stays inert. A lone node
 %% (`cluster.enabled = off`) is unaffected either way — it has no peer to sync
 %% with, and the authentication freshness fence treats it as vacuously fresh
-%% (see `db.aae.fence.on_isolation`).
+%% (see `db.oplog.aae.fence.on_isolation`).
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.aae", "bondy_oplog.aae_enabled", [
+{mapping, "db.oplog.aae", "bondy_oplog.aae_enabled", [
   {datatype, {flag, on, off}},
   {default, on}
 ]}.
@@ -33,10 +33,10 @@
 %% -----------------------------------------------------------------------------
 %% @doc The interval between bondy_db sync scheduler ticks. Each tick the
 %% scheduler asks the peer source for peers and dispatches sync sessions. Only
-%% relevant when `db.aae` is on.
+%% relevant when `db.oplog.aae` is on.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.aae.interval", "bondy_oplog.sync_interval_ms", [
+{mapping, "db.oplog.aae.interval", "bondy_oplog.sync_interval_ms", [
   {datatype, {duration, ms}},
   {default, "500ms"}
 ]}.
@@ -47,15 +47,15 @@
 %% pull, yet a naive scheduler still dispatches a session against every peer
 %% every tick — the dominant steady-state cost of running AAE across many shards.
 %% When on (default), each shard syncs at the tick interval while its data is
-%% actively changing and backs off geometrically up to `db.aae.live_sync.max`
+%% actively changing and backs off geometrically up to `db.oplog.aae.live_sync.max`
 %% once it goes quiescent, resetting to the fast cadence the moment its data
 %% moves again. Shards that back the authentication freshness fence are exempt
 %% and always sync every tick, so this never affects auth availability. When
 %% off, every live shard syncs every peer every tick (the historical
-%% behaviour). Only relevant when `db.aae` is on.
+%% behaviour). Only relevant when `db.oplog.aae` is on.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.aae.live_sync", "bondy_oplog.live_sync_adaptive", [
+{mapping, "db.oplog.aae.live_sync", "bondy_oplog.live_sync_adaptive", [
   {datatype, {flag, on, off}},
   {default, on}
 ]}.
@@ -68,10 +68,10 @@
 %% convergence SLA you need. The first poll that pulls anything resets the shard
 %% to the fast cadence, so recovery is quick once it starts. Shards backing the
 %% auth fence ignore this cap (they always sync every tick). Only relevant when
-%% `db.aae` and `db.aae.live_sync` are on.
+%% `db.oplog.aae` and `db.oplog.aae.live_sync` are on.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.aae.live_sync.max", "bondy_oplog.live_sync_max_ms", [
+{mapping, "db.oplog.aae.live_sync.max", "bondy_oplog.live_sync_max_ms", [
   {datatype, {duration, ms}},
   {default, "5s"}
 ]}.
@@ -80,15 +80,15 @@
 %% @doc Maximum number of AAE sync sessions allowed to run concurrently on this
 %% node. AAE is background work subordinate to routing — this cap keeps it from
 %% saturating the node. It governs SPEED and FAIRNESS, never the memory ceiling:
-%% the per-round page batch is `db.aae.max_pages_in_flight` divided by this
+%% the per-round page batch is `db.oplog.aae.max_pages_in_flight` divided by this
 %% value, so raising concurrency shrinks each session's batch and the node-wide
 %% page budget stays fixed. More concurrency means more peers/shards make
 %% progress at once (no shard starves behind a single serial sync), each running
 %% slower — NOT more RAM. `1` serialises AAE; `3` is a sane fairness default.
-%% Only relevant when `db.aae` is on.
+%% Only relevant when `db.oplog.aae` is on.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.aae.max_concurrency", "bondy_oplog.aae_max_concurrency", [
+{mapping, "db.oplog.aae.max_concurrency", "bondy_oplog.aae_max_concurrency", [
   {datatype, integer},
   {default, 3}
 ]}.
@@ -97,13 +97,13 @@
 %% @doc Node-wide budget, in MST pages, for AAE reconciliation in flight at any
 %% instant. This is the lever that bounds AAE's peak memory: a sync session
 %% pulls missing pages in bounded rounds of
-%% `this / db.aae.max_concurrency` pages, so total in-flight pages stay
+%% `this / db.oplog.aae.max_concurrency` pages, so total in-flight pages stay
 %% ≈ this budget regardless of dataset size or concurrency. Larger = faster
 %% sync, higher peak; smaller = gentler on RAM, slower. Only relevant when
-%% `db.aae` is on.
+%% `db.oplog.aae` is on.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.aae.max_pages_in_flight", "bondy_oplog.aae_max_pages_in_flight", [
+{mapping, "db.oplog.aae.max_pages_in_flight", "bondy_oplog.aae_max_pages_in_flight", [
   {datatype, integer},
   {default, 2048}
 ]}.
@@ -114,18 +114,18 @@
 %% even within the cap, a routing load spike transiently defers AAE so background
 %% reconciliation never steals scheduler time from the node's real job. When on,
 %% the scheduler samples a node-load signal each tick and, while the node is
-%% backlogged past `db.aae.load_run_queue_threshold`, skips the throttleable
+%% backlogged past `db.oplog.aae.load_run_queue_threshold`, skips the throttleable
 %% dispatches (bootstrap snapshot ships and non-fence live syncs) for that tick;
 %% in-flight sessions are never aborted and the deferred shards retry on the next
 %% quiet tick. Shards backing the authentication freshness fence are exempt and
 %% always sync, so this never affects auth availability. It cannot affect
 %% correctness, only convergence latency under load. Off by default — the cap and
 %% live throttle already keep AAE subordinate; enable it where routing latency is
-%% sensitive to AAE scheduler pressure under load. Only relevant when `db.aae`
+%% sensitive to AAE scheduler pressure under load. Only relevant when `db.oplog.aae`
 %% is on.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.aae.load_adaptive", "bondy_oplog.aae_load_adaptive", [
+{mapping, "db.oplog.aae.load_adaptive", "bondy_oplog.aae_load_adaptive", [
   {datatype, {flag, on, off}},
   {default, off}
 ]}.
@@ -133,16 +133,16 @@
 %% -----------------------------------------------------------------------------
 %% @doc Run-queue length per online scheduler — EWMA-smoothed across ticks — at
 %% or above which AAE yields its throttleable dispatches (see
-%% `db.aae.load_adaptive`). The signal is `erlang:statistics(run_queue)`
+%% `db.oplog.aae.load_adaptive`). The signal is `erlang:statistics(run_queue)`
 %% divided by the online scheduler count: the average number of ready processes
 %% queued per scheduler. A healthy node hovers near 0–1; a sustained 2+ means
 %% work is queuing faster than the schedulers drain it. Lower yields AAE sooner
 %% (more protective of routing latency, slower convergence under load); higher
-%% lets AAE work closer to saturation. Only consulted when both `db.aae` and
-%% `db.aae.load_adaptive` are on.
+%% lets AAE work closer to saturation. Only consulted when both `db.oplog.aae` and
+%% `db.oplog.aae.load_adaptive` are on.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.aae.load_run_queue_threshold",
+{mapping, "db.oplog.aae.load_run_queue_threshold",
  "bondy_oplog.aae_load_run_queue_threshold", [
   {datatype, float},
   {default, 2.0}
@@ -150,10 +150,10 @@
 
 %% -----------------------------------------------------------------------------
 %% @doc The number of peers the bondy_db sync scheduler samples from the
-%% Partisan cluster membership each tick. Only relevant when `db.aae` is on.
+%% Partisan cluster membership each tick. Only relevant when `db.oplog.aae` is on.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.aae.fanout", "bondy_oplog.aae_fanout", [
+{mapping, "db.oplog.aae.fanout", "bondy_oplog.aae_fanout", [
   {datatype, integer},
   {default, 3}
 ]}.
@@ -165,7 +165,7 @@
 %% commit or a successful AE round within this window — bounding how stale a
 %% credential/permission change a node may authenticate against. Lower = tighter
 %% security (a lagging node refuses sooner); higher = more availability under
-%% partition/lag. Only relevant when `db.aae` is on (the fence is otherwise a
+%% partition/lag. Only relevant when `db.oplog.aae` is on (the fence is otherwise a
 %% no-op — local writes are synchronous).
 %%
 %% Do not set this near the AE tick period: the confirming AE rounds are
@@ -178,7 +178,7 @@
 %% token_version fence and the AE merge-reactor RBAC invalidation.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.aae.fence.max_lag", "bondy_router.auth_max_lag", [
+{mapping, "db.oplog.aae.fence.max_lag", "bondy_router.auth_max_lag", [
   {datatype, {duration, ms}},
   {default, "60s"}
 ]}.
@@ -194,9 +194,9 @@
 %%
 %% A lone node (`cluster.enabled = off`) is NOT governed by this policy: with
 %% no peer to lag, its view is vacuously fresh and it always authenticates — so
-%% flipping `db.aae` on does not lock out a lone node.
+%% flipping `db.oplog.aae` on does not lock out a lone node.
 %%
-%% Only relevant when `db.aae` is on.
+%% Only relevant when `db.oplog.aae` is on.
 %%
 %% Options:
 %%  refuse  - fail closed: refuse all new authentication until a peer round
@@ -215,7 +215,7 @@
 %%             for the majority side. Requires a Partisan cluster.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.aae.fence.on_isolation", "bondy_oplog.aae_fence_on_isolation", [
+{mapping, "db.oplog.aae.fence.on_isolation", "bondy_oplog.aae_fence_on_isolation", [
   {datatype, {enum, [refuse, proceed, quorum]}},
   {default, refuse}
 ]}.
@@ -225,10 +225,10 @@
 %% raises the bondy_auth_fence_closed alarm. The alarm is cleared when the
 %% fence admits again, and is not raised until the node has been up for this
 %% long, since the fence is closed at every boot until the first AE round.
-%% `0` disables the alarm. Only relevant when `db.aae` is on.
+%% `0` disables the alarm. Only relevant when `db.oplog.aae` is on.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.aae.fence.alarm", "bondy_router.auth_fence_alarm_ms", [
+{mapping, "db.oplog.aae.fence.alarm", "bondy_router.auth_fence_alarm_ms", [
   {datatype, {duration, ms}},
   {default, "5m"}
 ]}.
@@ -243,7 +243,7 @@
 %% anti-entropy otherwise reports as converged. `0` disables the detector.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.drain.stall_alarm", "bondy_oplog.drain_stall_alarm_ms", [
+{mapping, "db.oplog.drain.stall_alarm", "bondy_oplog.drain_stall_alarm_ms", [
   {datatype, {duration, ms}},
   {default, "1m"}
 ]}.
@@ -257,14 +257,14 @@
 %% cannot truncate past it. Short-lived holes are ROUTINE (a local WAL commit
 %% landing out of sequence order, a burned sequence awaiting its backfill, a
 %% peer round away), which is why this alarms on the AGE of the condition and
-%% not on its occurrence — keep it well above `db.aae.interval`. Observable
+%% not on its occurrence — keep it well above `db.oplog.aae.interval`. Observable
 %% without waiting for the alarm via the
 %% bondy_oplog_instance_frontier_holes gauge. `0` disables the detector and
-%% clears any alarm it raised. Measured independently of `db.aae`: a node with
+%% clears any alarm it raised. Measured independently of `db.oplog.aae`: a node with
 %% anti-entropy off is more likely to carry a standing hole, not less.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.frontier.hole_alarm", "bondy_oplog.frontier_hole_alarm_ms", [
+{mapping, "db.oplog.frontier.hole_alarm", "bondy_oplog.frontier_hole_alarm_ms", [
   {datatype, {duration, ms}},
   {default, "5m"}
 ]}.
@@ -424,7 +424,7 @@ end}.
 
 %% -----------------------------------------------------------------------------
 %% @doc Byte threshold at which a durable shard's pack-store MST seals its
-%% `incoming.pack` into a sealed pack. With `db.pack_seal_mode = sync` the seal
+%% `incoming.pack` into a sealed pack. With `db.oplog.pack.seal_mode = sync` the seal
 %% rewrites the whole incoming pack on the apply pipeline, delaying the
 %% visibility of local writes for a time that grows with this threshold. A
 %% smaller value seals more often into more sealed packs, which adds
@@ -433,7 +433,7 @@ end}.
 %% Runtime-tunable (not in the manifest).
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.pack_auto_seal_bytes",
+{mapping, "db.oplog.pack.auto_seal_bytes",
  "bondy_oplog.pack_auto_seal_bytes", [
   {datatype, bytesize},
   {default, "2MB"}
@@ -450,10 +450,57 @@ end}.
 %% Runtime-tunable (not in the manifest).
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.pack_seal_mode",
+{mapping, "db.oplog.pack.seal_mode",
  "bondy_oplog.pack_seal_mode", [
   {datatype, {enum, [async, sync]}},
   {default, async}
+]}.
+
+
+%% -----------------------------------------------------------------------------
+%% @doc Time trigger of the pack collection: the longest time between two
+%% collections of a durable shard's sealed packs. A collection rewrites every
+%% sealed pack, keeping only the pages the current root reaches. The first
+%% compaction tick after a start only arms the clock. Global — applies to
+%% every durable shard node-wide. Runtime-tunable (not in the manifest).
+%% @end
+%% -----------------------------------------------------------------------------
+{mapping, "db.oplog.pack.gc.interval",
+ "bondy_oplog.durable_gc_interval_ms", [
+  {datatype, {duration, ms}},
+  {default, "1h"},
+  {validators, ["pos_integer"]}
+]}.
+
+
+%% -----------------------------------------------------------------------------
+%% @doc Volume trigger of the pack collection: a collection is due once the
+%% sealed packs hold this many times the page records the last collection
+%% left, never measured from fewer than `db.oplog.pack.gc.min_records`. At least 2:
+%% with 1, the count a collection leaves would make the next one due at once.
+%% Global. Runtime-tunable (not in the manifest).
+%% @end
+%% -----------------------------------------------------------------------------
+{mapping, "db.oplog.pack.gc.growth_factor",
+ "bondy_oplog.durable_gc_growth_factor", [
+  {datatype, integer},
+  {default, 2},
+  {validators, ["pack_gc_growth_factor"]}
+]}.
+
+
+%% -----------------------------------------------------------------------------
+%% @doc Smallest base of the volume trigger (`db.oplog.pack.gc.growth_factor`), in
+%% sealed page records, so a shard with few sealed records does not collect
+%% on every small burst of writes. Global. Runtime-tunable (not in the
+%% manifest).
+%% @end
+%% -----------------------------------------------------------------------------
+{mapping, "db.oplog.pack.gc.min_records",
+ "bondy_oplog.durable_gc_min_records", [
+  {datatype, integer},
+  {default, 10000},
+  {validators, ["pos_integer"]}
 ]}.
 
 
@@ -463,7 +510,7 @@ end}.
 %% rate (~6k ops/s on typical NVMe) but guaranteeing each write is durable
 %% before it returns — required for security-class namespaces (grants,
 %% tickets, users). `batched` defers fsync to a size or time boundary
-%% (`db.wal.batched_fsync_bytes` / `db.wal.batched_fsync_interval`) and
+%% (`db.oplog.wal.batched_fsync_bytes` / `db.oplog.wal.batched_fsync_interval`) and
 %% exposes durability via an explicit wait instead of the append call
 %% returning; it reaches roughly two orders of magnitude higher throughput
 %% at the cost of a bounded durability window. Global — affects every
@@ -472,7 +519,7 @@ end}.
 %% Runtime-tunable (not in the manifest).
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.wal.fsync_mode",
+{mapping, "db.oplog.wal.fsync_mode",
  "bondy_oplog.wal_fsync_mode", [
   {datatype, {enum, [per_write, batched]}},
   {default, per_write}
@@ -483,10 +530,10 @@ end}.
 %% @doc Rotation threshold for the durable WAL's head segment. The writer
 %% rotates to a fresh segment once the next frame would push the head past
 %% this size; rotation fsyncs the sealed segment and advances the durable
-%% position. Global, like `db.wal.fsync_mode`. Runtime-tunable.
+%% position. Global, like `db.oplog.wal.fsync_mode`. Runtime-tunable.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.wal.max_segment_bytes",
+{mapping, "db.oplog.wal.max_segment_bytes",
  "bondy_oplog.wal_max_segment_bytes", [
   {datatype, bytesize},
   {default, "64MB"}
@@ -496,11 +543,11 @@ end}.
 %% -----------------------------------------------------------------------------
 %% @doc Batched-mode fsync time trigger: the writer fsyncs at most this long
 %% after the first un-fsynced append. Only consulted when
-%% `db.wal.fsync_mode = batched`. Global, like `db.wal.fsync_mode`.
+%% `db.oplog.wal.fsync_mode = batched`. Global, like `db.oplog.wal.fsync_mode`.
 %% Runtime-tunable.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.wal.batched_fsync_interval",
+{mapping, "db.oplog.wal.batched_fsync_interval",
  "bondy_oplog.wal_batched_fsync_interval_ms", [
   {datatype, {duration, ms}},
   {default, "50ms"}
@@ -510,11 +557,11 @@ end}.
 %% -----------------------------------------------------------------------------
 %% @doc Batched-mode fsync size trigger: the writer fsyncs once accumulated
 %% un-fsynced bytes exceed this threshold. Only consulted when
-%% `db.wal.fsync_mode = batched`. Global, like `db.wal.fsync_mode`.
+%% `db.oplog.wal.fsync_mode = batched`. Global, like `db.oplog.wal.fsync_mode`.
 %% Runtime-tunable.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.wal.batched_fsync_bytes",
+{mapping, "db.oplog.wal.batched_fsync_bytes",
  "bondy_oplog.wal_batched_fsync_bytes", [
   {datatype, bytesize},
   {default, "1MB"}
@@ -546,7 +593,7 @@ end}.
 %% which restores the unbounded-growth behaviour.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.journal_trim_interval",
+{mapping, "db.leveled.journal.trim_interval",
  "bondy_db.journal_trim_interval_ms", [
   {datatype, {duration, ms}},
   {default, "1h"}
@@ -554,7 +601,7 @@ end}.
 
 %% -----------------------------------------------------------------------------
 %% @doc Interval at which each oplog instance checks its own heap and
-%% fullsweep-hibernates if it has grown past `db.gc_heap_delta` over its
+%% fullsweep-hibernates if it has grown past `db.oplog.heap_gc.delta` over its
 %% post-GC baseline. This reclaims the transient apply/AAE garbage a long-lived
 %% instance retains until the next major GC — most visibly during a solo import
 %% (no peers), where the AAE-driven hibernate never fires and the heap would
@@ -562,7 +609,7 @@ end}.
 %% applies to every oplog instance node-wide, not a specific database.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.gc_interval",
+{mapping, "db.oplog.heap_gc.interval",
  "bondy_oplog.instance_gc_interval_ms", [
   {datatype, {duration, ms}},
   {default, "2s"}
@@ -571,15 +618,15 @@ end}.
 
 %% -----------------------------------------------------------------------------
 %% @doc Heap-growth threshold above an instance's post-GC baseline at which the
-%% periodic monitor (`db.gc_interval`) fullsweep-hibernates it. Keying on
+%% periodic monitor (`db.oplog.heap_gc.interval`) fullsweep-hibernates it. Keying on
 %% growth over the live baseline — not absolute heap size — keeps an instance
 %% with a large live MST from being GC-thrashed: it fires once per ~this-many
 %% bytes of accumulated garbage, capping the transient per-instance peak at
 %% roughly `live + this`. Lower trades a touch more fullsweep work for a tighter
-%% memory ceiling. Runtime-tunable. Global — see `db.gc_interval`.
+%% memory ceiling. Runtime-tunable. Global — see `db.oplog.heap_gc.interval`.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.gc_heap_delta",
+{mapping, "db.oplog.heap_gc.delta",
  "bondy_oplog.instance_gc_heap_delta_bytes", [
   {datatype, bytesize},
   {default, "16MB"}
@@ -597,7 +644,7 @@ end}.
 %% exactly as if the feature did not exist. On by default.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.reclaim", "bondy_oplog.reclaim_enabled", [
+{mapping, "db.oplog.reclaim", "bondy_oplog.reclaim_enabled", [
   {datatype, {flag, on, off}},
   {default, on}
 ]}.
@@ -608,10 +655,10 @@ end}.
 %% not a liveness one, and each pass re-derives stability from peer state
 %% that only changes as anti-entropy rounds complete. `0` disables periodic
 %% passes (an operator can still trigger one explicitly). Only relevant when
-%% `db.reclaim` is on.
+%% `db.oplog.reclaim` is on.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.reclaim.interval", "bondy_oplog.reclaim_interval_ms", [
+{mapping, "db.oplog.reclaim.interval", "bondy_oplog.reclaim_interval_ms", [
   {datatype, {duration, ms}},
   {default, "1m"}
 ]}.
@@ -621,25 +668,25 @@ end}.
 %% applier — the sole writer of a shard's local projection — so this bounds
 %% how long a single batch can stall a concurrent write; a pass loops
 %% batches to completion, letting writes interleave between them. Only
-%% relevant when `db.reclaim` is on.
+%% relevant when `db.oplog.reclaim` is on.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.reclaim.batch_cells", "bondy_oplog.reclaim_batch_cells", [
+{mapping, "db.oplog.reclaim.batch_cells", "bondy_oplog.reclaim_batch_cells", [
   {datatype, integer},
   {default, 500}
 ]}.
 
 %% -----------------------------------------------------------------------------
 %% @doc Cap on concurrently running reclamation/compaction trigger workers.
-%% Global, shared machinery: the reclamation scheduler (`db.reclaim`) is a
+%% Global, shared machinery: the reclamation scheduler (`db.oplog.reclaim`) is a
 %% second instance of the same scheduler that drives compaction, and both
-%% instances read this one cap — it is NOT the `db.gc_interval` /
-%% `db.gc_heap_delta` per-instance BEAM heap monitor, a separate subsystem
+%% instances read this one cap — it is NOT the `db.oplog.heap_gc.interval` /
+%% `db.oplog.heap_gc.delta` per-instance BEAM heap monitor, a separate subsystem
 %% that happens to share the "gc" name. Instances over the cap on a given
 %% tick are skipped that round and retried on the next.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.gc_max_concurrency", "bondy_oplog.gc_max_concurrency", [
+{mapping, "db.oplog.compaction.max_concurrency", "bondy_oplog.gc_max_concurrency", [
   {datatype, integer},
   {default, 4}
 ]}.
@@ -659,7 +706,7 @@ end}.
 %% (`bondy_oplog_origin_retirement:retire_dead/0`). On by default.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.origin_retirement", "bondy_oplog.origin_retirement", [
+{mapping, "db.oplog.origin_retirement", "bondy_oplog.origin_retirement", [
   {datatype, {flag, on, off}},
   {default, on}
 ]}.
@@ -674,13 +721,13 @@ end}.
 %% Relative paths are resolved against `platform_data_dir`.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.origin_retirement.path", "bondy_oplog.retirement_path", [
+{mapping, "db.oplog.origin_retirement.path", "bondy_oplog.retirement_path", [
   {datatype, file},
   {default, "origin_retirement"}
 ]}.
 
 {translation, "bondy_oplog.retirement_path", fun(Conf) ->
-    Path = cuttlefish:conf_get("db.origin_retirement.path", Conf),
+    Path = cuttlefish:conf_get("db.oplog.origin_retirement.path", Conf),
     case filename:pathtype(Path) of
         absolute ->
             Path;
@@ -695,10 +742,10 @@ end}.
 %% turnover that produces no membership event — e.g. a node that loses its
 %% storage and rejoins under the same name mints a fresh origin without any
 %% peer joining or leaving, and only a periodic pass on the surviving nodes
-%% reaps the dead epoch. Only relevant when `db.origin_retirement` is on.
+%% reaps the dead epoch. Only relevant when `db.oplog.origin_retirement` is on.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.origin_retirement.interval",
+{mapping, "db.oplog.origin_retirement.interval",
  "bondy_oplog.origin_retirement_interval_ms", [
   {datatype, {duration, ms}},
   {default, "10m"}
@@ -717,7 +764,7 @@ end}.
 %% follows from realm size and nothing else. Global, like `db.wal.*`.
 %% @end
 %% -----------------------------------------------------------------------------
-{mapping, "db.primary_scan_limit", "bondy_db.primary_scan_limit", [
+{mapping, "db.index.primary_scan_limit", "bondy_db.primary_scan_limit", [
   {datatype, integer},
   {default, 1000000}
 ]}.
@@ -780,7 +827,7 @@ end}.
 %% This bounds the size of each file, not the number of them. Under
 %% `head_only` a journal record carries the write's object specs INCLUDING
 %% their payload, so the journal accumulates every version ever written while
-%% the ledger holds only the live set. `db.journal_trim_interval` is what
+%% the ledger holds only the live set. `db.leveled.journal.trim_interval` is what
 %% bounds the total: it drops files below the ledger's persisted sequence
 %% number. Setting that to `0` restores unbounded growth.
 %% @end
@@ -846,7 +893,7 @@ end}.
 %% Bondy syncs the projection itself before it compacts the log or records
 %% what the projection has applied, meant to keep in the log every write the
 %% projection could still lose to a power failure. Durability of the write
-%% itself is `db.wal.fsync_mode`.
+%% itself is `db.oplog.wal.fsync_mode`.
 %% @end
 %% -----------------------------------------------------------------------------
 {mapping, "db.leveled.sync_strategy", "bondy_db.leveled_sync_strategy", [
@@ -969,7 +1016,7 @@ end}.
 %% In `head_only` mode a journal record holds the write's object specs, and
 %% those carry the payload, so this option governs real volume — but no read
 %% path reads the journal (the entries exist only for startup consistency)
-%% and `db.journal_trim_interval` bounds how long any of it is retained.
+%% and `db.leveled.journal.trim_interval` bounds how long any of it is retained.
 %% @end
 %% -----------------------------------------------------------------------------
 {mapping, "db.leveled.compression_point", "bondy_db.leveled_compression_point", [
@@ -4695,6 +4742,12 @@ end}.
   "pos_integer",
   "greater than 1",
   fun(Size) -> Size >= 1 end
+}.
+
+{validator,
+  "pack_gc_growth_factor",
+  "an integer of at least 2",
+  fun(N) -> N >= 2 end
 }.
 
 

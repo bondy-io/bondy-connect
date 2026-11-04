@@ -21,7 +21,10 @@
 %% WHY THIS EXISTS: neither of the two ways a bondy.conf can be wrong announces
 %% itself at boot, and in both cases that is structural rather than an oversight.
 %%
-%% An unknown KEY is dropped in silence. The generated pre-start hook runs
+%% An unknown KEY was dropped in silence before 1.1.0, and from 1.1.0 stops the
+%% boot: `priv/hooks/pre_start' runs one strict cuttlefish pass over every
+%% schema set first. The reason the release needs that pass: the generated
+%% pre-start hook runs
 %% cuttlefish three times against the SAME etc/bondy.conf
 %% (`bin/hooks/pre_start_cuttlefish', invocations at lines 10, 28 and 46), each
 %% seeing only its own schema set, so every key owned by another set looks
@@ -32,16 +35,17 @@
 %% silence and the subsystem runs on its default while the operator believes
 %% their setting applies.
 %%
-%% A bad VALUE is worse, and silent for a different reason. Cuttlefish generates
-%% all-or-nothing: one value that fails its datatype or a validator abandons the
-%% whole run, so no app config is written for ANY key. The same hook passes
-%% --silent and does not check the exit status, and `config/prod/sys.config' ends
-%% with the include string "etc/generated/user_defined.config" -- so the failure
-%% prints nothing and the node boots on the file the last SUCCESSFUL generation
-%% left behind. Seen in the field 2026-08-22: a migrated file carrying
+%% A bad VALUE stops the boot. Cuttlefish generates all-or-nothing: one value
+%% that fails its datatype or a validator abandons the whole run. The failing
+%% run prints the key and the reason, `--silent' included, and the start script
+%% sources the hooks under `set -e', so it stops there. Measured on a 1.1.0
+%% release: a bad value in each of the three schema sets stopped `daemon', with
+%% the previous generation still in `etc/generated/'; the start script's
+%% `relx_run_hooks' code stops the same way under dash, bash and macOS `sh'. A
+%% field report of 2026-08-22, on an earlier build, described a node that came
+%% up on an earlier run's values with no diagnostic after a migrated file set
 %% `wamp.websocket.max_frame_size = infinity' against a `{datatype, bytesize}'
-%% mapping brought a node up on default listeners and an earlier run's values,
-%% with no diagnostic anywhere. See the VALUES THE SCHEMA REJECTS section.
+%% mapping. It was not reproduced. See the VALUES THE SCHEMA REJECTS section.
 %%
 %% WHAT IT CANNOT SEE: a value that is well-typed and wrong. The same field file
 %% set `platform_tmp_dir = /bondy/tmpXX', which is a perfectly good directory
@@ -550,20 +554,52 @@ rules() ->
                 " `<base_path>/oidc/<provider>/callback'."}},
 
         %% ---------------------------------------------------------------------
-        %% oplog.* -> db.* (the rename this release shipped)
+        %% db.* -> db.<component>.* (1.1.0): the oplog's settings move under
+        %% `db.oplog.', the journal trim under `db.leveled.', the scan limit
+        %% under `db.index.'. Exact keys precede the prefix rules.
+        %% ---------------------------------------------------------------------
+        {{match, ["db", "pack_auto_seal_bytes"]},
+            {rewrite, {all, 0, ["db", "oplog", "pack", "auto_seal_bytes"]}}},
+        {{match, ["db", "pack_seal_mode"]},
+            {rewrite, {all, 0, ["db", "oplog", "pack", "seal_mode"]}}},
+        {{match, ["db", "gc_interval"]},
+            {rewrite, {all, 0, ["db", "oplog", "heap_gc", "interval"]}}},
+        {{match, ["db", "gc_heap_delta"]},
+            {rewrite, {all, 0, ["db", "oplog", "heap_gc", "delta"]}}},
+        {{match, ["db", "gc_max_concurrency"]},
+            {rewrite, {all, 0, ["db", "oplog", "compaction", "max_concurrency"]}}},
+        {{match, ["db", "journal_trim_interval"]},
+            {rewrite, {all, 0, ["db", "leveled", "journal", "trim_interval"]}}},
+        {{match, ["db", "primary_scan_limit"]},
+            {rewrite, {all, 0, ["db", "index", "primary_scan_limit"]}}},
+        {{prefix, ["db", "wal"]},
+            {rewrite, {head, 2, ["db", "oplog", "wal"]}}},
+        {{prefix, ["db", "frontier"]},
+            {rewrite, {head, 2, ["db", "oplog", "frontier"]}}},
+        {{prefix, ["db", "drain"]},
+            {rewrite, {head, 2, ["db", "oplog", "drain"]}}},
+        {{prefix, ["db", "reclaim"]},
+            {rewrite, {head, 2, ["db", "oplog", "reclaim"]}}},
+        {{prefix, ["db", "origin_retirement"]},
+            {rewrite, {head, 2, ["db", "oplog", "origin_retirement"]}}},
+        {{prefix, ["db", "aae"]},
+            {rewrite, {head, 2, ["db", "oplog", "aae"]}}},
+
+        %% ---------------------------------------------------------------------
+        %% oplog.* -> db.* (the 1.0.0 rename), onto the 1.1.0 names
         %% ---------------------------------------------------------------------
         {{match, ["oplog", "catalog"]},
             {drop, "never had a consumer"}},
         {{match, ["oplog", "core", "scan_max_concurrency"]},
             {drop, "never had a consumer"}},
         {{match, ["oplog", "core", "gc_interval"]},
-            {rewrite, {all, 0, ["db", "gc_interval"]}}},
+            {rewrite, {all, 0, ["db", "oplog", "heap_gc", "interval"]}}},
         {{match, ["oplog", "core", "gc_heap_delta"]},
-            {rewrite, {all, 0, ["db", "gc_heap_delta"]}}},
+            {rewrite, {all, 0, ["db", "oplog", "heap_gc", "delta"]}}},
         {{match, ["oplog", "core", "pack_auto_seal_bytes"]},
-            {rewrite, {all, 0, ["db", "pack_auto_seal_bytes"]}}},
+            {rewrite, {all, 0, ["db", "oplog", "pack", "auto_seal_bytes"]}}},
         {{match, ["oplog", "core", "pack_seal_mode"]},
-            {rewrite, {all, 0, ["db", "pack_seal_mode"]}}},
+            {rewrite, {all, 0, ["db", "oplog", "pack", "seal_mode"]}}},
         {{match, ["oplog", "core", "shard_count"]},
             {rewrite, {all, 0, ["db", "main", "shard_count"]}}},
         {{match, ["oplog", "core", "partition_strategy"]},
@@ -574,10 +610,10 @@ rules() ->
             {rewrite, {all, 0, ["db", "main", "on_topology_mismatch"]}}},
         %% A prefix rule rather than the eleven rows the design enumerated: the
         %% tail is preserved verbatim and the result is checked against the
-        %% schema, so a member with no `db.aae.' counterpart reports as a stale
+        %% schema, so a member with no `db.oplog.aae.' counterpart reports as a stale
         %% rule instead of being silently renamed onto nothing.
         {{prefix, ["oplog", "aae"]},
-            {rewrite, {head, 2, ["db", "aae"]}}},
+            {rewrite, {head, 2, ["db", "oplog", "aae"]}}},
 
         %% ---------------------------------------------------------------------
         %% rpc_gateway.* -> http_connector.*
@@ -1182,16 +1218,11 @@ int_value(V) ->
 %% but fails a validator. Either one abandons the whole run, so no app config is
 %% written at all and every other setting in the file is lost with it.
 %%
-%% The operator sees none of that. `rebar3_scuttler/priv/pre_start_cuttlefish.tpl'
-%% runs cuttlefish with `--silent' and does not check its exit status, and
-%% `config/prod/sys.config' ends with the include string
-%% `"etc/generated/user_defined.config"' -- so a failed generation prints nothing
-%% and leaves the file the last SUCCESSFUL run wrote. The node boots on stale
-%% config with no diagnostic anywhere. Found in the field 2026-08-22 on a
-%% migrated file carrying `wamp.websocket.max_frame_size = infinity' against a
-%% `{datatype, bytesize}' mapping: the node came up on default listeners and an
-%% earlier run's `platform_tmp_dir', and the boot log's only trace was the values
-%% themselves being wrong.
+%% The release refuses to start on such a file: the failed run prints the key and
+%% stops the start script (measured; see the header). Reporting it here lets the
+%% operator fix it before deploying rather than at the first failed start. The
+%% 2026-08-22 field report the header cites described a silent boot on an
+%% earlier build; it was not reproduced.
 %%
 %% Only keys the file SETS are checked. A schema default that cannot parse is a
 %% schema bug and would break every deployment equally; it is not something an
@@ -1389,7 +1420,8 @@ report(Total, Findings) ->
     out("", []),
     out("  KEYS: ~p of ~p are set but this release maps none of them, so each",
         [length(Findings), Total]),
-    out("  is dropped in silence at boot and the setting does not apply.", []),
+    out("  stops the boot (from 1.1.0; earlier releases ignored it in silence).",
+        []),
     lists:foreach(fun(G) -> report_group(G, Findings) end, groups()).
 
 %% Deliberately louder than the other sections, and the reason is in the second
@@ -1406,12 +1438,8 @@ report_values(Faults) ->
             _ -> "these keys"
         end]),
     wrap("  ", "cuttlefish generates all or nothing: one value it cannot use"
-        " abandons the whole run, so NO setting in this file applies -- not just"
-        " the one below. The pre-start hook runs cuttlefish with --silent and"
-        " does not check its exit status, and sys.config includes the file it"
-        " would have written, so the node boots in silence on whatever the last"
-        " successful generation left in etc/generated/. Nothing appears in the"
-        " boot log. Fix these before deploying."),
+        " abandons the whole run, so the node refuses to start until every value"
+        " below is fixed. Fix these before deploying."),
     lists:foreach(
         fun({K, V, Fault}) ->
             out("    ~s = ~s", [pad(key_str(K), 46), V]),

@@ -591,8 +591,8 @@ maybe_start_partisan(false) ->
 
 %% @private
 %% Wires the bondy_oplog sync scheduler to the Partisan cluster when the node
-%% is clustered and oplog anti-entropy is enabled (`db.aae`). Sets the env the
-%% scheduler reads at init: peers from live Partisan membership
+%% is clustered and oplog anti-entropy is enabled (`db.oplog.aae`). Sets the
+%% env the scheduler reads at init: peers from live Partisan membership
 %% (`bondy_oplog_peer_source_partisan`) and sessions over the Partisan
 %% transport on the dedicated AE channel. Otherwise the scheduler keeps its
 %% defaults (static no-peer source + inline transport); with no peers its tick

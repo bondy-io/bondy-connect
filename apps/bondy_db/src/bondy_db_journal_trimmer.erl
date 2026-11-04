@@ -84,7 +84,7 @@ One trimmer per `bondy_db_leveled_sup`, started as that supervisor's
 first child, so every topology that provisions Bookies gets one without
 threading anything through the topology modules. Each tick enumerates
 the pool's live Bookies with `bondy_db_leveled_sup:bookie_roots/1` and trims
-each one. `db.journal_trim_interval` sets the cadence; `0` disables the
+each one. `db.leveled.journal.trim_interval` sets the cadence; `0` disables the
 timer entirely and this process then idles.
 
 A Bookie mid-restart is not an error: the call is wrapped, a failure is

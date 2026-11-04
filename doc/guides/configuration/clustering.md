@@ -11,7 +11,7 @@ the node can currently see.
 `on | off`, default `on`. Read at node start.
 
 With `on`, the node starts the cluster peer service and replicates through
-anti-entropy when `db.aae` is on.
+anti-entropy when `db.oplog.aae` is on.
 
 With `off`, the node runs without clustering
 (`bondy_cluster_standalone_SUITE`):
@@ -21,7 +21,7 @@ With `off`, the node runs without clustering
 - `bondy.cluster.members` answers this node only;
 - anti-entropy replication is not wired;
 - the authentication freshness fence certifies the node, so authentication
-  works with `db.aae` on;
+  works with `db.oplog.aae` on;
 - the insecure-peer-plane refusal does not apply, because there is no peer
   plane;
 - `bondy.cluster.leave` answers `bondy.error.cluster_disabled` (`K004`) and
@@ -47,7 +47,7 @@ restarted member, and it licenses nothing:
   (`bondy_oplog_compaction_test`: `no_other_member_with_clustering_is_held`);
 - origin retirement skips its pass and emits
   `[bondy_oplog, retirement, skipped]` with reason `no_members`;
-- the authentication freshness fence follows `db.aae.fence.on_isolation`.
+- the authentication freshness fence follows `db.oplog.aae.fence.on_isolation`.
   Under the default, `refuse`, a node with no reachable peer is never
   certified fresh, so authentication is refused with
   `temporarily_unavailable`; `quorum` does not count a node alone as a
@@ -131,7 +131,7 @@ can leave the node and the cluster refusing each other's snapshots with
 `source_behind_truncation`. Turn `automatic_leave` on only for a node you are
 decommissioning.
 
-Under the default `db.aae.fence.on_isolation = refuse`, a restarted member
+Under the default `db.oplog.aae.fence.on_isolation = refuse`, a restarted member
 refuses new authentication until its first sync round with a peer (the
 [authentication freshness fence](database_options.md#authentication-freshness-fence)).
 Bondy does not set Partisan's `partisan_data_dir`, so a node keeps no cluster

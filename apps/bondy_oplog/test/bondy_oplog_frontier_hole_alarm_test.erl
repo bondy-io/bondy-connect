@@ -4,8 +4,8 @@
 %% =============================================================================
 %% The applied-frontier hole detector in `bondy_oplog_sync_scheduler`: an
 %% instance that has carried a per-origin contiguity gap for longer than
-%% `db.frontier.hole_alarm` must raise `{bondy_oplog_frontier_hole, Id}`, and
-%% closing the gap must clear it.
+%% `db.oplog.frontier.hole_alarm` must raise `{bondy_oplog_frontier_hole, Id}`,
+%% and closing the gap must clear it.
 %%
 %% `hole_step/4` is the decision, driven with an injected clock; `check_holes/4`
 %% is the sweep, driven against a real registry entry and a real

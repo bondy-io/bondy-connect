@@ -203,7 +203,7 @@ closure. The gauges say what is true **now**; the counters say what happened.
   stuck hole while the hole count does not, so the ratio of the two says how far
   past the hole the instance has run.
 
-A hole that persists longer than `db.frontier.hole_alarm` (default 5 minutes,
+A hole that persists longer than `db.oplog.frontier.hole_alarm` (default 5 minutes,
 `0` disables) raises `{bondy_oplog_frontier_hole, InstanceId}`. Its details name
 the origins, the sequence number where each gap starts, and how much is stranded
 above it. The alarm is on the *age* of the condition, not its occurrence:

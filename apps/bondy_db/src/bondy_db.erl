@@ -2371,9 +2371,9 @@ pass table handles (e.g. the `security_users` / grant tables for the auth path)
 rather than raw namespace atoms.
 
 Only an anti-entropy round confirms a shard: a round that reached a peer, or
-a round with no peer that `db.aae.fence.on_isolation` lets confirm (a node with
-clustering off always does). A local write does not, so a node cut off from
-its peers stops passing under `refuse` however much it writes
+a round with no peer that `db.oplog.aae.fence.on_isolation` lets confirm (a
+node with clustering off always does). A local write does not, so a node cut
+off from its peers stops passing under `refuse` however much it writes
 (`AuthFence_Refuse` in `proofs/quint/configs/AuthFence.configs.qnt` holds
 `fenceSafe`; `AuthFence_Refuse_CommitBumps`, where commits confirm, violates
 it).
@@ -3753,7 +3753,7 @@ recompute_columns(Spec, Value) ->
 %% @private
 %% Enumerate every primary cell in `Realm` (materialised values), across
 %% all primary shards, with overlay disabled. Bounded by
-%% `db.primary_scan_limit`; a scan that fills it is logged as potentially
+%% `db.index.primary_scan_limit`; a scan that fills it is logged as potentially
 %% incomplete.
 %%
 %% Scoped and un-folded exactly like `list/2`, and for the same reason: a whole

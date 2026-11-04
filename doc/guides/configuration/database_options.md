@@ -111,30 +111,30 @@ Checked on each compaction tick, independently of
 These options apply to the durable WAL of every `main` shard. The `registry`
 WAL is in memory and does not use them.
 
-### `db.wal.fsync_mode` (`bondy_oplog.wal_fsync_mode`)
+### `db.oplog.wal.fsync_mode` (`bondy_oplog.wal_fsync_mode`)
 
 `per_write | batched`, default `per_write`.
 
 - `per_write` syncs every append before the append returns.
 - `batched` returns from an append **before** the frame is synced. The frame
-  is synced when the unsynced bytes reach `db.wal.batched_fsync_bytes`, or
-  `db.wal.batched_fsync_interval` after the first unsynced append, whichever
+  is synced when the unsynced bytes reach `db.oplog.wal.batched_fsync_bytes`, or
+  `db.oplog.wal.batched_fsync_interval` after the first unsynced append, whichever
   comes first. A power loss or operating-system crash in that window can
   lose the unsynced appends.
 
-### `db.wal.batched_fsync_interval` (`bondy_oplog.wal_batched_fsync_interval_ms`)
+### `db.oplog.wal.batched_fsync_interval` (`bondy_oplog.wal_batched_fsync_interval_ms`)
 
 Duration, default `50ms`. Used only with `batched`.
 
 The longest time an appended frame stays unsynced.
 
-### `db.wal.batched_fsync_bytes` (`bondy_oplog.wal_batched_fsync_bytes`)
+### `db.oplog.wal.batched_fsync_bytes` (`bondy_oplog.wal_batched_fsync_bytes`)
 
 Byte size, default `1MB`. Used only with `batched`.
 
 The unsynced bytes at which the writer syncs.
 
-### `db.wal.max_segment_bytes` (`bondy_oplog.wal_max_segment_bytes`)
+### `db.oplog.wal.max_segment_bytes` (`bondy_oplog.wal_max_segment_bytes`)
 
 Byte size, default `64MB`.
 
@@ -147,7 +147,7 @@ segment can exceed it.
 A durable shard's Merkle search tree accumulates pages in `incoming.pack` and
 periodically rewrites them into a sealed pack.
 
-### `db.pack_seal_mode` (`bondy_oplog.pack_seal_mode`)
+### `db.oplog.pack.seal_mode` (`bondy_oplog.pack_seal_mode`)
 
 `async | sync`, default `async`.
 
@@ -155,15 +155,45 @@ periodically rewrites them into a sealed pack.
 rewrites it inline when a page write crosses the threshold, so that write
 waits for the rewrite.
 
-### `db.pack_auto_seal_bytes` (`bondy_oplog.pack_auto_seal_bytes`)
+### `db.oplog.pack.auto_seal_bytes` (`bondy_oplog.pack_auto_seal_bytes`)
 
 Byte size, default `2MB`.
 
 The size of `incoming.pack` at which it is sealed.
 
+## Pack collection
+
+A write never changes a sealed page. A **pack collection** rewrites a shard's
+sealed packs into one, keeping only the pages that the current root or a
+pinned sync root reaches, then deletes the packs it replaced. Each shard checks
+on its compaction tick whether a collection is due. The first tick after a
+start only records the clock and the sealed record count. Each key below
+applies to every durable shard on the node and can be changed at runtime.
+
+### `db.oplog.pack.gc.interval` (`bondy_oplog.durable_gc_interval_ms`)
+
+Duration, default `1h`. Must be greater than zero.
+
+The time trigger: the longest time between two collections of a shard.
+
+### `db.oplog.pack.gc.growth_factor` (`bondy_oplog.durable_gc_growth_factor`)
+
+Integer, default `2`. Must be at least `2`.
+
+The volume trigger: a collection is due once the sealed packs hold this many
+times the page records the last collection left. With `1`, the count a
+collection leaves would make the next one due at once.
+
+### `db.oplog.pack.gc.min_records` (`bondy_oplog.durable_gc_min_records`)
+
+Integer, default `10000`. Must be at least `1`.
+
+The smallest base the volume trigger multiplies, so a shard with few sealed
+records does not collect on every small burst of writes.
+
 ## Anti-entropy
 
-### `db.aae` (`bondy_oplog.aae_enabled`)
+### `db.oplog.aae` (`bondy_oplog.aae_enabled`)
 
 `on | off`, default `on`.
 
@@ -172,37 +202,37 @@ Whether shards replicate through anti-entropy. With `on` and
 membership. With `off`, or with clustering disabled, no peer is wired and no
 sync session runs.
 
-### `db.aae.interval` (`bondy_oplog.sync_interval_ms`)
+### `db.oplog.aae.interval` (`bondy_oplog.sync_interval_ms`)
 
 Duration, default `500ms`.
 
 The interval between sync scheduler ticks. Each tick picks peers and starts
 sync sessions.
 
-### `db.aae.fanout` (`bondy_oplog.aae_fanout`)
+### `db.oplog.aae.fanout` (`bondy_oplog.aae_fanout`)
 
 Integer, default `3`.
 
 The number of peers sampled from the cluster membership for a tick.
 
-### `db.aae.live_sync` (`bondy_oplog.live_sync_adaptive`)
+### `db.oplog.aae.live_sync` (`bondy_oplog.live_sync_adaptive`)
 
 `on | off`, default `on`.
 
 With `on`, a shard whose local tree has stopped changing syncs less often,
-doubling its interval up to `db.aae.live_sync.max`, and returns to every tick
+doubling its interval up to `db.oplog.aae.live_sync.max`, and returns to every tick
 when its tree changes. With `off`, every shard syncs on every tick. Shards
 that back the authentication fence always sync on every tick.
 
-### `db.aae.live_sync.max` (`bondy_oplog.live_sync_max_ms`)
+### `db.oplog.aae.live_sync.max` (`bondy_oplog.live_sync_max_ms`)
 
 Duration, default `5s`.
 
-The longest interval between syncs of a quiet shard under `db.aae.live_sync`.
+The longest interval between syncs of a quiet shard under `db.oplog.aae.live_sync`.
 Replication is pull-only, so this is also how long a write can take to reach
 a quiet shard's peers.
 
-### `db.aae.max_concurrency` (`bondy_oplog.aae_max_concurrency`)
+### `db.oplog.aae.max_concurrency` (`bondy_oplog.aae_max_concurrency`)
 
 Integer, default `3`.
 
@@ -210,31 +240,31 @@ The number of sync sessions that can run at once on this node. A shard that
 backs the authentication fence starts its sessions even when the cap is
 reached.
 
-### `db.aae.max_pages_in_flight` (`bondy_oplog.aae_max_pages_in_flight`)
+### `db.oplog.aae.max_pages_in_flight` (`bondy_oplog.aae_max_pages_in_flight`)
 
 Integer, default `2048`.
 
 The node-wide budget of tree pages that sync sessions hold in flight. Each
 session pulls at most `max_pages_in_flight / max_concurrency` pages per round
-(integer division, at least `1`). Raising `db.aae.max_concurrency` therefore
+(integer division, at least `1`). Raising `db.oplog.aae.max_concurrency` therefore
 shrinks each session's batch and does not raise the budget. Sessions of the
 shards that back the authentication fence bypass the concurrency cap, so each
 of them adds one batch above the budget.
 
-### `db.aae.load_adaptive` (`bondy_oplog.aae_load_adaptive`)
+### `db.oplog.aae.load_adaptive` (`bondy_oplog.aae_load_adaptive`)
 
 `on | off`, default `off`.
 
 With `on`, while the node load signal is at or above
-`db.aae.load_run_queue_threshold`, a tick skips bootstrap transfers and the
+`db.oplog.aae.load_run_queue_threshold`, a tick skips bootstrap transfers and the
 live syncs of shards that do not back the authentication fence. Sessions
 already running are not stopped.
 
-### `db.aae.load_run_queue_threshold` (`bondy_oplog.aae_load_run_queue_threshold`)
+### `db.oplog.aae.load_run_queue_threshold` (`bondy_oplog.aae_load_run_queue_threshold`)
 
 Float, default `2.0`.
 
-The load at which `db.aae.load_adaptive` yields. The signal is the run queue
+The load at which `db.oplog.aae.load_adaptive` yields. The signal is the run queue
 length divided by the online schedulers, smoothed across ticks.
 
 ## Storage alarm thresholds
@@ -242,21 +272,21 @@ length divided by the online schedulers, smoothed across ticks.
 These options set when two of the storage alarms in [Alarms](../router/alarms.md)
 are raised. `0` disables the detector.
 
-### `db.drain.stall_alarm` (`bondy_oplog.drain_stall_alarm_ms`)
+### `db.oplog.drain.stall_alarm` (`bondy_oplog.drain_stall_alarm_ms`)
 
 Duration, default `1m`.
 
 How long a shard's WAL drain can process frames without committing a new
 position before the node raises `{bondy_oplog_drain_stalled, InstanceId}`.
 
-### `db.frontier.hole_alarm` (`bondy_oplog.frontier_hole_alarm_ms`)
+### `db.oplog.frontier.hole_alarm` (`bondy_oplog.frontier_hole_alarm_ms`)
 
 Duration, default `5m`.
 
 How long a shard can carry a per-origin gap in its applied frontier before the
 node raises `{bondy_oplog_frontier_hole, InstanceId}`. Short gaps occur in
 normal operation, so the alarm measures the age of the gap. Keep the value well
-above `db.aae.interval`. The gauge `bondy_oplog_instance_frontier_holes` shows
+above `db.oplog.aae.interval`. The gauge `bondy_oplog_instance_frontier_holes` shows
 the gaps before the alarm fires.
 
 ## Authentication freshness fence
@@ -266,12 +296,12 @@ security tables (users and grants) may be stale. A refused authentication
 returns `{error, temporarily_unavailable}`, and a WAMP session is aborted with
 `wamp.error.unavailable`; the client can retry.
 
-The fence applies only when `db.aae` is `on`; with `off` it never refuses. A
+The fence applies only when `db.oplog.aae` is `on`; with `off` it never refuses. A
 node with `cluster.enabled = off` is always certified fresh, so the fence
 does not refuse on it ([Clustering](clustering.md);
 `bondy_auth_oauth2_SUITE`: `aae_fence_certifies_only_with_clustering_disabled`).
 
-### `db.aae.fence.max_lag` (`bondy_router.auth_max_lag`)
+### `db.oplog.aae.fence.max_lag` (`bondy_router.auth_max_lag`)
 
 Duration, default `60s`.
 
@@ -279,7 +309,7 @@ The fence refuses when any shard of the security tables has gone longer than
 this without a sync round that certified it. A local write does not certify
 a shard: it says nothing about changes made on other nodes.
 
-### `db.aae.fence.on_isolation` (`bondy_oplog.aae_fence_on_isolation`)
+### `db.oplog.aae.fence.on_isolation` (`bondy_oplog.aae_fence_on_isolation`)
 
 `refuse | proceed | quorum`, default `refuse`.
 
@@ -298,7 +328,7 @@ Which sync activity certifies the security shards on a clustered node:
 
 `bondy_auth_oauth2_SUITE`: `aae_fence_isolation_policy`.
 
-### `db.aae.fence.alarm` (`bondy_router.auth_fence_alarm_ms`)
+### `db.oplog.aae.fence.alarm` (`bondy_router.auth_fence_alarm_ms`)
 
 Duration, default `5m`. `0` disables the alarm.
 
@@ -311,7 +341,7 @@ round. `bondy_auth_password_SUITE`: `aae_fence_alarm_follows_the_fence`.
 A node that stays fenced because no peer is reachable — the first node back
 after a whole-cluster outage, or the only one left — authenticates again once
 a peer joins and a round completes. To authenticate before that, set
-`db.aae.fence.on_isolation` to `proceed` on that node, accepting that it may
+`db.oplog.aae.fence.on_isolation` to `proceed` on that node, accepting that it may
 miss a revocation made on a node that is down, and set it back to `refuse`
 once a peer is back.
 

@@ -294,7 +294,7 @@ very different prices for reclamation.
 | | ephemeral (`bondy_mst_ets_store`) | durable (`bondy_mst_pack_store`) |
 | --- | --- | --- |
 | Cost of one collection | Mark from the roots, `ets:delete` the rest. | Rewrite every sealed pack into a new one. |
-| When it runs | On every truncation (`truncate_below_or_equal/4`). | On the compaction tick, at most once per `durable_gc_interval_ms` (`maybe_collect_durable/1`). |
+| When it runs | On every truncation (`truncate_below_or_equal/4`). | On the compaction tick, when the time or the volume trigger is due (`maybe_collect_durable/1`). |
 | What it reclaims | RAM | Disk |
 
 On the **ephemeral** backend a collection is cheap enough to run on
@@ -316,7 +316,7 @@ flowchart TB
     TICK[compaction tick]
     PACK{"pack store?"}
     ARM{"first tick<br/>since boot?"}
-    DUE{"≥ durable_gc_interval_ms<br/>since last collection?"}
+    DUE{"≥ durable_gc_interval_ms since last,<br/>or sealed records ≥ factor × base?"}
     SEAL{"seal in flight?"}
     GC["bondy_mst:gc(MST, pinned_roots)"]
     SKIP[skip]
@@ -338,10 +338,22 @@ Each gate has a reason:
   packs. A collection on the first tick would stall the instance on a
   full rewrite while it comes up. The first tick records the time and
   collects nothing.
-- **Interval** (`bondy_oplog.durable_gc_interval_ms`, default 1 h).
-  Durable namespaces have a low write volume, so garbage accumulates
-  slowly, and the rewrite is the most expensive operation the instance
-  performs.
+- **Due.** A collection is due when either trigger holds:
+  - **Time** (`db.oplog.pack.gc.interval`, `bondy_oplog.durable_gc_interval_ms`,
+    default 1 h). The rewrite is the most expensive operation the
+    instance performs, so this trigger is coarse.
+  - **Volume** (`db.oplog.pack.gc.growth_factor`, default 2, and
+    `db.oplog.pack.gc.min_records`, default 10 000). The sealed record count
+    (`bondy_mst_pack_store:sealed_record_count/1`) has reached the factor
+    times the base: the count the last collection left, or the minimum if
+    that is larger. Garbage grows with writes, not with live data, so a
+    write burst such as a restore fills the disk long before an hourly
+    collection (`bondy_oplog_compaction_cluster_SUITE`:
+    `write_volume_reclaims_durable_packs_before_the_interval`).
+
+  Every collection resets the clock and the base, including one that
+  dropped nothing, so a collection that reclaims nothing does not re-run
+  every tick.
 - **Seal in flight.** A collection rewrites the packs that a seal is
   producing. When the collection is skipped for this reason, the clock is
   not stamped, so the next tick retries.
@@ -754,7 +766,7 @@ one interval however much folds behind it.
 
 Held state is visible. `pending/1` is non-empty for an origin exactly
 when that origin has a hole. An instance that carries a hole for longer
-than `db.frontier.hole_alarm`
+than `db.oplog.frontier.hole_alarm`
 (`bondy_oplog_config:frontier_hole_alarm_ms/0`, default 5 min) raises
 `bondy_oplog_frontier_hole`. The alarm names the origins, where each gap
 starts, and how much is stranded above it.

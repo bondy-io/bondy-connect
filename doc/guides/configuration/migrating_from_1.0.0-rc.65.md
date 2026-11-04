@@ -72,17 +72,17 @@ meaning are identical.
 
 | Old key (≤ 1.0.0-rc.65) | New key |
 |---|---|
-| `oplog.aae` | `db.aae` |
-| `oplog.aae.interval` | `db.aae.interval` |
-| `oplog.aae.live_sync` | `db.aae.live_sync` |
-| `oplog.aae.live_sync.max` | `db.aae.live_sync.max` |
-| `oplog.aae.max_concurrency` | `db.aae.max_concurrency` |
-| `oplog.aae.max_pages_in_flight` | `db.aae.max_pages_in_flight` |
-| `oplog.aae.load_adaptive` | `db.aae.load_adaptive` |
-| `oplog.aae.load_run_queue_threshold` | `db.aae.load_run_queue_threshold` |
-| `oplog.aae.fanout` | `db.aae.fanout` |
-| `oplog.aae.fence.max_lag` | `db.aae.fence.max_lag` |
-| `oplog.aae.fence.on_isolation` | `db.aae.fence.on_isolation` |
+| `oplog.aae` | `db.oplog.aae` |
+| `oplog.aae.interval` | `db.oplog.aae.interval` |
+| `oplog.aae.live_sync` | `db.oplog.aae.live_sync` |
+| `oplog.aae.live_sync.max` | `db.oplog.aae.live_sync.max` |
+| `oplog.aae.max_concurrency` | `db.oplog.aae.max_concurrency` |
+| `oplog.aae.max_pages_in_flight` | `db.oplog.aae.max_pages_in_flight` |
+| `oplog.aae.load_adaptive` | `db.oplog.aae.load_adaptive` |
+| `oplog.aae.load_run_queue_threshold` | `db.oplog.aae.load_run_queue_threshold` |
+| `oplog.aae.fanout` | `db.oplog.aae.fanout` |
+| `oplog.aae.fence.max_lag` | `db.oplog.aae.fence.max_lag` |
+| `oplog.aae.fence.on_isolation` | `db.oplog.aae.fence.on_isolation` |
 
 Four more keys move from `oplog.core.*` to a bare `db.*` — the `core.`
 segment drops because these settings were never specific to one database;
@@ -90,10 +90,10 @@ they govern every replicated table node-wide:
 
 | Old key | New key |
 |---|---|
-| `oplog.core.gc_interval` | `db.gc_interval` |
-| `oplog.core.gc_heap_delta` | `db.gc_heap_delta` |
-| `oplog.core.pack_auto_seal_bytes` | `db.pack_auto_seal_bytes` |
-| `oplog.core.pack_seal_mode` | `db.pack_seal_mode` |
+| `oplog.core.gc_interval` | `db.oplog.heap_gc.interval` |
+| `oplog.core.gc_heap_delta` | `db.oplog.heap_gc.delta` |
+| `oplog.core.pack_auto_seal_bytes` | `db.oplog.pack.auto_seal_bytes` |
+| `oplog.core.pack_seal_mode` | `db.oplog.pack.seal_mode` |
 
 ### 3. Rename the durable-database keys (`core` is now `main`)
 
@@ -216,14 +216,14 @@ defaults are safe to run with unchanged.
 | Key | What it controls |
 |---|---|
 | `db.registry.shard_count` | Shard count for the ephemeral registry database, independent of `db.main.shard_count`. |
-| `db.wal.fsync_mode` | `per_write` (default) or `batched` — the durable write-ahead log's fsync strategy; see the key's schema comment for the throughput/durability trade-off. |
-| `db.wal.batched_fsync_interval`, `db.wal.batched_fsync_bytes` | Batching window for `db.wal.fsync_mode = batched`. |
-| `db.wal.max_segment_bytes` | WAL segment rotation threshold. |
-| `db.reclaim`, `db.reclaim.interval`, `db.reclaim.batch_cells` | Projection-cell reclamation (tombstone space reclaim). See the [reclamation configuration reference](reclamation_options.md). |
-| `db.origin_retirement`, `db.origin_retirement.interval` | Reaping bookkeeping for permanently departed cluster members. See the [reclamation configuration reference](reclamation_options.md). |
-| `db.gc_max_concurrency` | Shared compaction/reclamation scheduler tuning. See the [reclamation configuration reference](reclamation_options.md). |
-| `db.drain.stall_alarm` | Alarm threshold for a wedged WAL consumer. |
-| `db.frontier.hole_alarm` | Alarm threshold for a shard carrying a per-origin gap in its applied frontier. |
+| `db.oplog.wal.fsync_mode` | `per_write` (default) or `batched` — the durable write-ahead log's fsync strategy; see the key's schema comment for the throughput/durability trade-off. |
+| `db.oplog.wal.batched_fsync_interval`, `db.oplog.wal.batched_fsync_bytes` | Batching window for `db.oplog.wal.fsync_mode = batched`. |
+| `db.oplog.wal.max_segment_bytes` | WAL segment rotation threshold. |
+| `db.oplog.reclaim`, `db.oplog.reclaim.interval`, `db.oplog.reclaim.batch_cells` | Projection-cell reclamation (tombstone space reclaim). See the [reclamation configuration reference](reclamation_options.md). |
+| `db.oplog.origin_retirement`, `db.oplog.origin_retirement.interval` | Reaping bookkeeping for permanently departed cluster members. See the [reclamation configuration reference](reclamation_options.md). |
+| `db.oplog.compaction.max_concurrency` | Shared compaction/reclamation scheduler tuning. See the [reclamation configuration reference](reclamation_options.md). |
+| `db.oplog.drain.stall_alarm` | Alarm threshold for a wedged WAL consumer. |
+| `db.oplog.frontier.hole_alarm` | Alarm threshold for a shard carrying a per-origin gap in its applied frontier. |
 | `cluster.max_message_size` | Partisan inter-node frame size cap. |
 | `load_regulation.aae_reactor.pool.size` | Worker-pool size for anti-entropy merge reactions. |
 | `load_regulation.router.flow_pool.capacity` | Capacity of the per-flow relay ordering pool. |
@@ -332,7 +332,7 @@ cluster.enabled = off
 
 `cluster.enabled` defaults to `on`. A node left on `on` with no other member
 holds compaction and reclamation, and refuses authentication under the default
-`db.aae.fence.on_isolation`. See
+`db.oplog.aae.fence.on_isolation`. See
 [Running a single node](clustering.md#running-a-single-node).
 
 ## Result

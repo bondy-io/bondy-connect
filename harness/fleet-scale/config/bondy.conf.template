@@ -47,8 +47,8 @@ cluster.peer_discovery.config.nameservers.1 = fdaa::3
 cluster.channels.wamp_relay.parallelism     = 8
 
 ## --- anti-entropy: MUST be on -- 500ms sync tick ------------------------------
-db.aae                                   = on
-db.aae.interval                          = 500ms
+db.oplog.aae                                   = on
+db.oplog.aae.interval                          = 500ms
 
 ## --- routing / ordering (flow lanes enforce per-pair FIFO) --------------------
 router.forward.ack                          = off

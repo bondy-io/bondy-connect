@@ -235,7 +235,7 @@ instance starts and extended when a table registers on the instance.
 
 A node that cannot reach a peer must not certify itself fresh. Otherwise a
 partitioned replica would authenticate against stale data. When clustering is
-enabled, the `db.aae.fence.on_isolation` setting decides whether a round may
+enabled, the `db.oplog.aae.fence.on_isolation` setting decides whether a round may
 certify freshness:
 
 | Policy | A round certifies freshness when… |
@@ -260,7 +260,7 @@ flowchart LR
 
 Bondy's authentication path applies the fence before any authentication
 method runs. When the `bondy_oplog` application has AAE enabled
-(`db.aae`), `bondy_auth` calls `bondy_db:ensure_fresh/2` on the user, user
+(`db.oplog.aae`), `bondy_auth` calls `bondy_db:ensure_fresh/2` on the user, user
 grant and group grant tables with the `auth_max_lag` bound:
 
 ```mermaid

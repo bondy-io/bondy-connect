@@ -1287,7 +1287,7 @@ this round (no peer reachable). Certification follows
 `should_certify_freshness/1`: with clustering disabled
 (`bondy_cluster:enabled/0`) it always certifies, since there is no peer to
 lag. Otherwise the
-`db.aae.fence.on_isolation` policy decides — `proceed` always bumps
+`db.oplog.aae.fence.on_isolation` policy decides — `proceed` always bumps
 (treat isolation as vacuously fresh), `refuse` never bumps (fail closed —
 the fence will refuse), `quorum` bumps only while connected to a majority.
 Called by the sync scheduler at its no-peer seam.
@@ -1320,7 +1320,7 @@ do_bump_ae_targets(Instance, Meta) ->
     end.
 
 %% @private
-%% The configured no-peer fence policy (`db.aae.fence.on_isolation`).
+%% The configured no-peer fence policy (`db.oplog.aae.fence.on_isolation`).
 isolation_policy() ->
     bondy_oplog_config:aae_fence_on_isolation().
 

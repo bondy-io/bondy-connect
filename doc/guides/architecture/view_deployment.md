@@ -60,7 +60,7 @@ What fails together, and what a failure costs:
 | One connection process | That client | The client reconnects; `bondy_session_manager` sees the process exit and removes the session's registrations and subscriptions |
 | One shard's process | One shard on one node: the instance, WAL writer and applier restart together | `main`: the WAL replays into the projection. `registry`: peers resupply through anti-entropy |
 | One node | Its clients reconnect elsewhere; the cluster routes on. While it stays a member, compaction and reclamation wait for it | On return: anti-entropy catch-up, or a catalogue rebootstrap if registry retention truncated history past it ([convergence](view_convergence.md)) |
-| Network partition | Each side keeps routing locally; replication, compaction and reclamation pause across the cut | On heal: anti-entropy reconciles. Authentication freshness during the cut follows the fence policy (`db.aae.fence.on_isolation`) |
+| Network partition | Each side keeps routing locally; replication, compaction and reclamation pause across the cut | On heal: anti-entropy reconciles. Authentication freshness during the cut follows the fence policy (`db.oplog.aae.fence.on_isolation`) |
 
 ## Rationale
 

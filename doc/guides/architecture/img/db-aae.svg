@@ -50,9 +50,9 @@
 
   <line class="axis" x1="200" y1="152" x2="860" y2="152" marker-start="url(#a-arm)" marker-end="url(#a-arm)"/>
   <rect class="cfgbx" x="380" y="158" width="300" height="20" rx="4"/>
-  <text class="tk sp" x="388" y="172">db.aae.max_pages_in_flight = 2048</text>
+  <text class="tk sp" x="388" y="172">db.oplog.aae.max_pages_in_flight = 2048</text>
   <rect class="cfgbx" x="380" y="184" width="300" height="20" rx="4"/>
-  <text class="tk sp" x="388" y="198">db.aae.max_concurrency = 3</text>
+  <text class="tk sp" x="388" y="198">db.oplog.aae.max_concurrency = 3</text>
   <text class="ts mu" x="200" y="216">pages per round  =  budget ÷ concurrency</text>
   <text class="ts mu" x="200" y="232">Raising concurrency narrows every lane; the bar's width never moves. This is the lever that bounds peak RAM.</text>
 
@@ -66,7 +66,7 @@
     <line x1="440" y1="318" x2="440" y2="342"/><line x1="540" y1="318" x2="540" y2="342"/>
   </g>
   <line class="axis" x1="240" y1="306" x2="340" y2="306" marker-start="url(#a-arm)" marker-end="url(#a-arm)"/>
-  <text class="ts mu" x="290" y="300" text-anchor="middle">db.aae.interval = 500ms</text>
+  <text class="ts mu" x="290" y="300" text-anchor="middle">db.oplog.aae.interval = 500ms</text>
   <text class="t ink" x="40" y="334">AE tick</text>
 
   <circle cx="680" cy="330" r="16" class="fill"/>
@@ -76,9 +76,9 @@
   </g>
   <circle cx="790" cy="294" r="11" class="fill"/><circle cx="790" cy="330" r="11" class="fill"/><circle cx="790" cy="366" r="11" class="fill"/>
   <rect class="cfgbx" x="620" y="384" width="212" height="20" rx="4"/>
-  <text class="tk sp" x="628" y="398">db.aae.fanout = 3</text>
+  <text class="tk sp" x="628" y="398">db.oplog.aae.fanout = 3</text>
   <rect class="cfgbx" x="200" y="384" width="140" height="20" rx="4"/>
-  <text class="tk sp" x="208" y="398">db.aae = on</text>
+  <text class="tk sp" x="208" y="398">db.oplog.aae = on</text>
 
   <!-- ===== Panel C: the load gate ===== -->
   <line x1="40" y1="428" x2="920" y2="428" stroke="var(--ru,#d9d5cf)" stroke-width="1"/>
@@ -98,9 +98,9 @@
   <text class="ts ink" x="440" y="468" text-anchor="middle">AE yields its throttleable dispatches</text>
 
   <rect class="cfgbx" x="740" y="486" width="204" height="20" rx="4"/>
-  <text class="tk sp" x="748" y="500">db.aae.load_run_queue_threshold = 2.0</text>
+  <text class="tk sp" x="748" y="500">db.oplog.aae.load_run_queue_threshold = 2.0</text>
   <rect class="cfgbx" x="740" y="512" width="204" height="20" rx="4"/>
-  <text class="tk sp" x="748" y="526">db.aae.load_adaptive = off</text>
+  <text class="tk sp" x="748" y="526">db.oplog.aae.load_adaptive = off</text>
   <text class="ts mu" x="740" y="548">The threshold is only consulted</text>
   <text class="ts mu" x="740" y="562">when load_adaptive is on.</text>
 

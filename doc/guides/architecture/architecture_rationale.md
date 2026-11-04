@@ -45,7 +45,7 @@ The system's posture under load is asymmetric on purpose:
 - **Background work yields to foreground work.** Anti-entropy runs under a
   node-wide concurrency cap and a node-wide page budget (independent of shard
   count), backs off on converged shards, and can yield its dispatches when
-  the run queue is long (`db.aae.load_adaptive`, off by default). Replication
+  the run queue is long (`db.oplog.aae.load_adaptive`, off by default). Replication
   lag is recoverable; a saturated node is not.
 
 ## Consistency design: eventual, with explicit exceptions
@@ -60,8 +60,8 @@ making that safe:
   view](view_convergence.md) shows its detection and repair.
 - **Where staleness is dangerous, it is fenced, not tolerated.**
   Authentication refuses on a node whose view of the security tables is
-  older than a bound (`db.aae.fence.max_lag`), or that cannot confirm
-  freshness while clustering is enabled (`db.aae.fence.on_isolation`, which
+  older than a bound (`db.oplog.aae.fence.max_lag`), or that cannot confirm
+  freshness while clustering is enabled (`db.oplog.aae.fence.on_isolation`, which
   refuses by default). A node with clustering disabled (`cluster.enabled =
   off`) is exempt because it has no peer to lag.
 - **Garbage collection is licensed, never assumed.** History truncation

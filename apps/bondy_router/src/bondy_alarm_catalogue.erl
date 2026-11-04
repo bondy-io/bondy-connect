@@ -328,7 +328,7 @@ list() ->
             %% here: no metric or procedure reports drain progress.
             observe_with => [],
             tasks => [],
-            config_keys => [<<"db.drain.stall_alarm">>]
+            config_keys => [<<"db.oplog.drain.stall_alarm">>]
         },
         %% Raised by `bondy_oplog_sync_scheduler`. A gap in an origin's
         %% sequence that this replica has carried for longer than the
@@ -357,7 +357,7 @@ list() ->
             %% prefix, the start seq and the stranded count.
             observe_with => [],
             tasks => [],
-            config_keys => [<<"db.frontier.hole_alarm">>]
+            config_keys => [<<"db.oplog.frontier.hole_alarm">>]
         },
         %% Raised by `bondy_aae_reactor`. Not readiness-affecting: the fence is
         %% closed at every boot, so it would stop a StatefulSet starting the
@@ -376,9 +376,9 @@ list() ->
             observe_with => [],
             tasks => [],
             config_keys => [
-                <<"db.aae.fence.alarm">>,
-                <<"db.aae.fence.max_lag">>,
-                <<"db.aae.fence.on_isolation">>
+                <<"db.oplog.aae.fence.alarm">>,
+                <<"db.oplog.aae.fence.max_lag">>,
+                <<"db.oplog.aae.fence.on_isolation">>
             ]
         },
         %% Raised by `bondy_oplog_instance`, once at
@@ -458,7 +458,7 @@ list() ->
             detail_keys => [],
             observe_with => [],
             tasks => [],
-            config_keys => [<<"db.origin_retirement.path">>]
+            config_keys => [<<"db.oplog.origin_retirement.path">>]
         },
         %% Raised by `bondy_oplog_responder`. `class = cluster`: the affected
         %% data

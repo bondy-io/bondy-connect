@@ -13,7 +13,8 @@ the value is operator-tunable via `bondy_oplog_config:pack_auto_seal_bytes/0`.
 
 -include_lib("eunit/include/eunit.hrl").
 
-%% The `db.pack_auto_seal_bytes` schema default, "2MB" as a cuttlefish bytesize.
+%% The `db.oplog.pack.auto_seal_bytes` schema default, "2MB" as a cuttlefish
+%% bytesize.
 -define(DEFAULT_BYTES, 2 * 1024 * 1024).
 
 %% =============================================================================

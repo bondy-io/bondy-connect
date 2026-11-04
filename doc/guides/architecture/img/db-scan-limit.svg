@@ -47,7 +47,7 @@
 
   <line class="cfg" x1="670" y1="74" x2="670" y2="200"/>
   <rect class="cfgbx" x="530" y="212" width="286" height="20" rx="4"/>
-  <text class="tk sp" x="538" y="226">db.primary_scan_limit = 1000000</text>
+  <text class="tk sp" x="538" y="226">db.index.primary_scan_limit = 1000000</text>
 
   <text class="ts ink" x="150" y="226">A scan that fills the cap returns a POTENTIALLY INCOMPLETE result</text>
   <text class="ts mu"  x="150" y="242">and logs a warning naming this key — the caller is not told.</text>

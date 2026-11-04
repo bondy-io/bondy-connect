@@ -4,10 +4,10 @@
 ## longer exists: replication is now a bondy_db sync scheduler that ticks and
 ## dispatches sync sessions against peers, so the only equivalent knobs are the
 ## on/off flag and the tick interval. The remaining cadence, concurrency and
-## fence knobs (db.aae.live_sync, db.aae.max_concurrency, db.aae.fanout,
-## db.aae.fence.*) are left at their defaults.
-db.aae = on
-db.aae.interval = 500ms
+## fence knobs (db.oplog.aae.live_sync, db.oplog.aae.max_concurrency, db.oplog.aae.fanout,
+## db.oplog.aae.fence.*) are left at their defaults.
+db.oplog.aae = on
+db.oplog.aae.interval = 500ms
 ## Listeners are declared under `listeners.*`. A listener that is not declared
 ## does not exist, which is why the TLS variants this deployment used to switch
 ## off explicitly are simply absent.

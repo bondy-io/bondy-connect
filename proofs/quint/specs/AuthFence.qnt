@@ -15,7 +15,7 @@ module AuthFenceTypes {
 ///     which merges the peer's view into the node's;
 ///   - an isolated scheduler round, one with no peer
 ///     (`maybe_bump_ae_isolated/1`). A node with clustering off always
-///     confirms; a clustered one follows `db.aae.fence.on_isolation`:
+///     confirms; a clustered one follows `db.oplog.aae.fence.on_isolation`:
 ///     `Refuse` never confirms, `Proceed` always does;
 ///   - with `cfg.commitBumps`, an applier commit of local writes
 ///     (`bump_ae_targets/1` in `bondy_oplog_applier:commit_now/1`).
