@@ -1,4 +1,10 @@
 # CHANGELOG
+## Unreleased
+
+### Fixes
+* A request to the Admin API or to an API Gateway `oauth2` path with no `Authorization: Bearer` header, or with a bearer value that is not a JWT, got `401` with an `internal_error` body and a `trace_id` that matched no log entry. The body now names the refusal as `bondy.error.token_invalid`.
+* The `WWW-Authenticate: Bearer` challenge of a `401` follows RFC 6750 on the Admin API, API Gateway `oauth2` paths, the credential-verification endpoints and the MCP endpoint. A request that presented no bearer token gets `Bearer realm="<realm>"` with no error. A presented token that is refused gets `error="invalid_token"`. Before, the gateway sent Bondy's own error code (for example `error="invalid_credentials"`) together with non-standard `message` and `description` parameters, the verification endpoints sent `invalid_token` also when no credential was presented, and MCP sent a bare `Bearer` with no parameters. A gateway `401` caused by a token for a realm that does not exist now carries the challenge; before, it had none. The `Cookie`, `Basic` and `ApiKey` challenges do not change.
+
 ## 1.1.0
 
 ### Action required

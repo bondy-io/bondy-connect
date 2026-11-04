@@ -284,10 +284,15 @@ sets_no_store_cache_headers(_) ->
     ?assertNotEqual(nomatch, binary:match(CacheControl, <<"no-store">>)),
     ?assertNotEqual(undefined, header(<<"vary">>, Headers)).
 
+%% RFC 6750 §3.1: a request with no credential gets a challenge with no error.
 no_credential_is_rejected(_) ->
-    {Status, _, Body} = get_verify([]),
+    {Status, Headers, Body} = get_verify([]),
     ?assertEqual(401, Status),
-    ?assertMatch(#{~"active" := false}, decode(Body)).
+    ?assertMatch(#{~"active" := false}, decode(Body)),
+    ?assertEqual(
+        <<"Bearer realm=\"", ?REALM/binary, "\"">>,
+        header(<<"www-authenticate">>, Headers)
+    ).
 
 expired_ticket_is_rejected(_) ->
     %% The verifier allows a 120s leeway, so the ticket must be older than that.
@@ -301,10 +306,14 @@ expired_ticket_is_rejected(_) ->
 tampered_ticket_is_rejected(_) ->
     {ok, JWT, _} = issue_ticket(?REALM, ?USER),
     Tampered = tamper(JWT),
-    {Status, _, Body} = get_verify(cookie_header(?REALM, Tampered)),
+    {Status, Headers, Body} = get_verify(cookie_header(?REALM, Tampered)),
     ?assertEqual(401, Status),
     ?assertEqual(
         ~"bondy.error.token_invalid", maps:get(~"uri", decode(Body))
+    ),
+    ?assertEqual(
+        <<"Bearer realm=\"", ?REALM/binary, "\", error=\"invalid_token\"">>,
+        header(<<"www-authenticate">>, Headers)
     ).
 
 revoked_ticket_is_rejected(_) ->

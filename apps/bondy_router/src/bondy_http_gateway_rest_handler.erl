@@ -424,7 +424,13 @@ is_authorized(_, Req, #{security := #{<<"type">> := <<"api_key">>}} = St) ->
             "Request is using unsupported api_key authentication scheme",
         request => Req
     }),
-    deny_unenforced(<<"ApiKey">>, Req, St);
+    deny_unenforced(
+        scheme_challenge(
+            <<"ApiKey">>, maps:get(realm_uri, St), authentication_failed
+        ),
+        Req,
+        St
+    );
 is_authorized(Method, Req, #{security := #{<<"type">> := <<"oidc">>}} = St) ->
     authenticate_ticket_cookie(Method, Req, St);
 is_authorized(_, Req, #{security := #{<<"type">> := <<"basic">>}} = St) ->
@@ -437,7 +443,13 @@ is_authorized(_, Req, #{security := #{<<"type">> := <<"basic">>}} = St) ->
         type => <<"basic">>,
         request => Req
     }),
-    deny_unenforced(<<"Basic">>, Req, St);
+    deny_unenforced(
+        scheme_challenge(
+            <<"Basic">>, maps:get(realm_uri, St), authentication_failed
+        ),
+        Req,
+        St
+    );
 is_authorized(_, Req, #{security := Security} = St0) when
     is_map(Security) andalso map_size(Security) == 0
 ->
@@ -455,15 +467,19 @@ is_authorized(_, Req, #{security := Security} = St) ->
         security => Security,
         request => Req
     }),
-    deny_unenforced(<<"Bearer">>, Req, St).
+    %% No credential is evaluated here, so none can be named as refused.
+    deny_unenforced(
+        bondy_http_utils:bearer_challenge(
+            maps:get(realm_uri, St), no_credential
+        ),
+        Req,
+        St
+    ).
 
 %% @private
-deny_unenforced(Scheme, Req0, St) ->
+deny_unenforced(Challenge, Req0, St) ->
     Req1 = set_resp_headers(eval_headers(Req0, St), Req0),
-    RealmUri = maps:get(realm_uri, St),
-    Req2 = reply_auth_error(
-        authentication_failed, Scheme, RealmUri, json, Req1
-    ),
+    Req2 = reply_auth_error(authentication_failed, Challenge, json, Req1),
     {stop, Req2, St}.
 
 %% @private
@@ -481,7 +497,7 @@ authenticate_bearer(Req0, St0) ->
         Claims =
             case bondy_oauth_jwt:decode(Token) of
                 {ok, Decoded} -> Decoded;
-                {error, invalid} -> throw(invalid_token)
+                {error, invalid} -> throw(token_invalid)
             end,
         UserId = maps:get(<<"sub">>, Claims, undefined),
 
@@ -493,9 +509,17 @@ authenticate_bearer(Req0, St0) ->
         end
     catch
         throw:EReason ->
+            Refusal =
+                case bondy_http_utils:safe_bearer_token(Req0) of
+                    undefined -> no_credential;
+                    _ -> invalid_token
+                end,
             Req1 = set_resp_headers(eval_headers(Req0, St0), Req0),
             Req2 = reply_auth_error(
-                EReason, <<"Bearer">>, RealmUri, json, Req1
+                EReason,
+                bondy_http_utils:bearer_challenge(RealmUri, Refusal),
+                json,
+                Req1
             ),
             {stop, Req2, St0}
     end.
@@ -553,7 +577,10 @@ authenticate_ticket_cookie(Method, Req0, St0) ->
         throw:EReason ->
             Req1 = set_resp_headers(eval_headers(Req0, St0), Req0),
             Req2 = reply_auth_error(
-                EReason, <<"Cookie">>, RealmUri, json, Req1
+                EReason,
+                scheme_challenge(<<"Cookie">>, RealmUri, EReason),
+                json,
+                Req1
             ),
             {stop, Req2, St0}
     end.
@@ -609,23 +636,14 @@ authenticate(Token, Ctxt0, Req0, St0) ->
             },
             %% TODO update context
             {true, Req0, St1};
-        {error, {no_such_realm, _} = Reason} ->
-            {_, ErrorMap} = take_status_code(
-                bondy_connect_error:to_map(
-                    bondy_connect_error:from_term(Reason)
-                )
-            ),
-            Response = #{
-                <<"body">> => ErrorMap,
-                <<"headers">> => eval_headers(Req0, St0)
-            },
-            Req1 = reply(?HTTP_UNAUTHORIZED, json, Response, Req0),
-            {stop, Req1, St0};
         {error, Reason} ->
             RealmUri = maps:get(realm_uri, St0),
             Req1 = set_resp_headers(eval_headers(Req0, St0), Req0),
             Req2 = reply_auth_error(
-                Reason, <<"Bearer">>, RealmUri, json, Req1
+                Reason,
+                bondy_http_utils:bearer_challenge(RealmUri, invalid_token),
+                json,
+                Req1
             ),
             {stop, Req2, St0}
     end.
@@ -880,7 +898,7 @@ parse_token(Req) ->
         {bearer, Token} ->
             Token;
         _ ->
-            throw(invalid_token)
+            throw(token_invalid)
     end.
 
 %% @private
@@ -1340,14 +1358,31 @@ content_type(Headers) ->
         [] -> undefined
     end.
 
-reply_auth_error(Error, Scheme, Realm, Enc, Req) ->
+reply_auth_error(Error, Challenge, Enc, Req) ->
+    Resp = #{
+        <<"body">> => auth_error_body(Error),
+        <<"headers">> => #{
+            <<"www-authenticate">> => Challenge
+        }
+    },
+    reply(?HTTP_UNAUTHORIZED, error_encoding(Enc), Resp, Req).
+
+%% @private
+auth_error_body(Error) ->
     {_, Body} = take_status_code(
         bondy_connect_error:to_map(bondy_connect_error:from_term(Error))
     ),
+    Body.
+
+%% @private
+%% The challenge of a scheme other than `Bearer`, whose RFC 6750 form
+%% `bondy_http_utils:bearer_challenge/2` builds.
+scheme_challenge(Scheme, Realm, Error) ->
+    Body = auth_error_body(Error),
     Code = maps:get(<<"code">>, Body, <<>>),
     Msg = maps:get(<<"message">>, Body, <<>>),
     Desc = maps:get(<<"description">>, Body, <<>>),
-    Auth = <<
+    <<
         Scheme/binary,
         " realm=",
         $",
@@ -1368,14 +1403,7 @@ reply_auth_error(Error, Scheme, Realm, Enc, Req) ->
         $",
         Desc/binary,
         $"
-    >>,
-    Resp = #{
-        <<"body">> => Body,
-        <<"headers">> => #{
-            <<"www-authenticate">> => Auth
-        }
-    },
-    reply(?HTTP_UNAUTHORIZED, error_encoding(Enc), Resp, Req).
+    >>.
 
 %% @private
 -spec reply(integer(), atom(), map(), cowboy_req:req()) ->

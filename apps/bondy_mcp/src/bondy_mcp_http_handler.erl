@@ -1762,7 +1762,17 @@ reply_unauthorized(Reason, Req, #{base_uri := _}) ->
         description => "Unauthorized MCP request",
         reason => Reason
     }),
+    %% `Basic` is accepted as well, and a refused one presented no token.
+    Refusal =
+        case bondy_http_utils:safe_bearer_token(Req) of
+            undefined -> no_credential;
+            _ -> invalid_token
+        end,
     Req1 = cowboy_req:set_resp_header(
-        <<"www-authenticate">>, <<"Bearer">>, Req
+        <<"www-authenticate">>,
+        bondy_http_utils:bearer_challenge(
+            cowboy_req:binding(realm, Req), Refusal
+        ),
+        Req
     ),
     cowboy_req:reply(401, #{}, <<>>, Req1).

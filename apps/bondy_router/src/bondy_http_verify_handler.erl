@@ -146,7 +146,7 @@ handle(Method, Req, #{realm_uri := RealmUri}) when
                 realm_uri => RealmUri,
                 reason => Reason
             }),
-            reply_error(?HTTP_UNAUTHORIZED, error_type(Reason), RealmUri, Req)
+            reply_error(?HTTP_UNAUTHORIZED, Reason, RealmUri, Req)
     end;
 handle(_, Req, _) ->
     Headers = maps:put(
@@ -403,17 +403,21 @@ reply_ok(RealmUri, Identity, Req) ->
     cowboy_req:reply(?HTTP_OK, Headers, Body, Req).
 
 %% @private
-reply_error(Status, Type, RealmUri, Req) ->
-    Error = bondy_connect_error:from_term(Type),
+reply_error(Status, Reason, RealmUri, Req) ->
+    Error = bondy_connect_error:from_term(error_type(Reason)),
     Body = json:encode(
         maps:put(~"active", false, bondy_connect_error:to_map(Error))
     ),
+    Refusal =
+        case Reason of
+            no_credential -> no_credential;
+            _ -> invalid_token
+        end,
 
     Headers = maps:merge(no_store_headers(), #{
         <<"content-type">> => <<"application/json">>,
         <<"www-authenticate">> =>
-            <<"Bearer realm=\"", RealmUri/binary,
-                "\", error=\"invalid_token\"">>
+            bondy_http_utils:bearer_challenge(RealmUri, Refusal)
     }),
 
     cowboy_req:reply(Status, Headers, Body, Req).
