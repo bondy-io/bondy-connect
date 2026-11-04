@@ -344,6 +344,7 @@ silent_member_holds_compaction_and_rejoins(Config) ->
         ok = erpc:call(N, bondy_oplog_sync_scheduler, set_dispatch, [undefined])
      || N <- Nodes
     ],
+    Intervals = gc_intervals(Nodes),
     _ = [ok = bondy_ct:freeze_gc(N) || N <- Nodes],
     _ = [
         ok = erpc:call(N, ?MODULE, do_start_dispatch_collector, [])
@@ -354,6 +355,7 @@ silent_member_holds_compaction_and_rejoins(Config) ->
         do_stale_rejoin(Nodes)
     after
         %% Leave the cluster schedulable for any case added after this one.
+        ok = restore_gc_intervals(Intervals),
         _ = [
             try
                 erpc:call(N, ?MODULE, do_restore_sync_defaults, [])
@@ -522,6 +524,7 @@ truncated_prefix_is_held_and_repaired_by_rebootstrap(Config) ->
         ok = erpc:call(N, bondy_oplog_sync_scheduler, set_dispatch, [undefined])
      || N <- Nodes
     ],
+    Intervals = gc_intervals(Nodes),
     _ = [ok = bondy_ct:freeze_gc(N) || N <- Nodes],
     _ = [
         ok = erpc:call(N, ?MODULE, do_start_dispatch_collector, [])
@@ -531,6 +534,7 @@ truncated_prefix_is_held_and_repaired_by_rebootstrap(Config) ->
     try
         do_prefix_hole_enforced(Nodes)
     after
+        ok = restore_gc_intervals(Intervals),
         _ = [
             try
                 erpc:call(N, ?MODULE, do_restore_sync_defaults, [])
@@ -1204,6 +1208,30 @@ do_hole_origins_main() ->
 do_restore_sync_defaults() ->
     ok = bondy_oplog_sync_scheduler:set_dispatch(
         fun bondy_oplog_sync_scheduler:default_dispatch/2
+    ).
+
+%% @private
+%% Every case shares one cluster, and `bondy_ct:freeze_gc/1` sets both
+%% schedulers' interval to 0. A case that freezes them records the intervals
+%% first and restores them on exit, or every later case runs with no
+%% compaction tick at all.
+gc_intervals(Nodes) ->
+    [
+        {N, Name, maps:get(interval_ms, Info)}
+     || N <- Nodes,
+        Name <- [bondy_oplog_gc_scheduler, bondy_oplog_reclaim_scheduler],
+        Info <- [erpc:call(N, bondy_oplog_gc_scheduler, info, [Name])]
+    ].
+
+%% @private
+restore_gc_intervals(Intervals) ->
+    lists:foreach(
+        fun({N, Name, Ms}) ->
+            ok = erpc:call(
+                N, bondy_oplog_gc_scheduler, set_interval_ms, [Name, Ms]
+            )
+        end,
+        Intervals
     ).
 
 %% =============================================================================
