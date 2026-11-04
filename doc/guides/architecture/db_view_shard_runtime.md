@@ -75,11 +75,11 @@ process drains it, folds, installs, publishes and evicts in one step
    does not wait for other appenders' events. That barrier is what makes a
    subsequent `read/3` observe the write, because the facade registers its
    tables with the read-path overlay merge *disabled*.
-   `db.wal.fsync_mode` governs what "durable" costs. `per_write`, the
+   `db.oplog.wal.fsync_mode` governs what "durable" costs. `per_write`, the
    default, fsyncs every append, so each write is durable before it returns,
    at the price of binding the writer to the device's fsync rate. `batched`
-   defers the fsync to a size or time boundary (`db.wal.batched_fsync_bytes`,
-   `db.wal.batched_fsync_interval`) and exposes durability through an
+   defers the fsync to a size or time boundary (`db.oplog.wal.batched_fsync_bytes`,
+   `db.oplog.wal.batched_fsync_interval`) and exposes durability through an
    explicit wait rather than through the append returning, in exchange for a
    bounded durability window. All three options are global: they affect every
    durable instance on the node. A `registry` shard's in-memory WAL never
@@ -166,13 +166,13 @@ you set nothing.
 
 ### Durability of the append
 
-`db.wal.fsync_mode` (`per_write`) decides whether `append/2` returns before or
+`db.oplog.wal.fsync_mode` (`per_write`) decides whether `append/2` returns before or
 after the device has the frame, which is the difference between the head
 position and the durable position. `per_write` collapses the two. `batched`
-opens a window bounded by whichever of `db.wal.batched_fsync_bytes` (1 MB) or
-`db.wal.batched_fsync_interval` (50 ms) fires first, and callers that need a
+opens a window bounded by whichever of `db.oplog.wal.batched_fsync_bytes` (1 MB) or
+`db.oplog.wal.batched_fsync_interval` (50 ms) fires first, and callers that need a
 specific position on disk wait for it through `await_durable/3`.
-`db.wal.max_segment_bytes` (64 MB) sets where the head segment rotates. It is
+`db.oplog.wal.max_segment_bytes` (64 MB) sets where the head segment rotates. It is
 a soft target: the writer rotates between appends, before a frame that would
 cross it, so no batch spans a segment boundary.
 
@@ -181,10 +181,10 @@ window between head and durable position under each fsync mode](img/db-wal.svg)
 
 ### Sealing the pack
 
-`db.pack_seal_mode` decides whether the seal runs on the apply path.
+`db.oplog.pack.seal_mode` decides whether the seal runs on the apply path.
 `async`, the default, keeps it off that path: a monitored worker rewrites the
 pack while the instance keeps installing. `sync` puts one long datasync in
-front of the pipeline. `db.pack_auto_seal_bytes` sets how much accumulates
+front of the pipeline. `db.oplog.pack.auto_seal_bytes` sets how much accumulates
 first. Its default, `2MB`, is deliberately low so a seal rewrites the pack in
 short passes.
 
@@ -193,7 +193,7 @@ apply-latency trace under each seal mode](img/db-pack.svg)
 
 ### Detecting a stalled drain
 
-`db.drain.stall_alarm` (1 minute) is how long the applier may process frames
+`db.oplog.drain.stall_alarm` (1 minute) is how long the applier may process frames
 without committing past the highest position it has ever committed before it
 raises `{bondy_oplog_drain_stalled, InstanceId}`. Progress is measured against
 that high-water mark, so re-reading ground already committed does not count.
@@ -213,7 +213,7 @@ be inferred. `bondy_oplog_instance_frontier_holes` reports how many gaps a
 shard is carrying and `bondy_oplog_instance_frontier_pending_seqs` how much
 is stranded above them.
 
-`db.frontier.hole_alarm` (5 minutes) is how long a shard may carry one before
+`db.oplog.frontier.hole_alarm` (5 minutes) is how long a shard may carry one before
 raising `{bondy_oplog_frontier_hole, InstanceId}`, whose details name the
 origins and the sequence each gap starts at. The threshold is on the **age**
 of the condition, not its occurrence: short-lived gaps are routine — a local
@@ -221,7 +221,7 @@ commit landing out of sequence order, a burned sequence awaiting its
 backfill, an operation a peer round away. A gap that stays is not: the shard
 holds its reported frontier below it, so peers keep re-offering that origin
 and the log cannot truncate past it. `0` disables the detector. The sync
-scheduler measures it on its own 10-second timer, independently of `db.aae`,
+scheduler measures it on its own 10-second timer, independently of `db.oplog.aae`,
 because a node with anti-entropy off is more likely to carry a standing gap,
 not less.
 
@@ -255,7 +255,7 @@ read](img/db-leveled.svg)
 is `trim`, which drops journal files older than the one holding the
 penciller's persisted sequence number — the history a clean restart would no
 longer replay. Leveled schedules neither on its own, so
-`bondy_db_journal_trimmer` drives the trim every `db.journal_trim_interval`
+`bondy_db_journal_trimmer` drives the trim every `db.leveled.journal.trim_interval`
 (1 hour). Without it the journal grows with cumulative writes while the
 ledger holds only the live set. Reclaimed disk returns a few seconds after
 each pass, because leveled defers the unlink until no snapshot can still be
@@ -283,7 +283,7 @@ and snapshot options that still apply](img/db-leveled-compaction.svg)
 
 ### Bounding an index rebuild
 
-`db.primary_scan_limit` (1,000,000) caps the primary-cell rescan that answers
+`db.index.primary_scan_limit` (1,000,000) caps the primary-cell rescan that answers
 an indexed query while its index is stale. A scan that fills the cap returns a
 potentially incomplete result and logs a warning; the caller is not told. The
 right value follows from realm size and nothing else.

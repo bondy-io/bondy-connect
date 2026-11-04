@@ -11,8 +11,8 @@ clustered one, and asserts what clustering off changes: the standalone node
 does not start Partisan, refuses connections on the address its peer service
 would listen on, refuses `bondy.cluster.leave` with
 `bondy.error.cluster_disabled`, and still becomes ready as a cluster of one
-whose authentication fence passes with anti-entropy on (`db.aae`, which every
-`bondy_ct` peer enables).
+whose authentication fence passes with anti-entropy on (`db.oplog.aae`, which
+every `bondy_ct` peer enables).
 The clustered node is the control: the same probes find Partisan running, its
 peer address accepting and `leave` reaching the membership check, so a probe
 that cannot tell the modes apart fails there.
@@ -120,7 +120,7 @@ standalone_is_a_ready_cluster_of_one(Config) ->
     ?assertEqual(ok, fence(Node, 50)).
 
 %% A node left on `cluster.enabled = on` with no other member is not a single
-%% node: under the default `db.aae.fence.on_isolation = refuse` it never
+%% node: under the default `db.oplog.aae.fence.on_isolation = refuse` it never
 %% certifies its security tables, and compaction holds with `no_members`.
 lone_clustered_node_is_fenced_and_held(Config) ->
     ok = push_module(?config(clustered, Config)),

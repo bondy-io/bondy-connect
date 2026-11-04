@@ -247,16 +247,16 @@ Anti-entropy reconciles data between nodes. It is necessary, and it is never
 more important than routing. Three mechanisms keep it in its place, and they
 bound different things.
 
-**Concurrency** — `db.aae.max_concurrency` (3) caps how many sync sessions run
+**Concurrency** — `db.oplog.aae.max_concurrency` (3) caps how many sync sessions run
 at once. This governs speed and fairness, not memory: the per-round page batch
-is `db.aae.max_pages_in_flight` divided by this value, so raising concurrency
+is `db.oplog.aae.max_pages_in_flight` divided by this value, so raising concurrency
 shrinks each session's batch and leaves the node-wide page budget unchanged.
 More concurrency means more shards make progress at once, each more slowly, so
 no shard starves behind a single serial sync. Setting it to `1` serialises
 anti-entropy, except for the shards that back the authentication freshness
 fence, which bypass the cap.
 
-**Memory** — `db.aae.max_pages_in_flight` (2048) is the node-wide budget, in
+**Memory** — `db.oplog.aae.max_pages_in_flight` (2048) is the node-wide budget, in
 pages, for reconciliation in flight at any instant. This is the lever for peak
 memory, and it does not depend on dataset size or concurrency. Each session
 of a fence-backing shard bypasses the concurrency cap and adds one batch above
@@ -265,15 +265,15 @@ slower.
 
 **Time** — the other two bound anti-entropy in aggregate; neither stops it
 from competing with a routing spike happening right now.
-`db.aae.live_sync` (on) handles the steady state: a shard whose data has
+`db.oplog.aae.live_sync` (on) handles the steady state: a shard whose data has
 settled has nothing to pull, so its poll interval backs off geometrically up
-to `db.aae.live_sync.max` (5s) and resets to the tick cadence the moment its
+to `db.oplog.aae.live_sync.max` (5s) and resets to the tick cadence the moment its
 data moves again. Because propagation is pull-only, that cap is also the
 steady-state convergence latency for a quiescent shard — set it below the
 convergence bound you need.
 
-`db.aae.load_adaptive` (off) handles the spike: while the smoothed load ratio
-sits at or above `db.aae.load_run_queue_threshold` (2.0), the scheduler skips
+`db.oplog.aae.load_adaptive` (off) handles the spike: while the smoothed load ratio
+sits at or above `db.oplog.aae.load_run_queue_threshold` (2.0), the scheduler skips
 bootstrap transfers and the live syncs of shards that do not back the fence
 for that tick. The scheduler does not stop sessions already running, and the
 deferred shards are dispatched on the next tick below the threshold. The
@@ -306,9 +306,9 @@ neither feeds the other:
 | | Node load monitor | Anti-entropy scheduler |
 |---|---|---|
 | Reads | Total run queue length, raw, every 100ms | Run queue ÷ online schedulers |
-| Compared against | `run_queue_high_watermark` (8) × schedulers; back to normal at `run_queue_low_watermark` (4) × schedulers | `db.aae.load_run_queue_threshold` (2.0), as an EWMA-smoothed ratio across ticks |
+| Compared against | `run_queue_high_watermark` (8) × schedulers; back to normal at `run_queue_low_watermark` (4) × schedulers | `db.oplog.aae.load_run_queue_threshold` (2.0), as an EWMA-smoothed ratio across ticks |
 | Output | One binary status: busy / normal | Throttle this tick, or not |
-| Consumer | The `HELLO` admission gate | The anti-entropy scheduler, when `db.aae.load_adaptive` is on |
+| Consumer | The `HELLO` admission gate | The anti-entropy scheduler, when `db.oplog.aae.load_adaptive` is on |
 
 The hard threshold answers an admission question that must not flap; the
 smoothed ratio answers a "good moment for background work?" question that must
@@ -319,10 +319,10 @@ not overreact to one sample.
 | `HELLO` admission gate | latency of admitted sessions; the node's memory limit | node monitor busy state; memory monitor high state | immediate retryable `ABORT` (`wamp.error.unavailable`); established sessions unaffected | `load_regulation.hello.enabled` (`on`) | `bondy_wamp_dropped_total{reason="admission"}` · the `bondy_memory_high` alarm |
 | OAuth2 admission gate | latency of admitted grants; the node's memory limit | node monitor busy state; memory monitor high state | `503` + `retry-after` before any credential work | `load_regulation.oauth2.enabled` (`on`) | `cowboy_requests_total{status_class="5xx"}` · the `bondy_memory_high` alarm |
 | Flow-pool bound | memory and ordering on cluster ingress | a worker's queue vs its share of the budget | the message is shed (at-most-once delivery) | `load_regulation.router.flow_pool.capacity` (100,000) | `bondy_wamp_dropped_total{reason="shed"}` |
-| Anti-entropy concurrency cap | routing fairness | count of running sync sessions | further syncs are skipped until a later tick; per-round batch = pages ÷ concurrency; fence-backing shards exempt | `db.aae.max_concurrency` (3) | — |
-| Anti-entropy page budget | peak memory | reconciliation pages in flight | batches shrink; the budget does not depend on dataset size | `db.aae.max_pages_in_flight` (2048) | — |
-| Live-sync backoff | steady-state background cost | whether the shard's data moved | poll interval backs off geometrically to `db.aae.live_sync.max` (5s), resets on change | `db.aae.live_sync` (`on`) | — |
-| Load-adaptive throttle | routing during a spike | the smoothed run-queue ratio | that tick's bootstraps and non-fence live syncs are skipped; running syncs continue | `db.aae.load_adaptive` (`off`) | `bondy_oplog_sync_scheduler_yielding` |
+| Anti-entropy concurrency cap | routing fairness | count of running sync sessions | further syncs are skipped until a later tick; per-round batch = pages ÷ concurrency; fence-backing shards exempt | `db.oplog.aae.max_concurrency` (3) | — |
+| Anti-entropy page budget | peak memory | reconciliation pages in flight | batches shrink; the budget does not depend on dataset size | `db.oplog.aae.max_pages_in_flight` (2048) | — |
+| Live-sync backoff | steady-state background cost | whether the shard's data moved | poll interval backs off geometrically to `db.oplog.aae.live_sync.max` (5s), resets on change | `db.oplog.aae.live_sync` (`on`) | — |
+| Load-adaptive throttle | routing during a spike | the smoothed run-queue ratio | that tick's bootstraps and non-fence live syncs are skipped; running syncs continue | `db.oplog.aae.load_adaptive` (`off`) | `bondy_oplog_sync_scheduler_yielding` |
 | Rate limiting — five classes, three scopes | fair share per source IP / session / tenant | token buckets, consumed node → listener → realm | `429` / `ABORT` / `ERROR` / silent drop, per class — next section | `security.rate_limit.*` · `listeners.$name.rate_limit.*` · the realm `rate_limit` property | `bondy_rate_limited_total{class, scope}` |
 | Callee admission (`bondy_connect_sdk`) | the callee's handler pool | in-flight invocation count, plus an optional token bucket | backpressure `ERROR` instead of running the handler | `handler.max_concurrency` · `handler.rate` (client-side, not `bondy.conf`) | — |
 
@@ -547,8 +547,8 @@ consumer that is persistently slower than its producer — for that one it only
 delays the drop and holds the memory meanwhile.
 
 **Anti-entropy trades convergence latency for headroom.** Lowering
-`db.aae.max_pages_in_flight` cuts peak memory and slows sync.
-`db.aae.live_sync.max` is a convergence bound, so treat it as an SLA figure
+`db.oplog.aae.max_pages_in_flight` cuts peak memory and slows sync.
+`db.oplog.aae.live_sync.max` is a convergence bound, so treat it as an SLA figure
 rather than a tuning knob.
 
 **Rate limits are topology-dependent.** The right values depend entirely on

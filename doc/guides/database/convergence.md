@@ -48,9 +48,9 @@ exchange durable frontiers, and compaction trusts only those.
 
 ## The sync round
 
-Anti-entropy is pull-based. On each `db.aae.interval` tick,
+Anti-entropy is pull-based. On each `db.oplog.aae.interval` tick,
 `bondy_oplog_sync_scheduler` sorts the instances and rotates the list by a
-monotonic tick counter, so that a scarce `db.aae.max_concurrency` cap starves no
+monotonic tick counter, so that a scarce `db.oplog.aae.max_concurrency` cap starves no
 instance. It picks peers for the instances that win a slot, and
 `bondy_oplog_sync_session` runs one round against each peer:
 
@@ -373,7 +373,7 @@ Recovery has three stages, and each costs more than the last:
 
 | Situation | What has to happen | Bounded by |
 |---|---|---|
-| Ordinary lag | One sync round for that instance | `db.aae.interval`, times the ticks the instance waits for a slot under `db.aae.max_concurrency`, plus transfer |
+| Ordinary lag | One sync round for that instance | `db.oplog.aae.interval`, times the ticks the instance waits for a slot under `db.oplog.aae.max_concurrency`, plus transfer |
 | Standing gap | Two complete rounds to strike twice, then the remedy | Two rounds plus settle |
 | Re-bootstrap | Full projection transfer for the instance | Instance size |
 

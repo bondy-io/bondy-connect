@@ -1,4 +1,28 @@
 # CHANGELOG
+## 1.1.0
+
+### Action required
+* A node refuses to start when `bondy.conf` sets a key that this release does not read: a renamed key, a removed key or a typo. The error names each such key and the closest key the release knows. Earlier releases ignored such a key without a word, so its setting silently stayed at the default. Check your `bondy.conf` with `scripts/migrate_conf.escript check` before you upgrade.
+* The `db.*` keys of `bondy.conf` are grouped by the component they configure, so most of them have a new name. A node refuses to start on a `bondy.conf` that still uses an old name, and the error names the new key. Before you upgrade, run `scripts/migrate_conf.escript check <path>/bondy.conf` from this repository: it lists every old key with its new name, and `migrate` writes the converted file. The renames:
+  * `db.aae`, `db.aae.*` → `db.oplog.aae`, `db.oplog.aae.*`
+  * `db.wal.*` → `db.oplog.wal.*`
+  * `db.pack_auto_seal_bytes` → `db.oplog.pack.auto_seal_bytes`
+  * `db.pack_seal_mode` → `db.oplog.pack.seal_mode`
+  * `db.gc_interval` → `db.oplog.heap_gc.interval`
+  * `db.gc_heap_delta` → `db.oplog.heap_gc.delta`
+  * `db.gc_max_concurrency` → `db.oplog.compaction.max_concurrency`
+  * `db.frontier.hole_alarm` → `db.oplog.frontier.hole_alarm`
+  * `db.drain.stall_alarm` → `db.oplog.drain.stall_alarm`
+  * `db.reclaim`, `db.reclaim.*` → `db.oplog.reclaim`, `db.oplog.reclaim.*`
+  * `db.origin_retirement`, `db.origin_retirement.*` → `db.oplog.origin_retirement`, `db.oplog.origin_retirement.*`
+  * `db.journal_trim_interval` → `db.leveled.journal.trim_interval`
+  * `db.primary_scan_limit` → `db.index.primary_scan_limit`
+
+  The keys under `db.main.*`, `db.registry.*` and `db.leveled.*` keep their names. Values, units and defaults do not change.
+
+### Changes
+* New `bondy.conf` keys tune the reclamation of a durable table's anti-entropy tree, which 1.0.2 could set only in the application environment: `db.oplog.pack.gc.interval` (default `1h`), `db.oplog.pack.gc.growth_factor` (default `2`, at least 2) and `db.oplog.pack.gc.min_records` (default `10000`). See `doc/guides/configuration/database_options.md`.
+
 ## 1.0.2
 
 ### Fixes

@@ -55,16 +55,16 @@ when you set nothing.
 
 ### The sweeps
 
-`db.reclaim.interval` (1 minute) spaces the reclamation passes and
-`db.reclaim.batch_cells` (500) caps how many cells one pass scans, so a sweep
-cannot monopolise an instance. `db.origin_retirement.interval` (10 minutes)
+`db.oplog.reclaim.interval` (1 minute) spaces the reclamation passes and
+`db.oplog.reclaim.batch_cells` (500) caps how many cells one pass scans, so a sweep
+cannot monopolise an instance. `db.oplog.origin_retirement.interval` (10 minutes)
 spaces the retirement of departed peers' origins, recorded under
-`db.origin_retirement.path`. `db.reclaim` and `db.origin_retirement` turn each
+`db.oplog.origin_retirement.path`. `db.oplog.reclaim` and `db.oplog.origin_retirement` turn each
 sweep on or off.
 
-Separately, every instance inspects its own heap every `db.gc_interval`
+Separately, every instance inspects its own heap every `db.oplog.heap_gc.interval`
 (2 seconds) and fullsweep-hibernates when the heap has grown more than
-`db.gc_heap_delta` (16 MB) past its post-collection baseline. That returns
+`db.oplog.heap_gc.delta` (16 MB) past its post-collection baseline. That returns
 the transient apply and anti-entropy garbage a long-lived process would
 otherwise hold until its next major collection.
 
@@ -78,12 +78,12 @@ every database. A silent member holds them down until an explicit membership
 act removes it; no timeout changes that. Registry retention is the one bound
 on history that does not wait for members.
 
-`db.gc_max_concurrency` (4) caps how many instances either sweep may cycle at
+`db.oplog.compaction.max_concurrency` (4) caps how many instances either sweep may cycle at
 once. Reclamation runs a second instance of the scheduler that drives
 compaction (`bondy_oplog_gc_scheduler`), and both read this cap; instances
 over it are skipped that tick and retried on the next. Despite the shared
-prefix, the cap has nothing to do with the `db.gc_interval` and
-`db.gc_heap_delta` heap monitor.
+prefix, the cap has nothing to do with the `db.oplog.heap_gc.interval` and
+`db.oplog.heap_gc.delta` heap monitor.
 
 ```mermaid
 flowchart LR

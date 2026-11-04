@@ -49,9 +49,9 @@ it declares — not that every alarm carries structured detail.
 | `{bondy_mcp_name_collision, Realm, Name}` | major | realm | Two MCP manifest entries in a realm resolve to the same name |
 | `bondy_memory_high` | major | node | Node memory use is above the high watermark of its limit |
 | `{bondy_oplog_bucket_unroutable, InstanceId}` | major | node | A catalogue bootstrap received cells for a table this node does not declare; the instance does not adopt the peer's frontier and bootstraps again |
-| `{bondy_oplog_drain_stalled, InstanceId}` | major | node | A WAL drain processes frames without committing a new position for `db.drain.stall_alarm` |
-| `{bondy_oplog_frontier_hole, InstanceId}` | major | node | A shard has carried a gap in its applied frontier for `db.frontier.hole_alarm` |
-| `bondy_auth_fence_closed` | critical | node | The node has refused every new authentication for `db.aae.fence.alarm` |
+| `{bondy_oplog_drain_stalled, InstanceId}` | major | node | A WAL drain processes frames without committing a new position for `db.oplog.drain.stall_alarm` |
+| `{bondy_oplog_frontier_hole, InstanceId}` | major | node | A shard has carried a gap in its applied frontier for `db.oplog.frontier.hole_alarm` |
+| `bondy_auth_fence_closed` | critical | node | The node has refused every new authentication for `db.oplog.aae.fence.alarm` |
 | `{bondy_oplog_frontier_receipt_derived, InstanceId}` | major | node | A shard restored an applied frontier derived from receipt |
 | `bondy_db_main_unavailable` | critical | node | The durable `main` database could not be opened |
 | `{bondy_oplog_instance_down, InstanceId}` | critical | node | A shard instance has stopped and is not running again yet; its tables are unavailable |

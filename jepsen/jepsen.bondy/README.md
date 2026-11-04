@@ -121,7 +121,7 @@ tolerates either outcome for those).
 |---|---|---|
 | `--nemesis` | `none` | `none`, `kill-erlang-vm`, `random-partition-halves`, `partition-halves`, `partition-majorities-ring`, `partition-random-node`, `combined` |
 | `--recovery-wait` | 120 | Seconds between the heal and the final reads (see "Reading the verdict": `combined` faults converge in (60, 120] s on the compose cluster) |
-| `--aae-interval-ms` | 500 | `db.aae.interval` |
+| `--aae-interval-ms` | 500 | `db.oplog.aae.interval` |
 | `--ready-timeout` | 120 | Seconds a node has to answer `/ready` = 204 at setup |
 | `--realm` | `com.jepsen.bondy` | The realm the users are written into |
 | `--erlang-distribution-url` | newest `bondy-*.tar.gz` here | The release tarball |

@@ -1,33 +1,31 @@
 # How to check your configuration before an upgrade
 
-A `bondy.conf` can be wrong in two ways, and neither of them says so at boot.
+A `bondy.conf` can be wrong in two ways, and from 1.1.0 a node refuses to start
+on either:
 
-A key Bondy no longer recognises is dropped without a word: the node starts, and
-the subsystem you meant to configure runs on its default.
+- **A key Bondy does not read.** It is a renamed key, a removed key or a typo.
+  Before 1.1.0 the node dropped such a key without a word and ran the subsystem
+  on its default.
+- **A value Bondy cannot parse.** Config generation is all-or-nothing, so the
+  node does not start, and the error names the key and the reason.
 
-A value Bondy cannot parse is worse. Config generation is all-or-nothing, so one
-unusable value discards the whole file — every other setting in it with the same
-silence — and the node starts on whatever config the last successful generation
-left behind. Nothing appears in the log.
+`scripts/migrate_conf.escript` finds both before you deploy, and for a renamed
+key it names the new one. Run it before every upgrade, and after every
+hand-edit of a `bondy.conf`.
 
-`scripts/migrate_conf.escript` is the tool that tells you which of your settings
-either applies to.
+## How the boot check works
 
-Run it before every upgrade, and after every hand-edit of a `bondy.conf`.
+The release builds its application config by running `cuttlefish` once per
+schema set: the VM arguments, then the application schemas. Each run reads your
+*whole* `bondy.conf` while knowing only its own subset of keys, so every key
+owned by another set looks unrecognised to the run that is executing. Those
+runs therefore tolerate keys they do not know (`--allow_extra`), and that
+tolerance cannot tell "belongs to the other schema set" from "belongs to no
+schema at all".
 
-## Why a tool rather than a boot check
-
-The release builds its application config by running `cuttlefish` once per schema
-set — the VM arguments, then the application schemas — and each run reads your
-*whole* `bondy.conf` while knowing only its own subset of keys. Every key owned
-by another set therefore looks unrecognised to the run currently executing, so
-all the runs are told to tolerate keys they do not know.
-
-That tolerance cannot distinguish "belongs to the other schema set" from
-"belongs to no schema at all". It is structural, not a policy that could be
-switched off: the flag lives in the release-generation plugin's template, and
-removing it would abort the boot on the first invocation for essentially every
-application key in the file.
+From 1.1.0, the release's pre-start hook first runs `cuttlefish` once against
+every schema set together, without that tolerance. A key that no schema maps
+stops the boot there, and cuttlefish names the closest key it knows.
 
 So a key is genuinely dead only if *no* schema maps it. That is the question
 this tool answers.

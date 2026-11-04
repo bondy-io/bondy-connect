@@ -13,14 +13,14 @@ global, node-wide settings — not scoped to a specific `bondy_db` database
 
 ## Enabling reclamation
 
-### `db.reclaim` (`bondy_oplog.reclaim_enabled`)
+### `db.oplog.reclaim` (`bondy_oplog.reclaim_enabled`)
 
 `on | off`, default `on`.
 
 Whether the reclamation scheduler ticks. When `off`, the scheduler process
 runs idle: deletes still converge, and tombstones are kept indefinitely.
 
-### `db.reclaim.interval` (`bondy_oplog.reclaim_interval_ms`)
+### `db.oplog.reclaim.interval` (`bondy_oplog.reclaim_interval_ms`)
 
 Duration, default `1m`.
 
@@ -29,7 +29,7 @@ compaction scheduler's cadence: reclamation is a space concern, not a
 liveness one, and each pass re-derives stability from peer state that only
 changes as anti-entropy rounds complete. `0` disables periodic passes.
 
-### `db.reclaim.batch_cells` (`bondy_oplog.reclaim_batch_cells`)
+### `db.oplog.reclaim.batch_cells` (`bondy_oplog.reclaim_batch_cells`)
 
 `pos_integer()`, default `500`.
 
@@ -41,13 +41,13 @@ writes interleave between batches.
 
 ## Origin retirement
 
-### `db.origin_retirement` (`bondy_oplog.origin_retirement`)
+### `db.oplog.origin_retirement` (`bondy_oplog.origin_retirement`)
 
 `on | off`, default `on`.
 
 Whether the origin-retirement pass runs. When enabled, a node runs the pass
 on each membership change it observes, once at boot (to cover removals that
-happened while it was down), and every `db.origin_retirement.interval`. Each
+happened while it was down), and every `db.oplog.origin_retirement.interval`. Each
 pass:
 
 - forgets departed peers from the node's peer state;
@@ -62,7 +62,7 @@ reaps nothing and retries on the next trigger. Retirements learned from the
 members that did answer still apply. The pass never retires an origin by
 itself: see *Retiring a decommissioned node* below.
 
-### `db.origin_retirement.path` (`bondy_oplog.retirement_path`)
+### `db.oplog.origin_retirement.path` (`bondy_oplog.retirement_path`)
 
 Path, default `origin_retirement` relative to `platform_data_dir`.
 
@@ -87,7 +87,7 @@ alarm is raised once per episode and cleared by the next successful write. An
 application that embeds `bondy_oplog` without a path logs this once at info
 level and raises no alarm.
 
-### `db.origin_retirement.interval` (`bondy_oplog.origin_retirement_interval_ms`)
+### `db.oplog.origin_retirement.interval` (`bondy_oplog.origin_retirement_interval_ms`)
 
 Duration, default `10m`.
 
@@ -151,14 +151,14 @@ shared; `gc_scheduler`/`gc_interval_ms` (the compaction scheduler's own
 enablement and cadence) are internal-only — they have no `bondy.conf` key —
 and are listed here only to state that they do **not** govern reclamation.
 
-### `db.gc_max_concurrency` (`bondy_oplog.gc_max_concurrency`)
+### `db.oplog.compaction.max_concurrency` (`bondy_oplog.gc_max_concurrency`)
 
 `pos_integer()`, default `4`.
 
 The cap on trigger workers that one scheduler runs at once. The compaction
 scheduler and the reclamation scheduler each apply this value to their own
 workers. Instances over the cap on a tick are skipped and retried on the next
-tick. The option is unrelated to `db.gc_interval` and `db.gc_heap_delta`,
+tick. The option is unrelated to `db.oplog.heap_gc.interval` and `db.oplog.heap_gc.delta`,
 which configure each instance's BEAM heap monitor.
 
 ## Telemetry

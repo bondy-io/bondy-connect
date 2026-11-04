@@ -118,7 +118,7 @@ public final class Utils {
    * except for its own `cluster.peer_ip`.
    *
    * `test` is the Jepsen test map; `:nodes` is the node list and
-   * `:aae-interval-ms` the anti-entropy tick (`db.aae.interval`).
+   * `:aae-interval-ms` the anti-entropy tick (`db.oplog.aae.interval`).
    */
   @SuppressWarnings("unchecked")
   public static String configuration(Map<Object, Object> test, Object currentNode)
@@ -184,8 +184,8 @@ public final class Utils {
 
     // Anti-entropy: what makes acknowledged writes reach every replica
     // after a partition heals.
-    sb.append("db.aae = on\n");
-    sb.append("db.aae.interval = ").append(aaeIntervalMs).append("ms\n");
+    sb.append("db.oplog.aae = on\n");
+    sb.append("db.oplog.aae.interval = ").append(aaeIntervalMs).append("ms\n");
     return sb.toString();
   }
 

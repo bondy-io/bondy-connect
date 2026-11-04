@@ -824,7 +824,8 @@ schedule_tick(#state{interval_ms = Ms} = State) ->
 %% writer already holds. The alarm is on the OBSERVED age of that condition:
 %% the clock starts when this incarnation first sees the hole, and `pending` is
 %% volatile, so a restart re-observes it. It rides `?HOLE_TICK_MS` rather than
-%% the AE tick, so the age it reports does not move with `db.aae.interval`.
+%% the AE tick, so the age it reports does not move with
+%% `db.oplog.aae.interval`.
 check_holes(#state{holes = Holes} = State) ->
     case bondy_oplog_config:frontier_hole_alarm_ms() of
         0 ->
@@ -940,7 +941,7 @@ raise_hole_alarm(Id, VV, Pending, HeldForMs) ->
     Desc =
         <<
             "A shard instance has carried a per-origin gap in its applied "
-            "frontier for longer than db.frontier.hole_alarm. Sequence "
+            "frontier for longer than db.oplog.frontier.hole_alarm. Sequence "
             "numbers below the gap were never received; later ones from the "
             "same origin are applied but cannot be reported, so peers keep "
             "re-offering that origin and the log cannot be truncated past "
@@ -969,7 +970,7 @@ clear_hole_alarm(Id) ->
 default_dispatch(InstanceId, []) ->
     %% Empty peer list this round. `maybe_bump_ae_isolated/1` certifies a
     %% genuine single-node deployment unconditionally (no peer to lag), and
-    %% otherwise applies the `db.aae.fence.on_isolation` policy: `refuse`
+    %% otherwise applies the `db.oplog.aae.fence.on_isolation` policy: `refuse`
     %% leaves freshness to decay (the fence refuses); `proceed`/`quorum` may
     %% certify so the node keeps authenticating.
     bondy_oplog_sync_session:maybe_bump_ae_isolated(InstanceId);

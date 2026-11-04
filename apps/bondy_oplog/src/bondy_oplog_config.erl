@@ -228,8 +228,8 @@ gc_max_concurrency() ->
 
 -doc """
 `incoming.pack` byte threshold at which the durable pack-store MST seals it
-into a sealed pack (default 2 MiB, the `db.pack_auto_seal_bytes` default).
-See `db.pack_auto_seal_bytes` for the trade-off.
+into a sealed pack (default 2 MiB, the `db.oplog.pack.auto_seal_bytes` default).
+See `db.oplog.pack.auto_seal_bytes` for the trade-off.
 """.
 -spec pack_auto_seal_bytes() -> pos_integer().
 

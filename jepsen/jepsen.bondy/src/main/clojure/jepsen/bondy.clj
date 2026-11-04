@@ -591,7 +591,7 @@
     :default  120
     :parse-fn parse-long
     :validate [pos? "Must be a positive integer."]]
-   [nil "--aae-interval-ms NUM" "bondy_db anti-entropy interval (db.aae.interval)."
+   [nil "--aae-interval-ms NUM" "bondy_db anti-entropy interval (db.oplog.aae.interval)."
     :default  500
     :parse-fn parse-long
     :validate [pos? "Must be a positive integer."]]

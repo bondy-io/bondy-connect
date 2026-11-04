@@ -40,16 +40,16 @@
     <line x1="560" y1="98" x2="560" y2="126"/><line x1="720" y1="98" x2="720" y2="126"/>
   </g>
   <line class="axis" x1="240" y1="84" x2="400" y2="84" marker-start="url(#s-arm)" marker-end="url(#s-arm)"/>
-  <text class="ts mu" x="320" y="78" text-anchor="middle">db.reclaim.interval = 1m</text>
+  <text class="ts mu" x="320" y="78" text-anchor="middle">db.oplog.reclaim.interval = 1m</text>
   <rect class="fill" x="240" y="132" width="46" height="18"/>
   <rect class="fill" x="400" y="132" width="46" height="18"/>
   <rect class="fill" x="560" y="132" width="46" height="18"/>
   <rect class="fill" x="720" y="132" width="46" height="18"/>
   <text class="ts mu" x="790" y="145">at most 500 cells scanned per pass</text>
   <rect class="cfgbx" x="240" y="158" width="232" height="20" rx="4"/>
-  <text class="tk sp" x="248" y="172">db.reclaim.batch_cells = 500</text>
+  <text class="tk sp" x="248" y="172">db.oplog.reclaim.batch_cells = 500</text>
   <rect class="cfgbx" x="484" y="158" width="140" height="20" rx="4"/>
-  <text class="tk sp" x="492" y="172">db.reclaim = on</text>
+  <text class="tk sp" x="492" y="172">db.oplog.reclaim = on</text>
 
   <!-- ============ origin retirement ============ -->
   <line x1="40" y1="204" x2="920" y2="204" stroke="var(--ru,#d9d5cf)" stroke-width="1"/>
@@ -60,13 +60,13 @@
     <line x1="280" y1="248" x2="280" y2="276"/><line x1="600" y1="248" x2="600" y2="276"/>
   </g>
   <line class="axis" x1="280" y1="234" x2="600" y2="234" marker-start="url(#s-arm)" marker-end="url(#s-arm)"/>
-  <text class="ts mu" x="440" y="228" text-anchor="middle">db.origin_retirement.interval = 10m</text>
+  <text class="ts mu" x="440" y="228" text-anchor="middle">db.oplog.origin_retirement.interval = 10m</text>
   <rect class="fill" x="280" y="282" width="60" height="18"/>
   <rect class="fill" x="600" y="282" width="60" height="18"/>
   <rect class="cfgbx" x="280" y="310" width="304" height="20" rx="4"/>
-  <text class="tk sp" x="288" y="324">db.origin_retirement.path = origin_retirement</text>
+  <text class="tk sp" x="288" y="324">db.oplog.origin_retirement.path = origin_retirement</text>
   <rect class="cfgbx" x="596" y="310" width="188" height="20" rx="4"/>
-  <text class="tk sp" x="604" y="324">db.origin_retirement = on</text>
+  <text class="tk sp" x="604" y="324">db.oplog.origin_retirement = on</text>
 
   <!-- ============ instance heap monitor ============ -->
   <line x1="40" y1="356" x2="920" y2="356" stroke="var(--ru,#d9d5cf)" stroke-width="1"/>
@@ -81,7 +81,7 @@
         fill="none" stroke="var(--sp,#14705f)" stroke-width="2"/>
   <line class="cfg" x1="200" y1="402" x2="880" y2="402"/>
   <rect class="cfgbx" x="640" y="378" width="248" height="20" rx="4"/>
-  <text class="tk sp" x="648" y="392">db.gc_heap_delta = 16MB</text>
+  <text class="tk sp" x="648" y="392">db.oplog.heap_gc.delta = 16MB</text>
   <g class="tick" stroke-width="1.2" opacity=".55">
     <line x1="240" y1="466" x2="240" y2="474"/><line x1="280" y1="466" x2="280" y2="474"/>
     <line x1="320" y1="466" x2="320" y2="474"/><line x1="360" y1="466" x2="360" y2="474"/>
@@ -90,7 +90,7 @@
   </g>
   <text class="ts sp" x="366" y="484">every tick: check own heap · fullsweep-hibernate when it has grown past the delta</text>
   <rect class="cfgbx" x="200" y="492" width="196" height="20" rx="4"/>
-  <text class="tk sp" x="208" y="506">db.gc_interval = 2s</text>
+  <text class="tk sp" x="208" y="506">db.oplog.heap_gc.interval = 2s</text>
   <text class="ts mu" x="408" y="506">Reclaims transient apply/AAE garbage a long-lived instance would otherwise hold until the next major GC.</text>
   <text class="ts mu" x="40" y="530">Every option above is a bondy.conf key; values shown are the defaults.</text>
 </svg>

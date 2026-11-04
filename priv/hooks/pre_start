@@ -52,3 +52,25 @@ echo "${NC}===> BONDY_RUNTIME_DIR=${BONDY_RUNTIME_DIR}"
 
 relx_escript ./bin/validate-config ${BONDY_ETC_DIR} ${BONDY_RELEASE_DIR}
 relx_escript ./bin/replace-env-vars ${BONDY_ETC_DIR}
+
+# Refuse to start on a bondy.conf key that no schema maps. Each cuttlefish run
+# in hooks/pre_start_cuttlefish reads one schema set, so it passes
+# --allow_extra, which drops an unknown key without a word: a renamed key or a
+# typo leaves its setting at the default. This run reads bondy.conf against
+# every schema set at once, without --allow_extra, so an unknown key stops the
+# boot and cuttlefish names the closest known key. It also rejects a value its
+# setting cannot parse. Its output files are discarded.
+STRICT_CONF_DIR="$(mktemp -d)"
+if ! relx_escript ./bin/cuttlefish \
+        --etc_dir "${BONDY_ETC_DIR}" \
+        --dest_dir "${STRICT_CONF_DIR}" \
+        --schema_dir "${BONDY_RELEASE_DIR}schema" \
+        --schema_file "${BONDY_RELEASE_DIR}vm_args.schema" \
+        --conf_file "${BONDY_ETC_DIR}/bondy.conf" \
+        --silent; then
+    rm -rf "${STRICT_CONF_DIR}"
+    echo "${RED}===> bondy.conf has a key this release does not read, or a value it rejects (see above)."
+    echo "${RED}===> Fix it before starting; 'scripts/migrate_conf.escript check' lists renamed keys.${NC}"
+    exit 1
+fi
+rm -rf "${STRICT_CONF_DIR}"

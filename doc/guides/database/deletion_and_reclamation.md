@@ -193,9 +193,9 @@ at the last confirmed key instead, violates it.
 `proofs/README.md` records both runs.
 
 The sweep is bounded and resumable. Each pass runs in batches of
-`db.reclaim.batch_cells` cells, so concurrent writes interleave between
+`db.oplog.reclaim.batch_cells` cells, so concurrent writes interleave between
 batches instead of waiting for a whole-shard scan. Passes run on their own
-cadence, `db.reclaim.interval`, driven by a second instance of the GC
+cadence, `db.oplog.reclaim.interval`, driven by a second instance of the GC
 scheduler registered as `bondy_oplog_reclaim_scheduler`. That cadence is
 separate from, and much slower than, the compaction cadence.
 
@@ -217,13 +217,13 @@ its own past, the failure mode that Riak's kv679 made well known. The
 consequence is that a node accumulates dead origins over its lifetime, and
 their bookkeeping entries stay in cell states.
 
-The origin-retirement pass (`db.origin_retirement`) removes these entries by
+The origin-retirement pass (`db.oplog.origin_retirement`) removes these entries by
 **complement**. It asks every current member for the origins it claims, which
 is knowledge each node owns. An origin that appears in the local frontiers but
 that no member claims is a dead epoch. The pass reaps its causal-context
 entries from cell states. The pass is fail-closed: if any member cannot be
 queried, nothing is reaped, and the pass retries later. It runs on membership
-changes and on a slow periodic tick (`db.origin_retirement.interval`). The tick
+changes and on a slow periodic tick (`db.oplog.origin_retirement.interval`). The tick
 covers an origin epoch that turns over without any membership change, such as
 a Kubernetes pod that loses its volume and rejoins under the same name.
 

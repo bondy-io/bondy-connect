@@ -112,10 +112,10 @@
   <text class="ts mu" x="600" y="342">A write is already durable in the WAL before the fold</text>
   <text class="ts mu" x="600" y="356">reaches leveled, and the projection can be rebuilt</text>
   <text class="ts mu" x="600" y="370">from it — so none is deliberate, not an oversight.</text>
-  <text class="ts sp" x="600" y="392">Durability of the write itself is db.wal.fsync_mode.</text>
+  <text class="ts sp" x="600" y="392">Durability of the write itself is db.oplog.wal.fsync_mode.</text>
 
   <rect class="cfgbx" x="600" y="424" width="300" height="20" rx="4"/>
-  <text class="tk sp" x="608" y="438">db.journal_trim_interval = 1h</text>
+  <text class="tk sp" x="608" y="438">db.leveled.journal.trim_interval = 1h</text>
   <text class="ts mu" x="600" y="462">Nothing in leveled reclaims this column on its own:</text>
   <text class="ts mu" x="600" y="476">compaction is refused under head_only and the trim</text>
   <text class="ts mu" x="600" y="490">counterpart is never self-scheduled. Bondy drives it,</text>

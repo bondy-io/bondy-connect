@@ -4040,7 +4040,7 @@
         "type": "prometheus",
         "uid": "bondy-prometheus"
       },
-      "description": "Instances that have carried a hole past db.frontier.hole_alarm. The alarm fires on the AGE of the condition the gauge above reports, so this lights only for gaps that are not closing on their own.",
+      "description": "Instances that have carried a hole past db.oplog.frontier.hole_alarm. The alarm fires on the AGE of the condition the gauge above reports, so this lights only for gaps that are not closing on their own.",
       "gridPos": {
         "h": 4,
         "w": 4,

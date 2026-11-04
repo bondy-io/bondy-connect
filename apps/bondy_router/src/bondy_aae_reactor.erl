@@ -69,11 +69,11 @@ update) likewise needs no session-close.
 Every 10 seconds the reactor checks the authentication freshness fence
 (`bondy_auth:security_fence/0`). It raises `bondy_auth_fence_closed` when no
 anti-entropy round has refreshed the security tables for longer than
-`db.aae.fence.alarm`, and clears it once the fence admits again. The check
+`db.oplog.aae.fence.alarm`, and clears it once the fence admits again. The check
 reads the fence's per-shard timestamps on every tick and keeps no state of its
 own, apart from its start time: the fence starts closed at every boot, so the
 alarm is not raised until the reactor has been up for the threshold.
-`db.aae.fence.alarm = 0` disables the alarm and clears it.
+`db.oplog.aae.fence.alarm = 0` disables the alarm and clears it.
 
 ## Subscription lifecycle
 
@@ -275,9 +275,9 @@ raise_auth_fence_alarm(Namespaces, AlarmMs) ->
             bondy_auth_fence_closed,
             <<
                 "This node has refused every new authentication for longer "
-                "than db.aae.fence.alarm: no anti-entropy round has refreshed "
-                "its users and grants within that time. See "
-                "db.aae.fence.on_isolation."
+                "than db.oplog.aae.fence.alarm: no anti-entropy round has "
+                "refreshed its users and grants within that time. See "
+                "db.oplog.aae.fence.on_isolation."
             >>
         },
         #{details => #{namespaces => Namespaces, threshold_ms => AlarmMs}}

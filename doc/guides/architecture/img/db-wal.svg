@@ -84,7 +84,7 @@
   <!-- rotation threshold -->
   <line class="cfg" x1="830" y1="54" x2="830" y2="212"/>
   <rect class="cfgbx" x="700" y="30" width="216" height="22" rx="4"/>
-  <text class="tk sp" x="708" y="45">db.wal.max_segment_bytes = 64MB</text>
+  <text class="tk sp" x="708" y="45">db.oplog.wal.max_segment_bytes = 64MB</text>
   <text class="ts mu" x="700" y="264" >rotation happens between appends — a batch never spans a boundary,</text>
   <text class="ts mu" x="700" y="278" >so the threshold is a soft target</text>
 
@@ -100,7 +100,7 @@
   <line x1="40" y1="310" x2="920" y2="310" stroke="var(--ru,#d6d2cc)" stroke-width="1"/>
   <text class="tb ink" x="40" y="344">Durability — when fsync happens</text>
   <rect class="cfgbx" x="330" y="328" width="266" height="22" rx="4"/>
-  <text class="tk sp" x="338" y="343">db.wal.fsync_mode = per_write | batched</text>
+  <text class="tk sp" x="338" y="343">db.oplog.wal.fsync_mode = per_write | batched</text>
 
   <!-- lane 1 : per_write -->
   <text class="t ink" x="40" y="392">per_write</text>
@@ -146,8 +146,8 @@
   <text class="ts sp" x="500" y="498">whichever trigger fires first; head may lead durable by one window</text>
 
   <rect class="cfgbx" x="150" y="528" width="252" height="22" rx="4"/>
-  <text class="tk sp" x="158" y="543">db.wal.batched_fsync_bytes = 1MB</text>
+  <text class="tk sp" x="158" y="543">db.oplog.wal.batched_fsync_bytes = 1MB</text>
   <rect class="cfgbx" x="414" y="528" width="286" height="22" rx="4"/>
-  <text class="tk sp" x="422" y="543">db.wal.batched_fsync_interval = 50ms</text>
+  <text class="tk sp" x="422" y="543">db.oplog.wal.batched_fsync_interval = 50ms</text>
   <text class="ts mu" x="40" y="576">Every option above is a bondy.conf key; values shown are the defaults.</text>
 </svg>

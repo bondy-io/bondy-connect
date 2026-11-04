@@ -21,7 +21,8 @@ system and the user's password capabilities.
 -include("bondy_db_tables.hrl").
 
 %% Default AE-freshness bound for the auth fence; overridable via the
-%% `bondy_router` `auth_max_lag` app env (cuttlefish `db.aae.fence.max_lag`).
+%% `bondy_router` `auth_max_lag` app env (cuttlefish
+%% `db.oplog.aae.fence.max_lag`).
 %% AE rounds complete late on a busy node, so a bound near 1s refuses
 %% authentication under transient CPU pressure with no security staleness in
 %% play. 60s bounds the cross-node staleness window a node authenticates
@@ -552,16 +553,16 @@ authenticate(Method, Signature, DataIn, Ctxt) ->
 
 -doc """
 The authentication freshness fence. On a node whose view of the security
-tables (users and grants) is staler than `db.aae.fence.max_lag` — a lagging
-or partitioned node — every new authentication is refused, whatever the
+tables (users and grants) is staler than `db.oplog.aae.fence.max_lag` — a
+lagging or partitioned node — every new authentication is refused, whatever the
 method: such a node must not authenticate against a view that may predate a
 credential or permission change made elsewhere.
 
-Admits everything unless anti-entropy is enabled (`db.aae`): with it off,
+Admits everything unless anti-entropy is enabled (`db.oplog.aae`): with it off,
 local writes are synchronous and there is no cross-node staleness window. The
 per-shard freshness signal is produced by anti-entropy
-(`bondy_oplog_sync_session`), under the `db.aae.fence.on_isolation` policy;
-the fence only reads it.
+(`bondy_oplog_sync_session`), under the `db.oplog.aae.fence.on_isolation`
+policy; the fence only reads it.
 """.
 -spec security_fence() -> ok | {error, temporarily_unavailable}.
 
@@ -579,7 +580,7 @@ Returns `disabled` when anti-entropy is off, `ok` when every primary shard of
 the user, user-grant and group-grant tables completed an anti-entropy round
 within `MaxLag`, and `{stale, Namespaces}` otherwise. `Namespaces` is empty
 when the catalogue has not provisioned those tables. Authentication is refused
-while this returns `{stale, _}` at `db.aae.fence.max_lag`.
+while this returns `{stale, _}` at `db.oplog.aae.fence.max_lag`.
 """.
 -spec fence_freshness(MaxLag :: non_neg_integer() | infinity) ->
     disabled | ok | {stale, [atom()]}.

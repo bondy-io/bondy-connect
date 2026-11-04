@@ -74,9 +74,8 @@
 %% per constant-factor growth, so its cost is spread over the writes that grew
 %% the set, and the sealed record count between collections is bounded by the
 %% factor times the post-collection count, plus what one compaction tick
-%% appends. Override with
-%% `bondy_oplog.durable_gc_interval_ms`, `bondy_oplog.durable_gc_growth_factor`
-%% and `bondy_oplog.durable_gc_min_records`.
+%% appends. `bondy.conf` sets them as `db.oplog.pack.gc.interval`,
+%% `db.oplog.pack.gc.growth_factor` and `db.oplog.pack.gc.min_records`.
 -define(DURABLE_GC_INTERVAL_MS, 3_600_000).
 -define(DURABLE_GC_GROWTH_FACTOR, 2).
 -define(DURABLE_GC_MIN_RECORDS, 10_000).

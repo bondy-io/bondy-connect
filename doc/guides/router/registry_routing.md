@@ -81,9 +81,9 @@ each on its own schedule:
 
 1. The origin-retirement pass reaps the departed node's origin from its
    summary cells, which leaves each cell with a count of zero. The pass runs on
-   each membership change and every `db.origin_retirement.interval`.
+   each membership change and every `db.oplog.origin_retirement.interval`.
 2. The reclamation sweep discards the emptied cells once they are causally
-   stable, every `db.reclaim.interval`. See
+   stable, every `db.oplog.reclaim.interval`. See
    [Understanding deletion and reclamation](../database/deletion_and_reclamation.md).
 3. The consistency sweep deletes each stub of a non-member node whose cell is
    gone, every `registry.rib.check_interval`. With that interval set to `0`,

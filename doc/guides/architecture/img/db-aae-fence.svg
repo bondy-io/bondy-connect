@@ -53,10 +53,10 @@
   <text class="ts ink" x="806" y="164" text-anchor="middle">root moves again</text>
   <text class="ts mu"  x="806" y="178" text-anchor="middle">back to base</text>
   <rect class="cfgbx" x="200" y="192" width="180" height="20" rx="4"/>
-  <text class="tk sp" x="208" y="206">db.aae.live_sync = on</text>
+  <text class="tk sp" x="208" y="206">db.oplog.aae.live_sync = on</text>
   <rect class="cfgbx" x="392" y="192" width="216" height="20" rx="4"/>
-  <text class="tk sp" x="400" y="206">db.aae.live_sync.max = 5s</text>
-  <text class="ts mu" x="620" y="206">base cadence follows db.aae.interval</text>
+  <text class="tk sp" x="400" y="206">db.oplog.aae.live_sync.max = 5s</text>
+  <text class="ts mu" x="620" y="206">base cadence follows db.oplog.aae.interval</text>
 
   <!-- ===== Panel B: the fence ===== -->
   <line x1="40" y1="240" x2="920" y2="240" stroke="var(--ru,#d9d5cf)" stroke-width="1"/>
@@ -72,7 +72,7 @@
   <text class="ts sp"  x="410" y="322" text-anchor="middle">authentication proceeds</text>
   <text class="ts ink" x="750" y="322" text-anchor="middle">ALL new authentication refused</text>
   <rect class="cfgbx" x="628" y="278" width="228" height="20" rx="4"/>
-  <text class="tk sp" x="636" y="292">db.aae.fence.max_lag = 60s</text>
+  <text class="tk sp" x="636" y="292">db.oplog.aae.fence.max_lag = 60s</text>
   <text class="ts mu" x="200" y="384">temporarily_unavailable — regardless of method. Such a node must not authenticate against a view that may predate a</text>
   <text class="ts mu" x="200" y="398">credential or permission change made elsewhere.</text>
 
@@ -89,8 +89,8 @@
   <line class="cfg" x1="200" y1="428" x2="320" y2="428"/>
   <text class="ts sp" x="260" y="422" text-anchor="middle">default</text>
   <rect class="cfgbx" x="608" y="437" width="290" height="20" rx="4"/>
-  <text class="tk sp" x="616" y="451">db.aae.fence.on_isolation = refuse</text>
+  <text class="tk sp" x="616" y="451">db.oplog.aae.fence.on_isolation = refuse</text>
   <text class="ts mu" x="200" y="486">The freshness signal is produced AE-side and honours this policy; the fence only reads it.</text>
-  <text class="ts mu" x="200" y="504">The whole fence is a no-op when db.aae is off — local writes are then synchronous and no cross-node staleness window exists.</text>
+  <text class="ts mu" x="200" y="504">The whole fence is a no-op when db.oplog.aae is off — local writes are then synchronous and no cross-node staleness window exists.</text>
   <text class="ts mu" x="40" y="528">Every option above is a bondy.conf key; values shown are the defaults.</text>
 </svg>

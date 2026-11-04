@@ -26,7 +26,8 @@ registry included.
 
 The release generates its configuration with `cuttlefish --allow_extra`, which
 ignores a key no schema maps without reporting it. A `bondy.conf` that still
-sets `db.compaction.peer_timeout` boots, and the key has no effect. Remove it.
+sets `db.compaction.peer_timeout` boots, and the key has no effect. From 1.1.0,
+a node refuses to start on it instead. Remove it.
 [How to check your configuration](checking_your_configuration.md) finds keys
 like this one.
 
@@ -44,11 +45,11 @@ cluster.enabled = off
   `no_members`. The node logs
   ["GC stalled"](../reference/log_messages.md#gc-stalled) for each instance,
   at most once a minute per instance and scheduler.
-- With `db.aae = on` (the default), the authentication freshness fence follows
-  `db.aae.fence.on_isolation`, whose default is `refuse`. A node with no peer
+- With `db.oplog.aae = on` (the default), the authentication freshness fence follows
+  `db.oplog.aae.fence.on_isolation`, whose default is `refuse`. A node with no peer
   is then never certified fresh. Authentication is refused with
   `temporarily_unavailable` once the security tables have not been certified
-  within `db.aae.fence.max_lag`.
+  within `db.oplog.aae.fence.max_lag`.
 
 See [Running a single node](clustering.md#running-a-single-node).
 
