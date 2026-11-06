@@ -74,7 +74,7 @@
   0},
  {<<"leveled">>,
   {git,"https://github.com/bondy-io/leveled.git",
-       {ref,"71981285bbd144f56d91c69974d904e6f21466f2"}},
+       {ref,"f604c341cce00956871f775c1d808ed96571a180"}},
   0},
  {<<"lhttpc">>,{pkg,<<"lhttpc">>,<<"1.6.2">>},1},
  {<<"logger_colorful">>,{pkg,<<"logger_colorful">>,<<"0.1.0">>},0},
