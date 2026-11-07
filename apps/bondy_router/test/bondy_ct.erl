@@ -859,7 +859,7 @@ start_cluster(Names, Config) when is_list(Names) ->
     Nodes = start_nodes_or_unwind(Indexed, PrivDir, Cookie, []),
     try
         ok = form_cluster(Nodes),
-        ok = wait_for_members(Nodes, length(Nodes), 30000),
+        ok = wait_for_cluster(Nodes, length(Nodes), 30000),
         Nodes
     catch
         Class:Reason:Stacktrace ->
@@ -1060,7 +1060,7 @@ wait_node_down_loop(Node, Deadline) ->
 rejoin({_, Node, _}, Existing, Timeout) ->
     [{_, First, _} | _] = Existing,
     ok = join(Node, First, []),
-    wait_for_members(Existing, length(Existing), Timeout).
+    wait_for_cluster(Existing, length(Existing), Timeout).
 
 %% -----------------------------------------------------------------------------
 %% @doc Stops a cluster started by {@link start_cluster/2}.
@@ -1575,15 +1575,49 @@ form_cluster(_) ->
     ok.
 
 %% @private
-%% Polls every node's Partisan membership until each sees at least `Expected'
-%% members (membership includes the local node), or fails after `Timeout' ms.
-wait_for_members(Nodes, Expected, Timeout) ->
+%% Waits until every node lists at least `Expected' members AND every node is
+%% fully connected to every other: each configured Partisan channel holds its
+%% full parallelism (`partisan_peer_connections:is_fully_connected/1').
+%% Membership alone is not enough. A node opens its channel connections to a
+%% new member after it learns of it, so a call made as soon as membership
+%% converges can find no connection on its channel and fail with `nodedown'.
+%% Observed in `bondy_cluster_standalone_SUITE:
+%% nodes_that_truncated_alone_refuse_each_other': right after the rejoin, one
+%% node held 1 of its 8 connections to the other, none on `bondy_aae'.
+wait_for_cluster(Nodes, Expected, Timeout) ->
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
-    wait_for_members_loop(Nodes, Expected, Deadline).
+    wait_for_cluster_loop(Nodes, Expected, Deadline).
 
 %% @private
-wait_for_members_loop(Nodes, Expected, Deadline) ->
-    Converged = lists:all(
+wait_for_cluster_loop(Nodes, Expected, Deadline) ->
+    case
+        members_converged(Nodes, Expected) andalso not_connected(Nodes) =:= []
+    of
+        true ->
+            ok;
+        false ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                true ->
+                    Members = [
+                        {Node,
+                            rpc:call(Node, partisan_peer_service, members, [])}
+                     || {_, Node, _} <- Nodes
+                    ],
+                    error(
+                        {cluster_formation_timeout, #{
+                            members => Members,
+                            not_fully_connected => not_connected(Nodes)
+                        }}
+                    );
+                false ->
+                    timer:sleep(250),
+                    wait_for_cluster_loop(Nodes, Expected, Deadline)
+            end
+    end.
+
+%% @private
+members_converged(Nodes, Expected) ->
+    lists:all(
         fun({_, Node, _}) ->
             case rpc:call(Node, partisan_peer_service, members, []) of
                 {ok, Members} -> length(Members) >= Expected;
@@ -1591,26 +1625,20 @@ wait_for_members_loop(Nodes, Expected, Deadline) ->
             end
         end,
         Nodes
-    ),
-    case Converged of
-        true ->
-            ok;
-        false ->
-            case erlang:monotonic_time(millisecond) > Deadline of
-                true ->
-                    Status = [
-                        {Node,
-                            rpc:call(
-                                Node, partisan_peer_service, members, []
-                            )}
-                     || {_, Node, _} <- Nodes
-                    ],
-                    error({cluster_membership_timeout, Status});
-                false ->
-                    timer:sleep(250),
-                    wait_for_members_loop(Nodes, Expected, Deadline)
-            end
-    end.
+    ).
+
+%% @private
+%% The ordered pairs `{From, To}' where `From' is not yet fully connected to
+%% `To'.
+not_connected(Nodes) ->
+    [
+        {From, To}
+     || {_, From, _} <- Nodes,
+        {_, To, _} <- Nodes,
+        From =/= To,
+        rpc:call(From, partisan_peer_connections, is_fully_connected, [To]) =/=
+            true
+    ].
 
 %% =============================================================================
 %% AAE FRESHNESS-FENCE TEST HELPERS

@@ -186,9 +186,15 @@ nodes_that_truncated_alone_refuse_each_other(Config) ->
         {KeptB, _} = write_and_remove(B, ~"cnegb", 10),
         ?assertMatch({0, [_ | _]}, call(A, do_truncate_main, [])),
         ?assertMatch({0, [_ | _]}, call(B, do_truncate_main, [])),
-        Ab = restart_clustered(A, 1, Config),
-        Bb = restart_clustered(B, 2, Config),
+        %% Periodic sync off: the scheduler would otherwise bootstrap an
+        %% instance that only one node truncated from that node, after which
+        %% the other node is no longer behind its truncation and the
+        %% bootstrap below succeeds. The only sessions are the test's own.
+        NoSync = [{[bondy_oplog, sync_interval_ms], 0}],
+        Ab = restart_clustered(A, 1, NoSync, Config),
+        Bb = restart_clustered(B, 2, NoSync, Config),
         ok = bondy_ct:rejoin(Bb, [Ab, Bb], 30000),
+        ok = await_serving([Ab, Bb], 240),
         lists:foreach(
             fun({Node, Peer}) ->
                 Results = call(
@@ -249,8 +255,11 @@ up(Nodes) ->
     put(?MODULE, Nodes),
     Nodes.
 
-restart_clustered({Name, _, _} = S, Idx, Config) ->
-    New = bondy_ct:restart_node(S, Idx, [], Config, graceful),
+restart_clustered(S, Idx, Config) ->
+    restart_clustered(S, Idx, [], Config).
+
+restart_clustered({Name, _, _} = S, Idx, ExtraEnv, Config) ->
+    New = bondy_ct:restart_node(S, Idx, ExtraEnv, Config, graceful),
     ok = push_module(New),
     put(?MODULE, lists:keyreplace(Name, 1, get(?MODULE), New)),
     New.
@@ -276,6 +285,29 @@ write_and_remove(S, Prefix, Count) ->
 
 %% Polls until every node reads every kept value and no removed key, driving
 %% the sync scheduler between attempts.
+%% A restarted instance refuses to serve a peer (`refold_owed') until its
+%% replay has presented every event its frontier does not claim. A bootstrap
+%% against it is then refused for that reason, whatever else holds, so a test
+%% of another refusal waits until every `main' instance serves.
+await_serving(Nodes, 0) ->
+    error({refold_still_owed, owing(Nodes)});
+await_serving(Nodes, Tries) ->
+    case owing(Nodes) of
+        [] ->
+            ok;
+        _ ->
+            timer:sleep(250),
+            await_serving(Nodes, Tries - 1)
+    end.
+
+owing(Nodes) ->
+    [
+        {node_of(N), I}
+     || N <- Nodes,
+        I <- call(N, main_instances, []),
+        erpc:call(node_of(N), bondy_oplog_instance, serving, [I]) =/= ok
+    ].
+
 await_reads(Nodes, Kept, Removed) ->
     await_reads(Nodes, Kept, Removed, 180).
 
