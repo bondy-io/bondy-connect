@@ -1,6 +1,6 @@
 ![Bondy Connect logo](https://github.com/bondy-io/bondy-connect/blob/develop/doc/assets/bondy_bg.png?raw=true)
 
-![Version](https://img.shields.io/badge/version-1.1.0-blue?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-1.2.0-blue?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=for-the-badge)<br>
 ![Docker Pulls](https://img.shields.io/docker/pulls/leapsight/bondy-connect?style=for-the-badge)
 ![Docker Build (main)](https://img.shields.io/github/actions/workflow/status/bondy-io/bondy-connect/docker-debian.yaml?&branch=main&label=docker-main&style=for-the-badge)
@@ -152,7 +152,7 @@ docker run \
 -p 18082:18082 \
 -v "$PWD/examples/custom_config/etc:/bondy/etc" \
 -v "/tmp/data:/bondy/data" \
-leapsight/bondy-connect:1.1.0
+leapsight/bondy-connect:1.2.0
 ```
 
 The example configuration runs a single node (`cluster.enabled = off`) with the
@@ -192,13 +192,13 @@ To build a production release tarball, run:
 just release-tar
 ```
 
-The recipe writes `_build/prod/rel/bondy-connect/bondy-connect-1.1.0.tar.gz`
+The recipe writes `_build/prod/rel/bondy-connect/bondy-connect-1.2.0.tar.gz`
 and unpacks a copy into `_build/tar`. To install Bondy Connect somewhere else,
 unpack the tarball there, for example into `~/tmp/bondy`:
 
 ```shell
 mkdir -p ~/tmp/bondy
-tar -zxvf _build/prod/rel/bondy-connect/bondy-connect-1.1.0.tar.gz -C ~/tmp/bondy
+tar -zxvf _build/prod/rel/bondy-connect/bondy-connect-1.2.0.tar.gz -C ~/tmp/bondy
 ```
 
 #### Running

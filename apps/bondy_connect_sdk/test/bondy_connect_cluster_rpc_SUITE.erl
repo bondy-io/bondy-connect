@@ -21,6 +21,7 @@ order without settling the call before the final result.
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("bondy_wamp/include/bondy_wamp.hrl").
 -include("bondy_connect.hrl").
 
 -compile([nowarn_export_all, export_all]).
@@ -30,6 +31,8 @@ order without settling the call before the final result.
 -define(NODE1_WAMP_PORT, 18201).
 -define(NODE2_WAMP_PORT, 18202).
 -define(PROC, <<"com.example.cluster.progressive">>).
+%% The LENGTH a small-limit client announces: 2^11 octets.
+-define(SMALL_LIMIT, 2048).
 
 all() ->
     [
@@ -42,7 +45,12 @@ all() ->
         progressive_input_remote_cancel_interrupts_callee,
         progressive_input_remote_caller_death_interrupts_callee,
         progressive_input_remote_callee_death_errors_caller,
-        remote_kill_without_callee_support_skips
+        remote_kill_without_callee_support_skips,
+        oversized_invocation_across_cluster,
+        oversized_result_across_cluster,
+        oversized_progressive_result_across_cluster_ends_the_call,
+        oversized_event_across_cluster,
+        oversized_input_chunk_across_cluster_ends_the_call
     ].
 
 suite() ->
@@ -591,9 +599,268 @@ progressive_input_remote_callee_death_errors_caller(Config) ->
 
     ok = bondy_connect_client:disconnect(Caller).
 
+-doc """
+An INVOCATION larger than the LENGTH of a callee on node2 is not sent. The
+callee's session on node2 answers it with ERROR
+`wamp.error.payload_size_exceeded`, which crosses the relay back to the caller
+on node1. The handler never runs, and the same callee then serves a small call.
+""".
+oversized_invocation_across_cluster(Config) ->
+    [{_, Node1, _}, {_, _, _}] = ?config(nodes, Config),
+    Proc = <<"com.example.cluster.big_invocation">>,
+    Echo = <<Proc/binary, ".echo">>,
+    TestPid = self(),
+    Callee = connect(?NODE2_WAMP_PORT, #{max_message_length => ?SMALL_LIMIT}),
+    {ok, _} = bondy_connect_client:register(Callee, Proc, fun(_, _, _) ->
+        TestPid ! invoked,
+        {ok, #{args => []}}
+    end),
+    {ok, _} = bondy_connect_client:register(Callee, Echo, fun(Args, _, _) ->
+        {ok, #{args => Args}}
+    end),
+    ok = wait_registered(Node1, Proc),
+    ok = wait_registered(Node1, Echo),
+    Caller = connect(?NODE1_WAMP_PORT),
+
+    ?assertMatch(
+        {error, #{kind := wamp, uri := ?WAMP_PAYLOAD_SIZE_EXCEEDED}},
+        bondy_connect_client:call(Caller, Proc, [oversized()])
+    ),
+    receive
+        invoked -> ct:fail(oversized_invocation_delivered)
+    after 0 -> ok
+    end,
+    ?assertMatch(
+        {ok, #{args := [<<"hi">>]}},
+        bondy_connect_client:call(Caller, Echo, [<<"hi">>])
+    ),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
+-doc """
+A final RESULT relayed from a callee on node2 that is larger than the LENGTH of
+the caller on node1 reaches the caller as ERROR
+`wamp.error.payload_size_exceeded`, and the caller's connection stays usable.
+""".
+oversized_result_across_cluster(Config) ->
+    [{_, Node1, _}, {_, _, _}] = ?config(nodes, Config),
+    Proc = <<"com.example.cluster.big_result">>,
+    Echo = <<Proc/binary, ".echo">>,
+    Callee = connect(?NODE2_WAMP_PORT),
+    {ok, _} = bondy_connect_client:register(Callee, Proc, fun(_, _, _) ->
+        {ok, #{args => [oversized()]}}
+    end),
+    {ok, _} = bondy_connect_client:register(Callee, Echo, fun(Args, _, _) ->
+        {ok, #{args => Args}}
+    end),
+    ok = wait_registered(Node1, Proc),
+    ok = wait_registered(Node1, Echo),
+    Caller = connect(?NODE1_WAMP_PORT, #{max_message_length => ?SMALL_LIMIT}),
+
+    ?assertMatch(
+        {error, #{kind := wamp, uri := ?WAMP_PAYLOAD_SIZE_EXCEEDED}},
+        bondy_connect_client:call(Caller, Proc, [])
+    ),
+    ?assertMatch(
+        {ok, #{args := [<<"hi">>]}},
+        bondy_connect_client:call(Caller, Echo, [<<"hi">>])
+    ),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
+-doc """
+A progressive RESULT relayed from node2 that is larger than the LENGTH of the
+caller on node1 ends the call on node1, which relays the CANCEL to node2: the
+caller gets the chunk before it, then ERROR `wamp.error.payload_size_exceeded`
+and nothing after it, and the callee's handler on node2 is interrupted while
+it waits.
+""".
+oversized_progressive_result_across_cluster_ends_the_call(Config) ->
+    [{_, Node1, _}, {_, _, _}] = ?config(nodes, Config),
+    Proc = <<"com.example.cluster.big_progressive">>,
+    TestPid = self(),
+    Callee = connect(?NODE2_WAMP_PORT),
+    {ok, _} = bondy_connect_client:register(Callee, Proc, fun(_, _, Details) ->
+        Progress = maps:get(progress, Details),
+        TestPid ! {worker, self()},
+        ok = Progress([<<"first">>], #{}),
+        ok = Progress([oversized()], #{}),
+        timer:sleep(2000),
+        TestPid ! callee_continued,
+        {ok, #{args => [<<"final">>]}}
+    end),
+    ok = wait_registered(Node1, Proc),
+    Caller = connect(?NODE1_WAMP_PORT, #{max_message_length => ?SMALL_LIMIT}),
+
+    {ok, Token} = bondy_connect_client:call_async(Caller, Proc, [], #{}, #{
+        receive_progress => true
+    }),
+    Worker =
+        receive
+            {worker, W} -> W
+        after 5000 -> ct:fail(no_worker)
+        end,
+    MRef = monitor(process, Worker),
+    ?assertMatch({progress, #{args := [<<"first">>]}}, next_reply(Token)),
+    ?assertMatch(
+        {error, #{kind := wamp, uri := ?WAMP_PAYLOAD_SIZE_EXCEEDED}},
+        next_reply(Token)
+    ),
+    receive
+        {'DOWN', MRef, process, Worker, _} -> ok;
+        callee_continued -> ct:fail(call_not_ended)
+    after 5000 ->
+        ct:fail(worker_not_interrupted)
+    end,
+    receive
+        {bondy_connect_client, Token, Extra} -> ct:fail({extra_reply, Extra})
+    after 1000 -> ok
+    end,
+    ?assertEqual(established, bondy_connect_client:status(Caller)),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
+-doc """
+An EVENT published on node2 that is larger than the LENGTH of a subscriber on
+node1 is not sent to it, while a subscriber with the default limit on node1
+gets it. Both events come from one publisher, so the small-limit subscriber
+getting only the second means the first was dropped rather than delayed.
+""".
+oversized_event_across_cluster(Config) ->
+    [{_, _, _}, {_, Node2, _}] = ?config(nodes, Config),
+    Topic = <<"com.example.cluster.big_event">>,
+    TestPid = self(),
+    Tagged = fun(Tag) ->
+        fun(Args, _, _) ->
+            TestPid ! {event, Tag, Args},
+            ok
+        end
+    end,
+    Small = connect(?NODE1_WAMP_PORT, #{max_message_length => ?SMALL_LIMIT}),
+    Large = connect(?NODE1_WAMP_PORT),
+    {ok, _} = bondy_connect_client:subscribe(Small, Topic, Tagged(small)),
+    {ok, _} = bondy_connect_client:subscribe(Large, Topic, Tagged(large)),
+    ok = wait_until(
+        fun() ->
+            erpc:call(Node2, bondy_registry, has_matches, [
+                subscription, ?REALM, Topic
+            ])
+        end,
+        30000,
+        subscriptions_not_visible_on_node2
+    ),
+    Pub = connect(?NODE2_WAMP_PORT),
+
+    ok = bondy_connect_client:publish(Pub, Topic, [oversized()]),
+    ok = bondy_connect_client:publish(Pub, Topic, [<<"small">>]),
+
+    ?assertEqual([oversized()], recv_event(large)),
+    ?assertEqual([<<"small">>], recv_event(large)),
+    ?assertEqual([<<"small">>], recv_event(small)),
+    ?assertEqual(established, bondy_connect_client:status(Small)),
+
+    ok = bondy_connect_client:disconnect(Small),
+    ok = bondy_connect_client:disconnect(Large),
+    ok = bondy_connect_client:disconnect(Pub).
+
+-doc """
+An input chunk of a progressive call from the caller on node1 that is larger
+than the LENGTH of the callee on node2 ends the call: the callee's session on
+node2 answers with ERROR `wamp.error.payload_size_exceeded`, which crosses the
+relay to the caller, and interrupts the callee, whose handler sees no chunk
+after the oversized one.
+""".
+oversized_input_chunk_across_cluster_ends_the_call(Config) ->
+    [{_, Node1, _}, {_, _, _}] = ?config(nodes, Config),
+    Proc = <<"com.example.cluster.big_input_chunk">>,
+    Callee = connect(?NODE2_WAMP_PORT, #{max_message_length => ?SMALL_LIMIT}),
+    TestPid = self(),
+    {ok, _} = bondy_connect_client:register(Callee, Proc, fun(
+        [First],
+        _,
+        #{
+            input := Input
+        }
+    ) ->
+        TestPid ! {worker, self()},
+        TestPid ! {chunk, First},
+        Pull = fun Pull() ->
+            case Input() of
+                {more, [N], _} ->
+                    TestPid ! {chunk, N},
+                    Pull();
+                {last, [N], _} ->
+                    TestPid ! {chunk, N},
+                    {ok, #{args => []}}
+            end
+        end,
+        Pull()
+    end),
+    ok = wait_registered(Node1, Proc),
+    Caller = connect(?NODE1_WAMP_PORT),
+    {ok, Token} = bondy_connect_client:call_stream(Caller, Proc, [1], #{}, #{}),
+    Worker =
+        receive
+            {worker, W} -> W
+        after 5000 -> ct:fail(handler_not_running)
+        end,
+    MRef = monitor(process, Worker),
+    receive
+        {chunk, 1} -> ok
+    after 5000 -> ct:fail(no_first_chunk)
+    end,
+    ok = bondy_connect_client:send_input(Caller, Token, [oversized()], #{}),
+    _ = bondy_connect_client:send_input(Caller, Token, [3], #{}),
+    _ = bondy_connect_client:finish_input(Caller, Token, [4], #{}),
+
+    ?assertMatch(
+        {error, #{kind := wamp, uri := ?WAMP_PAYLOAD_SIZE_EXCEEDED}},
+        next_reply(Token)
+    ),
+    receive
+        {'DOWN', MRef, process, Worker, _} -> ok;
+        {chunk, N} -> ct:fail({chunk_after_oversized, N})
+    after 5000 ->
+        ct:fail(callee_not_interrupted)
+    end,
+    receive
+        {chunk, Late} -> ct:fail({chunk_after_oversized, Late});
+        {bondy_connect_client, Token, Extra} -> ct:fail({extra_reply, Extra})
+    after 1000 -> ok
+    end,
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
 %% =============================================================================
 %% HELPERS
 %% =============================================================================
+
+%% @private Larger than `?SMALL_LIMIT' once encoded, in any serializer.
+oversized() ->
+    binary:copy(<<"x">>, 2 * ?SMALL_LIMIT).
+
+%% @private A registration made on node2 is routable from `Node1'.
+wait_registered(Node1, Proc) ->
+    wait_until(
+        fun() ->
+            erpc:call(Node1, bondy_registry_rib, match_stubs, [?REALM, Proc]) =/=
+                []
+        end,
+        30000,
+        {registration_not_visible_on_node1, Proc}
+    ).
+
+%% @private
+recv_event(Tag) ->
+    receive
+        {event, Tag, Args} -> Args
+    after 10000 ->
+        ct:fail({no_event, Tag})
+    end.
 
 %% @private Drain progress replies until the terminal one arrives.
 drain_progress(Token, Timeout) ->
@@ -611,11 +878,15 @@ drain_progress(Token, Timeout) ->
 %% asynchronously across the cluster, so a first join can race it and be
 %% rejected even after the realm object is visible.
 connect(Port) ->
-    connect(Port, erlang:monotonic_time(millisecond) + 15000).
+    connect(Port, #{}).
 
 %% @private
-connect(Port, Deadline) ->
-    Spec = #{
+connect(Port, Extra) ->
+    connect(Port, Extra, erlang:monotonic_time(millisecond) + 15000).
+
+%% @private
+connect(Port, Extra, Deadline) ->
+    Spec = Extra#{
         transport => tcp,
         endpoint => {?HOST, Port},
         realm => ?REALM,
@@ -631,7 +902,7 @@ connect(Port, Deadline) ->
                     ct:fail({connect_failed, Port, Reason});
                 false ->
                     timer:sleep(200),
-                    connect(Port, Deadline)
+                    connect(Port, Extra, Deadline)
             end
     end.
 

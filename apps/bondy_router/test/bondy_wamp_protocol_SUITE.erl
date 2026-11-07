@@ -71,16 +71,17 @@ format_status(_Config) ->
     lists:foreach(
         fun(
             {SubProtocol, AuthMethod, AuthClaims, AuthContext, AuthTime, Name,
-                Context, MsgLimiter, Listener}
+                Context, MsgLimiter, Listener, MaxMessageSize, Abandoned}
         ) ->
             State =
                 {wamp_state, SubProtocol, AuthMethod, AuthClaims, AuthContext,
-                    AuthTime, Name, Context, MsgLimiter, Listener},
+                    AuthTime, Name, Context, MsgLimiter, Listener,
+                    MaxMessageSize, Abandoned},
             NewState = bondy_wamp_protocol:format_status(State),
             ?assertEqual(State, NewState)
         end,
         [
-            {SP, AM, ACl, AC, AT, SN, Co, ML, LS}
+            {SP, AM, ACl, AC, AT, SN, Co, ML, LS, MS, AB}
          || SP <- [undefined, {raw, binary, json}],
             AM <- [undefined, cryptosign],
             ACl <- [undefined, #{}],
@@ -89,7 +90,9 @@ format_status(_Config) ->
             SN <- [closed, establishing],
             Co <- [undefined, #{}],
             ML <- [undefined],
-            LS <- [undefined, admin_api]
+            LS <- [undefined, admin_api],
+            MS <- [infinity, 2048],
+            AB <- [#{}, #{{call, 1} => true}]
         ]
     ).
 
@@ -424,7 +427,7 @@ terminate(_Config) ->
     %% undefined context
     StateNoContext =
         {wamp_state, SubProtocol, cryptosign, undefined, #{}, 123, failed,
-            undefined, undefined, undefined},
+            undefined, undefined, undefined, infinity, #{}},
     ?assertEqual(undefined, bondy_wamp_protocol:context(StateNoContext)),
     ?assertEqual(ok, bondy_wamp_protocol:terminate(StateNoContext)),
 
@@ -444,7 +447,7 @@ handle_inbound(_Config) ->
     SubProtocolInvalid = {ws, text, EncodingUnsupported},
     StateInvalidSP =
         {wamp_state, SubProtocolInvalid, wampcra, undefined, #{}, 123,
-            establishing, undefined, undefined, undefined},
+            establishing, undefined, undefined, undefined, infinity, #{}},
     Error = {unsupported_encoding, EncodingUnsupported},
     ?assertError(
         Error, bondy_wamp_protocol:handle_inbound(<<>>, StateInvalidSP)

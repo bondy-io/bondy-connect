@@ -38,7 +38,19 @@ outbound WAMP messages.
     %% handed in through the init opts by the connection handlers — the
     %% listener-scope dimension of the rate-limit chain. `undefined` for
     %% transports that do not thread it (the HTTP transport session).
-    listener :: atom() | binary() | undefined
+    listener :: atom() | binary() | undefined,
+    %% The largest encoded message the peer accepts, in octets: the LENGTH a
+    %% RawSocket client announces in its handshake. `infinity` for carriers
+    %% where the peer announces no limit (WebSocket, HTTP).
+    max_message_size = infinity :: pos_integer() | infinity,
+    %% Calls and invocations this session ended because a chunk of a stream
+    %% exceeded `max_message_size': a progressive RESULT to the caller, or an
+    %% INVOCATION to the callee. Any later message of that stream is dropped.
+    %% They are kept for the session: the dealer looks a call up before it
+    %% sends, so a chunk can arrive at any time after the call ended, and no
+    %% message marks the last one. Call and invocation ids are separate
+    %% number spaces, hence the tag.
+    abandoned = #{} :: #{{call | invocation, id()} => true}
 }).
 
 -type state() :: #wamp_state{} | undefined.
@@ -267,24 +279,109 @@ handle_inbound(Data, St) ->
     end.
 
 -spec handle_outbound(bondy_wamp_message:t(), state()) ->
-    {ok, iodata(), state()}
+    {ok, state()}
+    | {ok, iodata(), state()}
     | {error, any(), state()}
     | {stop, state()}
     | {stop, iodata(), state()}
     | {stop, iodata(), state(), After :: non_neg_integer()}.
 
-handle_outbound(#result{} = M, St0) ->
+handle_outbound(#result{request_id = CallId}, St) when
+    is_map_key({call, CallId}, St#wamp_state.abandoned)
+->
+    {ok, St};
+handle_outbound(#error{request_type = ?CALL, request_id = CallId}, St) when
+    is_map_key({call, CallId}, St#wamp_state.abandoned)
+->
+    {ok, St};
+handle_outbound(
+    #result{request_id = CallId, details = #{progress := true}} = M, St0
+) ->
     Ctxt0 = St0#wamp_state.context,
     St1 = update_context(bondy_context:reset(Ctxt0), St0),
     Bin = bondy_wamp_encoding:encode(M, encoding(St1)),
-    ok = notify(M, erlang:iolist_size(Bin), St1),
-    {ok, Bin, St1};
-handle_outbound(#error{request_type = ?CALL} = M, St0) ->
+    Size = erlang:iolist_size(Bin),
+
+    case fits(Size, St1) of
+        true ->
+            ok = notify(M, Size, St1),
+            {ok, Bin, St1};
+        false ->
+            %% The dealer ends the call, so no new chunk is sent, and
+            %% `abandoned' drops the ones already on their way. The
+            %% caller gets only the chunks before this one, then the ERROR.
+            ok = log_payload_size_exceeded(M, Size, St1),
+            ok = bondy_dealer:abandon_call(CallId, St1#wamp_state.context),
+            Error = payload_size_exceeded_error(?CALL, CallId),
+            ErrorBin = bondy_wamp_encoding:encode(Error, encoding(St1)),
+            ok = notify(Error, erlang:iolist_size(ErrorBin), St1),
+            St2 = abandon({call, CallId}, St1),
+            {ok, ErrorBin, St2}
+    end;
+handle_outbound(#result{request_id = CallId} = M, St0) ->
     Ctxt0 = St0#wamp_state.context,
     St1 = update_context(bondy_context:reset(Ctxt0), St0),
-    Bin = bondy_wamp_encoding:encode(M, encoding(St1)),
-    ok = notify(M, erlang:iolist_size(Bin), St1),
-    {ok, Bin, St1};
+    encode_call_reply(M, CallId, St1);
+handle_outbound(#error{request_type = ?CALL, request_id = CallId} = M, St0) ->
+    Ctxt0 = St0#wamp_state.context,
+    St1 = update_context(bondy_context:reset(Ctxt0), St0),
+    encode_call_reply(M, CallId, St1);
+handle_outbound(#event{} = M, St) ->
+    Bin = bondy_wamp_encoding:encode(M, encoding(St)),
+    Size = erlang:iolist_size(Bin),
+
+    case fits(Size, St) of
+        true ->
+            ok = notify(M, Size, St),
+            {ok, Bin, St};
+        false ->
+            %% WAMP RawSocket: a Router MUST NOT send a message larger than
+            %% the Client's LENGTH. The event is dropped for this subscriber
+            %% only.
+            ok = log_payload_size_exceeded(M, Size, St),
+            ok = bondy_telemetry:wamp_dropped(payload_size_exceeded, event),
+            {ok, St}
+    end;
+handle_outbound(#invocation{request_id = InvocationId}, St) when
+    is_map_key({invocation, InvocationId}, St#wamp_state.abandoned)
+->
+    {ok, St};
+handle_outbound(#invocation{request_id = InvocationId} = M, St) ->
+    Bin = bondy_wamp_encoding:encode(M, encoding(St)),
+    Size = erlang:iolist_size(Bin),
+
+    case fits(Size, St) of
+        true ->
+            ok = notify(M, Size, St),
+            {ok, Bin, St};
+        false ->
+            %% The callee never sees this INVOCATION. Its session answers it
+            %% with an ERROR, which the dealer returns to the caller the way
+            %% it returns any callee ERROR, and drops the later chunks of a
+            %% progressive call. A callee that got earlier chunks is still
+            %% running the invocation, so it is interrupted; one that got
+            %% none ignores the INTERRUPT, as it does any INTERRUPT for an
+            %% invocation it has finished.
+            ok = log_payload_size_exceeded(M, Size, St),
+            Error = payload_size_exceeded_error(?INVOCATION, InvocationId),
+            {ok, Ctxt} = bondy_router:route(Error, St#wamp_state.context),
+            St1 = abandon({invocation, InvocationId}, update_context(Ctxt, St)),
+            Roles = bondy_context:roles(Ctxt),
+
+            case
+                key_value:get([callee, features, call_canceling], Roles, false)
+            of
+                true ->
+                    Interrupt = bondy_wamp_message:interrupt(
+                        InvocationId, #{mode => <<"killnowait">>}
+                    ),
+                    Bin1 = bondy_wamp_encoding:encode(Interrupt, encoding(St1)),
+                    ok = notify(Interrupt, erlang:iolist_size(Bin1), St1),
+                    {ok, Bin1, St1};
+                false ->
+                    {ok, St1}
+            end
+    end;
 handle_outbound(#goodbye{} = M, St0) ->
     %% Bondy is shutting_down this session, we will stop when we
     %% get the client's goodbye response
@@ -1270,7 +1367,8 @@ do_init({_, _, _} = Subprotocol, Peer, Opts) ->
         state_name = closed,
         subprotocol = Subprotocol,
         context = Ctxt,
-        listener = maps:get(listener, Opts, undefined)
+        listener = maps:get(listener, Opts, undefined),
+        max_message_size = maps:get(max_message_size, Opts, infinity)
     },
 
     ok = update_process_metadata(State),
@@ -1299,3 +1397,57 @@ update_process_metadata(#wamp_state{} = State) ->
 
 notify(M, WireSize, State) ->
     bondy_telemetry:wamp_message(M, WireSize, State#wamp_state.context).
+
+%% @private
+abandon(Key, #wamp_state{abandoned = Abandoned} = St) ->
+    St#wamp_state{abandoned = Abandoned#{Key => true}}.
+
+%% @private
+fits(_, #wamp_state{max_message_size = infinity}) ->
+    true;
+fits(Size, #wamp_state{max_message_size = Max}) ->
+    Size =< Max.
+
+%% @private
+%% Encodes the final RESULT or ERROR of a CALL. When it exceeds the peer's
+%% maximum message size the caller gets ERROR `wamp.error.payload_size_exceeded`
+%% for the same request instead, so the call is answered rather than left to
+%% time out.
+encode_call_reply(M, CallId, St) ->
+    Bin = bondy_wamp_encoding:encode(M, encoding(St)),
+    Size = erlang:iolist_size(Bin),
+
+    case fits(Size, St) of
+        true ->
+            ok = notify(M, Size, St),
+            {ok, Bin, St};
+        false ->
+            ok = log_payload_size_exceeded(M, Size, St),
+            Error = payload_size_exceeded_error(?CALL, CallId),
+            ErrorBin = bondy_wamp_encoding:encode(Error, encoding(St)),
+            ok = notify(Error, erlang:iolist_size(ErrorBin), St),
+            {ok, ErrorBin, St}
+    end.
+
+%% @private
+payload_size_exceeded_error(RequestType, RequestId) ->
+    bondy_wamp_error:to_wamp(
+        bondy_connect_error:new(payload_size_exceeded, #{
+            message => ~"payload_size_exceeded",
+            description =>
+                ~"The message exceeds the peer's maximum message size."
+        }),
+        RequestType,
+        RequestId,
+        #{}
+    ).
+
+%% @private
+log_payload_size_exceeded(M, Size, St) ->
+    ?LOG_DEBUG(#{
+        description => "Message exceeds the peer's maximum message size",
+        reason => payload_size_exceeded,
+        message_type => element(1, M),
+        message_size => Size,
+        max_message_size => St#wamp_state.max_message_size
+    }).

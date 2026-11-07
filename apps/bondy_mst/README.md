@@ -392,7 +392,7 @@ rebar3 `git_subdir` dependency:
 {deps, [
     {bondy_mst,
         {git_subdir, "https://github.com/bondy-io/bondy-connect.git",
-            {tag, "1.1.0"}, "apps/bondy_mst"}}
+            {tag, "1.2.0"}, "apps/bondy_mst"}}
 ]}.
 ```
 

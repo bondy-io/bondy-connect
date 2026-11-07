@@ -273,6 +273,74 @@ release-tar:
     mkdir -p _build/tar
     tar -zxvf _build/{{profile}}/rel/*/*.tar.gz -C _build/tar
 
+# The old version is read from the release in rebar.config. The bump edits the
+# release, the vsn of the apps that carry the release version, the
+# `git_subdir` refs to bondy-connect (external consumers resolve them once the
+# tag is pushed, so set them before tagging), the README, and renames the
+# CHANGELOG's `## Unreleased` section. Apps with their own version (bondy_wamp,
+# bondy_mst, ...), other dependencies' tags and mentions of past versions in
+# prose are left alone. Every pattern must match before any file is written: a
+# file that no longer names the version stops the bump with nothing changed. It
+# commits nothing.
+
+# Bump the release version in every file that names it: `just bump-version 1.2.0`.
+bump-version new:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    new='{{new}}'
+    [[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+        { echo "aborting: '$new' is not a version X.Y.Z" >&2; exit 1; }
+    old=$(perl -ne "print \$1 if /\{release, \{'bondy-connect', \"([0-9.]+)\"/" rebar.config)
+    [[ -n "$old" ]] ||
+        { echo "aborting: no bondy-connect release version in rebar.config" >&2; exit 1; }
+    [[ "$new" != "$old" ]] ||
+        { echo "aborting: the version is already $old" >&2; exit 1; }
+    git_ref='bondy-connect\.git",\s*\{tag, "'
+    # FILE|PREFIX|SUFFIX: the version between the PREFIX and SUFFIX regexes.
+    edits=(
+        "rebar.config|\{release, \{'bondy-connect', \"|\""
+        "apps/bondy_router/src/bondy_router.app.src|\{vsn, \"|\""
+        "apps/bondy_cluster/src/bondy_cluster.app.src|\{vsn, \"|\""
+        "apps/bondy_broker_bridge/src/bondy_broker_bridge.app.src|\{vsn, \"|\""
+        "apps/bondy_connect_lib/src/bondy_connect_lib.app.src|\{vsn, \"|\""
+        "apps/bondy_metrics/src/bondy_metrics.app.src|\{vsn, \"|\""
+        "apps/bondy_connect_sdk/rebar.config|$git_ref|\""
+        "apps/bondy_db/rebar.config|$git_ref|\""
+        "apps/bondy_oplog/rebar.config|$git_ref|\""
+        "apps/bondy_wamp/rebar.config|$git_ref|\""
+        "apps/bondy_connect_sdk/doc_extras/tutorial.md|$git_ref|\""
+        "apps/bondy_mst/README.md|$git_ref|\""
+        "jepsen/bondy_mst_jepsen/rebar.config|$git_ref|\""
+        "README.md|version-|-blue"
+        "README.md|bondy-connect:|(?![0-9.])"
+        "README.md|bondy-connect-|\.tar\.gz"
+        "CHANGELOG.md||"
+    )
+    count() {
+        P="$2" S="$3" O="$old" perl -0ne \
+            '$c = () = /($ENV{P})\Q$ENV{O}\E(?=$ENV{S})/mg; print $c' "$1"
+    }
+    for e in "${edits[@]}"; do
+        IFS='|' read -r f p s <<< "$e"
+        if [[ "$f" == CHANGELOG.md ]]; then
+            grep -q '^## Unreleased$' "$f" ||
+                { echo "aborting: $f has no '## Unreleased' section" >&2; exit 1; }
+        elif [[ $(count "$f" "$p" "$s") -eq 0 ]]; then
+            echo "aborting: $f does not name $old where expected ($p...$s)" >&2
+            exit 1
+        fi
+    done
+    for e in "${edits[@]}"; do
+        IFS='|' read -r f p s <<< "$e"
+        if [[ "$f" == CHANGELOG.md ]]; then
+            N="$new" perl -pi -e 's/^## Unreleased$/## $ENV{N}/' "$f"
+        else
+            P="$p" S="$s" O="$old" N="$new" perl -0pi -e \
+                's/($ENV{P})\Q$ENV{O}\E(?=$ENV{S})/$1$ENV{N}/mg' "$f"
+        fi
+    done
+    echo "Bumped $old -> $new"
+
 # The dev overlay in rebar.config does not install the example configs, so
 # they are copied here. `security_config.json` is optional: only the .template
 # is checked in (the real file was removed from the tree), so it is copied
