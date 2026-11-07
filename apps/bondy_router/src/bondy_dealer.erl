@@ -309,6 +309,7 @@ another register request second might be permissible immediately.
 -type eot() :: bondy_registry_store:eot().
 
 %% API
+-export([abandon_call/2]).
 -export([features/0]).
 -export([flush/2]).
 -export([flush_callee_promises/2]).
@@ -1102,6 +1103,22 @@ forward_call(#call{} = Msg, Callee, #{from := Caller} = Opts0) ->
             bondy_router_peer:send(RealmUri, To, Invocation, SendOpts)
     end.
 
+-doc """
+Ends a call of the local caller in `Ctxt` that the router cannot complete.
+
+It acts as a `killnowait` CANCEL without the reply: the call is settled, the
+callee is interrupted, and any later RESULT is discarded. The caller's session
+answers the caller itself. It is not the caller's request, so it needs no
+`wamp.cancel` permission.
+""".
+-spec abandon_call(id(), bondy_context:t()) -> ok.
+
+abandon_call(CallId, Ctxt) ->
+    M = bondy_wamp_message:cancel(CallId, #{mode => <<"killnowait">>}),
+    handle_cancel(
+        M, Ctxt, killnowait, #{error => undefined, authorize => false}
+    ).
+
 %% =============================================================================
 %% PRIVATE
 %% =============================================================================
@@ -1287,9 +1304,10 @@ do_forward(#cancel{} = M, Ctxt0) ->
     %% The caller is not affected, only in the kill case will receive an
     %% error later in the case of a remote callee.
     %% The mode arrives as a binary (validated CANCEL option); normalise it to
-    %% the atom the handle_cancel/3 clauses match on.
+    %% the atom the handle_cancel/4 clauses match on.
+    Opts = #{error => cancelled_error(M#cancel.request_id), authorize => true},
     handle_cancel(
-        M, Ctxt0, cancel_mode(maps:get(mode, M#cancel.options, skip))
+        M, Ctxt0, cancel_mode(maps:get(mode, M#cancel.options, skip)), Opts
     );
 do_forward(#yield{} = M, Ctxt0) ->
     %% We match the YIELD with the original INVOCATION using the request_id,
@@ -1492,7 +1510,7 @@ tracked by a call promise (the invocation promise lives on the callee's
 node), so the CANCEL is relayed to that node, which resolves the local
 invocation id and INTERRUPTs the callee (`forward/3`).
 """.
-handle_cancel(#cancel{} = M, Ctxt, Mode) ->
+handle_cancel(#cancel{} = M, Ctxt, Mode, Opts) ->
     RealmUri = bondy_context:realm_uri(Ctxt),
     Caller = bondy_context:ref(Ctxt),
     CallId = M#cancel.request_id,
@@ -1500,10 +1518,26 @@ handle_cancel(#cancel{} = M, Ctxt, Mode) ->
 
     case bondy_rpc_promise:find(CallKey) of
         {ok, Promise} ->
-            handle_cancel_remote(M, Ctxt, Mode, CallKey, Promise);
+            handle_cancel_remote(M, Ctxt, Mode, CallKey, Promise, Opts);
         error ->
-            handle_cancel_local(M, Ctxt, Mode)
+            handle_cancel_local(M, Ctxt, Mode, Opts)
     end.
+
+%% @private
+%% `undefined' when the caller's session answers the caller itself
+%% (`abandon_call/2').
+reply_cancel(_, _, undefined) ->
+    ok;
+reply_cancel(RealmUri, Caller, #error{} = Error) ->
+    bondy_router_peer:send(RealmUri, Caller, Error, #{}).
+
+%% @private
+%% A caller's CANCEL needs `wamp.cancel'; a call the router ends itself
+%% (`abandon_call/2') does not.
+authorize_cancel(Uri, Ctxt, #{authorize := true}) ->
+    bondy_rbac:authorize(<<"wamp.cancel">>, Uri, Ctxt);
+authorize_cancel(_, _, #{authorize := false}) ->
+    ok.
 
 %% @private
 %% Cancel a call whose callee is on another node or bridged cluster. For
@@ -1514,13 +1548,13 @@ handle_cancel(#cancel{} = M, Ctxt, Mode) ->
 %% `skip` only so the callee's node drops its invocation promise). A
 %% promise without a callee is a call waiting for a registration; there is
 %% nothing to forward the CANCEL to.
-handle_cancel_remote(M, Ctxt, Mode, CallKey, Promise) ->
+handle_cancel_remote(M, Ctxt, Mode, CallKey, Promise, Opts) ->
     RealmUri = bondy_context:realm_uri(Ctxt),
     Caller = bondy_context:ref(Ctxt),
-    CallId = M#cancel.request_id,
+    Error = maps:get(error, Opts),
 
     Uri = bondy_rpc_promise:procedure_uri(Promise),
-    ok = bondy_rbac:authorize(<<"wamp.cancel">>, Uri, Ctxt),
+    ok = authorize_cancel(Uri, Ctxt, Opts),
 
     %% `kill` waits for the callee's ERROR, which a call without a callee (one
     %% waiting for a registration) never gets.
@@ -1528,15 +1562,12 @@ handle_cancel_remote(M, Ctxt, Mode, CallKey, Promise) ->
         case {Mode, bondy_rpc_promise:callee(Promise)} of
             {kill, undefined} ->
                 _ = bondy_rpc_promise:take(CallKey),
-                bondy_router_peer:send(
-                    RealmUri, Caller, cancelled_error(CallId), #{}
-                );
+                ok = reply_cancel(RealmUri, Caller, Error);
             {kill, _} ->
                 ok;
             {Settled, _} when Settled == killnowait; Settled == skip ->
                 _ = bondy_rpc_promise:take(CallKey),
-                Error = cancelled_error(CallId),
-                bondy_router_peer:send(RealmUri, Caller, Error, #{})
+                ok = reply_cancel(RealmUri, Caller, Error)
         end,
 
     case bondy_rpc_promise:callee(Promise) of
@@ -1547,7 +1578,7 @@ handle_cancel_remote(M, Ctxt, Mode, CallKey, Promise) ->
     end.
 
 %% @private
-handle_cancel_local(#cancel{} = M, Ctxt0, kill) ->
+handle_cancel_local(#cancel{} = M, Ctxt0, kill, CancelOpts) ->
     %% INTERRUPT is sent to the callee, but ERROR is not returned
     %% to the caller until the callee has answered the INVOCATION
     %% with ERROR. In this case, the caller may receive RESULT or
@@ -1561,7 +1592,7 @@ handle_cancel_local(#cancel{} = M, Ctxt0, kill) ->
 
     Fun = fun(Promise, Ctxt1) ->
         Uri = bondy_rpc_promise:procedure_uri(Promise),
-        ok = bondy_rbac:authorize(<<"wamp.cancel">>, Uri, Ctxt1),
+        ok = authorize_cancel(Uri, Ctxt1, CancelOpts),
 
         InvocationId = bondy_rpc_promise:invocation_id(Promise),
         Callee = bondy_rpc_promise:callee(Promise),
@@ -1577,8 +1608,8 @@ handle_cancel_local(#cancel{} = M, Ctxt0, kill) ->
                 ok = bondy_router_peer:send(RealmUri, To, R, SendOpts);
             false ->
                 _ = bondy_rpc_promise:take(bondy_rpc_promise:key(Promise)),
-                Error = cancelled_error(CallId),
-                ok = bondy_router_peer:send(RealmUri, Caller, Error, #{})
+                Error = maps:get(error, CancelOpts),
+                ok = reply_cancel(RealmUri, Caller, Error)
         end,
 
         {ok, Ctxt1}
@@ -1586,7 +1617,7 @@ handle_cancel_local(#cancel{} = M, Ctxt0, kill) ->
 
     _ = find_invocations(CallId, Fun, Ctxt0),
     ok;
-handle_cancel_local(#cancel{} = M, Ctxt0, killnowait) ->
+handle_cancel_local(#cancel{} = M, Ctxt0, killnowait, CancelOpts) ->
     %% The pending call is canceled and ERROR is send immediately
     %% back to the caller. INTERRUPT is sent to the callee and any
     %% response to the invocation or interrupt from the callee is
@@ -1600,15 +1631,15 @@ handle_cancel_local(#cancel{} = M, Ctxt0, killnowait) ->
 
     Fun = fun(Promise, Ctxt1) ->
         Uri = bondy_rpc_promise:procedure_uri(Promise),
-        ok = bondy_rbac:authorize(<<"wamp.cancel">>, Uri, Ctxt1),
+        ok = authorize_cancel(Uri, Ctxt1, CancelOpts),
 
         InvocationId = bondy_rpc_promise:invocation_id(Promise),
         Callee = bondy_rpc_promise:callee(Promise),
 
-        Error = cancelled_error(CallId),
+        Error = maps:get(error, CancelOpts),
 
         %% We know the caller is local
-        ok = bondy_router_peer:send(RealmUri, Caller, Error, #{}),
+        ok = reply_cancel(RealmUri, Caller, Error),
 
         %% But Callee might be remote
         case interruptible(Callee) of
@@ -1628,7 +1659,7 @@ handle_cancel_local(#cancel{} = M, Ctxt0, killnowait) ->
     end,
     _ = take_invocations(CallId, M, Fun, Ctxt0),
     ok;
-handle_cancel_local(#cancel{} = M, Ctxt0, skip) ->
+handle_cancel_local(#cancel{} = M, Ctxt0, skip, CancelOpts) ->
     %% The pending call is canceled and ERROR is sent immediately
     %% back to the caller. No INTERRUPT is sent to the callee and
     %% the result is discarded when received.
@@ -1641,14 +1672,14 @@ handle_cancel_local(#cancel{} = M, Ctxt0, skip) ->
 
     Fun = fun(Promise, Ctxt1) ->
         Uri = bondy_rpc_promise:procedure_uri(Promise),
-        ok = bondy_rbac:authorize(<<"wamp.cancel">>, Uri, Ctxt1),
+        ok = authorize_cancel(Uri, Ctxt1, CancelOpts),
 
         %% The cancellation acknowledgement is an ERROR for the CALL (the
         %% CANCEL message type has no ERROR counterpart in the spec).
-        Error = cancelled_error(CallId),
+        Error = maps:get(error, CancelOpts),
 
         RealmUri = bondy_context:realm_uri(Ctxt1),
-        ok = bondy_router_peer:send(RealmUri, Caller, Error, #{}),
+        ok = reply_cancel(RealmUri, Caller, Error),
 
         {ok, Ctxt1}
     end,

@@ -6,7 +6,7 @@
 {application, bondy_cluster, [
     {description,
         "The cluster as every Bondy app reaches it, over Partisan."},
-    {vsn, "1.1.0"},
+    {vsn, "1.2.0"},
     {registered, [bondy_cluster_sup]},
     {mod, {bondy_cluster_app, []}},
     {applications, [

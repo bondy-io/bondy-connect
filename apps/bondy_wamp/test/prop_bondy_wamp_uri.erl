@@ -3,250 +3,499 @@
 %% SPDX-License-Identifier: Apache-2.0
 %% =============================================================================
 
-%% @doc Property-based tests for bondy_wamp_uri (WAMP URI validation and matching).
-%%
-%% WAMP URIs follow specific rules for format and matching strategies.
-%% @end
 -module(prop_bondy_wamp_uri).
+-moduledoc """
+Property-based tests for `bondy_wamp_uri`: URI validation under the loose and
+strict rules, matching, and `components/1`.
+
+The generators follow the WAMP URI grammar. A URI is one or more components
+separated by single dots. A strict component holds lower-case letters, digits
+and `_`. A loose component holds any byte except `.`, `#`, DEL (0x7F) and the
+bytes from 0x00 to 0x20. Each rule combines a class with a shape: components
+(`exact`), components with one optional trailing dot (`prefix`), or any run of
+class bytes and dots (`allow_empty`, for wildcard patterns).
+
+Valid URIs come from the grammar; invalid ones are a valid URI with exactly
+one defect, so a rejection is attributable to that defect.
+""".
 
 -include_lib("proper/include/proper.hrl").
 -include("bondy_wamp.hrl").
 
-%% Properties
--export([
-    prop_valid_loose_uri_accepted/0,
-    prop_valid_strict_uri_accepted/0,
-    prop_empty_uri_only_loose_prefix/0,
-    prop_exact_match_reflexive/0,
-    prop_prefix_match_reflexive/0,
-    prop_wildcard_match_reflexive/0,
-    prop_prefix_match_empty_pattern/0,
-    prop_wildcard_match_same_components/0,
-    prop_components_valid_uri/0,
-    prop_components_reconstructable/0
-]).
+%% Validation
+-export([prop_valid_strict_uri_accepted/0]).
+-export([prop_valid_loose_uri_accepted/0]).
+-export([prop_strict_is_a_subset_of_loose/0]).
+-export([prop_a_forbidden_byte_is_rejected/0]).
+-export([prop_strict_rejects_a_loose_only_byte/0]).
+-export([prop_an_empty_component_needs_allow_empty/0]).
+-export([prop_a_trailing_dot_needs_prefix_or_allow_empty/0]).
+-export([prop_empty_uri_only_loose_prefix/0]).
+-export([prop_validate_agrees_with_is_valid/0]).
+-export([prop_scan_is_the_grammar/0]).
+%% Matching
+-export([prop_exact_match_reflexive/0]).
+-export([prop_prefix_match_reflexive/0]).
+-export([prop_wildcard_match_reflexive/0]).
+-export([prop_prefix_match_empty_pattern/0]).
+-export([prop_wildcard_match_is_componentwise/0]).
+%% Components
+-export([prop_components_valid_uri/0]).
+-export([prop_components_reconstructable/0]).
+
+-define(NUMTESTS, 5000).
 
 %% =============================================================================
-%% Generators
+%% GENERATORS: BYTES
 %% =============================================================================
 
-%% Generate a valid loose URI component (no spaces, dots, or hashes)
-loose_component() ->
-    ?LET(
-        Chars,
-        non_empty(
-            list(
-                oneof([
-                    range($a, $z),
-                    range($A, $Z),
-                    range($0, $9),
-                    $_,
-                    $-
-                ])
-            )
-        ),
-        list_to_binary(Chars)
-    ).
+strict_byte() ->
+    frequency([{26, range($a, $z)}, {10, range($0, $9)}, {2, $_}]).
 
-%% Generate a valid strict URI component (lowercase, digits, underscore only)
-strict_component() ->
-    ?LET(
-        Chars,
-        non_empty(
-            list(
-                oneof([
-                    range($a, $z),
-                    range($0, $9),
-                    $_
-                ])
-            )
-        ),
-        list_to_binary(Chars)
-    ).
+%% In the loose class and outside the strict one: upper case, ASCII
+%% punctuation other than `.' and `#', and bytes above 0x7F.
+loose_only_byte() ->
+    frequency([
+        {3, range($A, $Z)},
+        {3,
+            oneof(
+                (lists:seq(16#21, 16#2F) -- [$#, $.]) ++ lists:seq($:, $@) ++
+                    "[\\]^`{|}~"
+            )},
+        {2, range(16#80, 16#FF)}
+    ]).
 
-%% Generate a list of 2-5 components (avoids SUCHTHAT constraint issues)
-components_list(ComponentGen) ->
+loose_byte() ->
+    frequency([{3, strict_byte()}, {2, loose_only_byte()}]).
+
+%% Outside every class, and not the separator: the bytes from 0x00 to 0x20
+%% (whitespace and control characters, NUL and newline among them), `#' and
+%% DEL.
+forbidden_byte() ->
+    frequency([
+        {4, range(0, 16#20)},
+        {2, oneof([0, $\n, $\s, $\t, $\r])},
+        {1, $#},
+        {1, 16#7F}
+    ]).
+
+%% =============================================================================
+%% GENERATORS: URIS
+%% =============================================================================
+
+%% Mostly short, sometimes long enough to span several words.
+component(Byte) ->
     ?LET(
         N,
-        range(2, 5),
-        vector(N, ComponentGen)
+        frequency([{8, range(1, 8)}, {2, range(9, 24)}]),
+        ?LET(Bytes, vector(N, Byte), list_to_binary(Bytes))
     ).
 
-%% Generate a valid loose URI (at least 2 components separated by dots)
-loose_uri() ->
+uri(Byte) ->
     ?LET(
-        Components,
-        components_list(loose_component()),
-        iolist_to_binary(lists:join(<<".">>, Components))
+        N,
+        range(1, 8),
+        ?LET(Cs, vector(N, component(Byte)), join(Cs))
     ).
 
-strict_uri() ->
+prefix_uri(Byte) ->
     ?LET(
-        Components,
-        components_list(strict_component()),
-        iolist_to_binary(lists:join(<<".">>, Components))
-    ).
-
-%% Generate a URI suitable for wildcard matching (may have empty components)
-wildcard_uri() ->
-    ?LET(
-        Components,
-        ?SUCHTHAT(
-            L,
-            non_empty(list(oneof([loose_component(), <<>>]))),
-            length(L) >= 2 andalso
-                lists:any(fun(C) -> C =/= <<>> end, L)
-        ),
-        iolist_to_binary(lists:join(<<".">>, Components))
-    ).
-
-%% Generate a URI suitable for prefix matching (may have trailing dot)
-prefix_uri() ->
-    ?LET(
-        {Uri, TrailingDot},
-        {loose_uri(), boolean()},
-        case TrailingDot of
+        {Uri, Dot},
+        {uri(Byte), boolean()},
+        case Dot of
             true -> <<Uri/binary, ".">>;
             false -> Uri
         end
     ).
 
-invalid_uri() ->
-    oneof([
-        %% Contains spaces
-        <<"com.example.my procedure">>,
-        %% Contains hash (reserved)
-        <<"com.example#topic">>,
-        %% Single component
-        <<"justoneword">>,
-        %% Just dots
-        <<"...">>,
-        %% Empty
-        <<>>
-    ]).
-
-%% =============================================================================
-%% Properties: Validation
-%% =============================================================================
-
-prop_valid_loose_uri_accepted() ->
-    ?FORALL(
-        Uri,
-        loose_uri(),
-        bondy_wamp_uri:is_valid(Uri, loose)
+%% A wildcard pattern: components, some of them empty. Never the empty URI,
+%% which only `loose_prefix' accepts.
+wildcard_pattern(Byte) ->
+    ?SUCHTHAT(
+        P,
+        ?LET(
+            N,
+            range(1, 8),
+            ?LET(
+                Cs,
+                vector(N, frequency([{3, component(Byte)}, {1, <<>>}])),
+                join(Cs)
+            )
+        ),
+        P =/= <<>>
     ).
 
-prop_valid_strict_uri_accepted() ->
-    ?FORALL(
-        Uri,
-        strict_uri(),
-        bondy_wamp_uri:is_valid(Uri, strict)
-    ).
+%% A valid input for each class and shape.
+valid(Class, exact) -> uri(class_byte(Class));
+valid(Class, prefix) -> prefix_uri(class_byte(Class));
+valid(Class, allow_empty) -> wildcard_pattern(class_byte(Class)).
 
-prop_empty_uri_only_loose_prefix() ->
-    ?FORALL(
-        _,
-        term(),
+class_byte(strict) -> strict_byte();
+class_byte(loose) -> loose_byte().
+
+shape() ->
+    oneof([exact, prefix, allow_empty]).
+
+class() ->
+    oneof([strict, loose]).
+
+rule() ->
+    oneof(rules()).
+
+rules() ->
+    [
+        strict,
+        strict_prefix,
+        strict_allow_empty,
+        loose,
+        loose_prefix,
+        loose_allow_empty
+    ].
+
+rule(strict, exact) -> strict;
+rule(strict, prefix) -> strict_prefix;
+rule(strict, allow_empty) -> strict_allow_empty;
+rule(loose, exact) -> loose;
+rule(loose, prefix) -> loose_prefix;
+rule(loose, allow_empty) -> loose_allow_empty.
+
+%% `Bin' with `Byte' inserted at a position from the start to the end.
+insert_byte(Bin, ByteGen) ->
+    ?LET(
+        {Pos, Byte},
+        {range(0, byte_size(Bin)), ByteGen},
         begin
-            bondy_wamp_uri:is_valid(<<>>, loose_prefix) andalso
-                not bondy_wamp_uri:is_valid(<<>>, loose) andalso
-                not bondy_wamp_uri:is_valid(<<>>, strict)
+            <<H:Pos/binary, T/binary>> = Bin,
+            <<H/binary, Byte, T/binary>>
         end
     ).
 
+%% A URI with one empty component: a leading dot, a doubled dot, or a doubled
+%% trailing dot.
+with_empty_component(Uri) ->
+    Doubled =
+        case binary:matches(Uri, <<".">>) of
+            [] ->
+                [];
+            Dots ->
+                [
+                    ?LET(
+                        {Pos, _},
+                        oneof(Dots),
+                        begin
+                            <<H:Pos/binary, T/binary>> = Uri,
+                            <<H/binary, ".", T/binary>>
+                        end
+                    )
+                ]
+        end,
+    oneof([<<".", Uri/binary>>, <<Uri/binary, "..">> | Doubled]).
+
+join(Components) ->
+    iolist_to_binary(lists:join(<<".">>, Components)).
+
+%% Any input at all: valid for some class and shape, one defect away from
+%% valid, or arbitrary bytes.
+any_input() ->
+    frequency([
+        {3, ?LET({C, S}, {class(), shape()}, valid(C, S))},
+        {2,
+            ?LET(
+                {C, S},
+                {class(), shape()},
+                ?LET(U, valid(C, S), insert_byte(U, forbidden_byte()))
+            )},
+        {1, ?LET(U, uri(strict_byte()), insert_byte(U, loose_only_byte()))},
+        {1, ?LET(U, uri(loose_byte()), with_empty_component(U))},
+        {1, ?LET(L, list(range(0, 255)), list_to_binary(L))}
+    ]).
+
 %% =============================================================================
-%% Properties: Matching
+%% PROPERTIES: VALIDATION
+%% =============================================================================
+
+%% Every URI the strict grammar generates is valid under the strict rule of
+%% its shape.
+prop_valid_strict_uri_accepted() ->
+    numtests(
+        ?NUMTESTS,
+        ?FORALL(
+            {Shape, Uri},
+            ?LET(S, shape(), {S, valid(strict, S)}),
+            bondy_wamp_uri:is_valid(Uri, rule(strict, Shape))
+        )
+    ).
+
+%% Every URI the loose grammar generates is valid under the loose rule of its
+%% shape.
+prop_valid_loose_uri_accepted() ->
+    numtests(
+        ?NUMTESTS,
+        ?FORALL(
+            {Shape, Uri},
+            ?LET(S, shape(), {S, valid(loose, S)}),
+            bondy_wamp_uri:is_valid(Uri, rule(loose, Shape))
+        )
+    ).
+
+%% The strict class is part of the loose class, so a strict URI is also a
+%% loose URI of the same shape.
+prop_strict_is_a_subset_of_loose() ->
+    numtests(
+        ?NUMTESTS,
+        ?FORALL(
+            {Shape, Uri},
+            ?LET(S, shape(), {S, valid(strict, S)}),
+            bondy_wamp_uri:is_valid(Uri, rule(loose, Shape))
+        )
+    ).
+
+%% One byte outside every class, at any position including the first and the
+%% last, makes a URI invalid under every rule. A newline at the end is one
+%% such case.
+prop_a_forbidden_byte_is_rejected() ->
+    numtests(
+        ?NUMTESTS,
+        ?FORALL(
+            Uri,
+            ?LET(
+                {C, S},
+                {class(), shape()},
+                ?LET(U, valid(C, S), insert_byte(U, forbidden_byte()))
+            ),
+            lists:all(
+                fun(R) -> not bondy_wamp_uri:is_valid(Uri, R) end, rules()
+            )
+        )
+    ).
+
+%% A loose-only byte in a strict URI leaves it valid under the loose rules
+%% and invalid under the strict ones.
+prop_strict_rejects_a_loose_only_byte() ->
+    numtests(
+        ?NUMTESTS,
+        ?FORALL(
+            Uri,
+            ?LET(U, uri(strict_byte()), insert_byte(U, loose_only_byte())),
+            lists:all(fun(R) -> bondy_wamp_uri:is_valid(Uri, R) end, [
+                loose, loose_prefix, loose_allow_empty
+            ]) andalso
+                lists:all(fun(R) -> not bondy_wamp_uri:is_valid(Uri, R) end, [
+                    strict, strict_prefix, strict_allow_empty
+                ])
+        )
+    ).
+
+%% An empty component is valid only where empty components are allowed.
+prop_an_empty_component_needs_allow_empty() ->
+    numtests(
+        ?NUMTESTS,
+        ?FORALL(
+            {Class, Uri},
+            ?LET(
+                C,
+                class(),
+                {C, ?LET(U, uri(class_byte(C)), with_empty_component(U))}
+            ),
+            not bondy_wamp_uri:is_valid(Uri, rule(Class, exact)) andalso
+                not bondy_wamp_uri:is_valid(Uri, rule(Class, prefix)) andalso
+                bondy_wamp_uri:is_valid(Uri, rule(Class, allow_empty))
+        )
+    ).
+
+%% A single trailing dot is valid for a prefix or a wildcard pattern and
+%% invalid for an exact URI.
+prop_a_trailing_dot_needs_prefix_or_allow_empty() ->
+    numtests(
+        ?NUMTESTS,
+        ?FORALL(
+            {Class, Uri},
+            ?LET(
+                C, class(), {C, ?LET(U, uri(class_byte(C)), <<U/binary, ".">>)}
+            ),
+            not bondy_wamp_uri:is_valid(Uri, rule(Class, exact)) andalso
+                bondy_wamp_uri:is_valid(Uri, rule(Class, prefix)) andalso
+                bondy_wamp_uri:is_valid(Uri, rule(Class, allow_empty))
+        )
+    ).
+
+%% The empty URI is valid only as a loose prefix, the prefix of every URI.
+prop_empty_uri_only_loose_prefix() ->
+    ?FORALL(
+        Rule,
+        rule(),
+        bondy_wamp_uri:is_valid(<<>>, Rule) =:= (Rule =:= loose_prefix)
+    ).
+
+%% `validate/2' returns the URI that `is_valid/2' accepts and raises for the
+%% one it rejects.
+prop_validate_agrees_with_is_valid() ->
+    numtests(
+        ?NUMTESTS,
+        ?FORALL(
+            {Rule, Uri},
+            {rule(), any_input()},
+            case bondy_wamp_uri:is_valid(Uri, Rule) of
+                true ->
+                    bondy_wamp_uri:validate(Uri, Rule) =:= Uri;
+                false ->
+                    try bondy_wamp_uri:validate(Uri, Rule) of
+                        _ -> false
+                    catch
+                        error:{invalid_uri, Uri} -> true
+                    end
+            end
+        )
+    ).
+
+%% `is_valid/2' accepts exactly what each rule's grammar accepts, with the
+%% grammar written as the regular expression it is easiest to read as. The
+%% expression is compiled with `dollar_endonly' so that `$' means end of
+%% input: without it, PCRE's `$' also matches before a final newline.
+prop_scan_is_the_grammar() ->
+    numtests(
+        20000,
+        ?FORALL(
+            {Rule, Uri},
+            {rule(), any_input()},
+            bondy_wamp_uri:is_valid(Uri, Rule) =:= grammar_accepts(Uri, Rule)
+        )
+    ).
+
+grammar_accepts(<<>>, Rule) ->
+    loose_prefix == Rule;
+grammar_accepts(Uri, Rule) ->
+    {ok, MP} = re:compile(grammar(Rule), [dollar_endonly]),
+    re:run(Uri, MP) =/= nomatch.
+
+-define(LOOSE_CLASS, "[^\\s\\.#\\x00-\\x1F\\x7F]").
+-define(STRICT_CLASS, "[0-9a-z_]").
+
+grammar(loose) ->
+    "^(" ?LOOSE_CLASS "+\\.)*(" ?LOOSE_CLASS "+)$";
+grammar(loose_prefix) ->
+    "^(" ?LOOSE_CLASS "+\\.)*(" ?LOOSE_CLASS "+)[.]?$";
+grammar(loose_allow_empty) ->
+    "^((" ?LOOSE_CLASS "+\\.)|\\.)*(" ?LOOSE_CLASS "+)?$";
+grammar(strict) ->
+    "^(" ?STRICT_CLASS "+\\.)*(" ?STRICT_CLASS "+)$";
+grammar(strict_prefix) ->
+    "^(" ?STRICT_CLASS "+\\.)*(" ?STRICT_CLASS "+)[.]?$";
+grammar(strict_allow_empty) ->
+    "^((" ?STRICT_CLASS "+\\.)|\\.)*(" ?STRICT_CLASS "+)?$".
+
+%% =============================================================================
+%% PROPERTIES: MATCHING
 %% =============================================================================
 
 prop_exact_match_reflexive() ->
     ?FORALL(
-        Uri,
-        loose_uri(),
-        bondy_wamp_uri:match(Uri, Uri, ?EXACT_MATCH)
+        Uri, uri(loose_byte()), bondy_wamp_uri:match(Uri, Uri, ?EXACT_MATCH)
     ).
 
 prop_prefix_match_reflexive() ->
     ?FORALL(
-        Uri,
-        loose_uri(),
-        bondy_wamp_uri:match(Uri, Uri, ?PREFIX_MATCH)
+        Uri, uri(loose_byte()), bondy_wamp_uri:match(Uri, Uri, ?PREFIX_MATCH)
     ).
 
 prop_wildcard_match_reflexive() ->
     ?FORALL(
-        Uri,
-        loose_uri(),
-        bondy_wamp_uri:match(Uri, Uri, ?WILDCARD_MATCH)
+        Uri, uri(loose_byte()), bondy_wamp_uri:match(Uri, Uri, ?WILDCARD_MATCH)
     ).
 
-%% Property: Empty pattern matches everything in prefix mode
+%% The empty prefix matches every URI.
 prop_prefix_match_empty_pattern() ->
     ?FORALL(
-        Uri,
-        loose_uri(),
-        bondy_wamp_uri:match(Uri, <<>>, ?PREFIX_MATCH)
+        Uri, uri(loose_byte()), bondy_wamp_uri:match(Uri, <<>>, ?PREFIX_MATCH)
     ).
 
-%% Property: Wildcard match requires same number of components
-prop_wildcard_match_same_components() ->
-    ?FORALL(
-        {Uri1, Uri2},
-        {loose_uri(), loose_uri()},
+%% `match(Uri, Pattern, wildcard)' holds exactly when both have the same
+%% number of components and each pattern component is empty or equal to the
+%% URI's. Half the URIs are drawn from the pattern: its empty components
+%% filled, and sometimes one byte changed, so matches and near misses are
+%% common, not only unrelated pairs.
+prop_wildcard_match_is_componentwise() ->
+    numtests(
+        20000,
+        ?FORALL(
+            {Pattern, Uri},
+            ?LET(
+                {Byte, P},
+                ?LET(C, class(), {
+                    class_byte(C), wildcard_pattern(class_byte(C))
+                }),
+                {P, oneof([uri(Byte), from_pattern(P, Byte)])}
+            ),
+            bondy_wamp_uri:match(Uri, Pattern, ?WILDCARD_MATCH) =:=
+                componentwise(
+                    binary:split(Pattern, <<".">>, [global]),
+                    binary:split(Uri, <<".">>, [global])
+                )
+        )
+    ).
+
+componentwise([], []) -> true;
+componentwise([<<>> | P], [_ | U]) -> componentwise(P, U);
+componentwise([C | P], [C | U]) -> componentwise(P, U);
+componentwise(_, _) -> false.
+
+%% The pattern with each empty component filled, and sometimes one byte
+%% replaced by another class byte.
+from_pattern(Pattern, Byte) ->
+    ?LET(
+        Filled,
+        ?LET(
+            Cs,
+            [
+                case C of
+                    <<>> -> component(Byte);
+                    _ -> C
+                end
+             || C <- binary:split(Pattern, <<".">>, [global])
+            ],
+            join(Cs)
+        ),
+        oneof([Filled, replace_one_byte(Filled, Byte)])
+    ).
+
+replace_one_byte(Bin, Byte) ->
+    ?LET(
+        {I, New},
+        {range(0, byte_size(Bin) - 1), Byte},
         begin
-            Components1 = binary:split(Uri1, <<".">>, [global]),
-            Components2 = binary:split(Uri2, <<".">>, [global]),
-            case length(Components1) =:= length(Components2) of
-                true ->
-                    %% When same number of components, wildcard might match
-                    %% (depending on component values)
-                    true;
-                false ->
-                    %% Different number of components should not match
-                    not bondy_wamp_uri:match(Uri1, Uri2, ?WILDCARD_MATCH)
+            <<H:I/binary, Old, T/binary>> = Bin,
+            case Old of
+                $. -> Bin;
+                _ -> <<H/binary, New, T/binary>>
             end
         end
     ).
 
 %% =============================================================================
-%% Properties: Components
+%% PROPERTIES: COMPONENTS
 %% =============================================================================
 
-%% Generate a list of exactly 3-5 components for components tests
-components_list_3plus() ->
-    ?LET(
-        N,
-        range(3, 5),
-        vector(N, loose_component())
-    ).
+three_or_more_components() ->
+    ?LET(N, range(3, 6), vector(N, component(loose_byte()))).
 
-%% Property: components/1 works on valid URIs with at least 3 components
+%% A URI of three or more components splits into the domain (the first two
+%% components) followed by each remaining component.
 prop_components_valid_uri() ->
     ?FORALL(
         Components,
-        components_list_3plus(),
-        begin
-            Uri = iolist_to_binary(lists:join(<<".">>, Components)),
-            ResultComponents = bondy_wamp_uri:components(Uri),
-            is_list(ResultComponents) andalso length(ResultComponents) >= 2
-        end
+        three_or_more_components(),
+        length(bondy_wamp_uri:components(join(Components))) =:=
+            length(Components) - 1
     ).
 
-%% Property: Domain component contains the first two parts
 prop_components_reconstructable() ->
     ?FORALL(
         Components,
-        components_list_3plus(),
+        three_or_more_components(),
         begin
-            Uri = iolist_to_binary(lists:join(<<".">>, Components)),
-            [Domain | Rest] = bondy_wamp_uri:components(Uri),
-            %% Domain should be first.second
-            ExpectedDomain = iolist_to_binary([
-                lists:nth(1, Components),
-                <<".">>,
-                lists:nth(2, Components)
-            ]),
-            %% Rest should be remaining components
-            ExpectedRest = lists:nthtail(2, Components),
-            Domain =:= ExpectedDomain andalso Rest =:= ExpectedRest
+            [Domain | Rest] = bondy_wamp_uri:components(join(Components)),
+            [First, Second | Tail] = Components,
+            Domain =:= <<First/binary, ".", Second/binary>> andalso
+                Rest =:= Tail
         end
     ).

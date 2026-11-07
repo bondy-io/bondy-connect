@@ -45,12 +45,14 @@ all() ->
         a_tenant_session_may_check_its_own_realm,
         a_tenant_session_may_name_its_own_realm_explicitly,
         a_tenant_session_may_not_name_another_realm,
+        a_realm_mismatch_names_the_received_realm,
         a_master_session_may_name_any_realm,
         a_master_session_naming_no_realm_asks_about_master,
         an_unknown_authid_answers_false_rather_than_erroring,
         too_few_arguments_is_an_arity_error,
         too_many_arguments_is_an_arity_error,
         cert_manager_refuses_a_tenant_session,
+        cert_manager_refusal_names_only_the_master_rule,
         cert_manager_answers_a_master_session
     ].
 
@@ -114,6 +116,33 @@ a_tenant_session_may_not_name_another_realm(_) ->
     %% DIFFERENT rather than about realm B in particular.
     E2 = call_error(?REALM_B, [?REALM_A, ?USER_A, ~"wamp.call", ?PROC]),
     ?assertEqual(?WAMP_NOT_AUTHORIZED, E2#error.error_uri).
+
+%% The refusal names the realm the caller sent, as an Erlang term, so a
+%% charlist realm (the reported mistake) reads differently from the session's
+%% binary realm. The session realm itself, sent as a charlist, is the case that
+%% looked identical before: the old text showed only the session's realm.
+a_realm_mismatch_names_the_received_realm(_) ->
+    Charlist = binary_to_list(?REALM_A),
+    E = call_error(?REALM_A, [Charlist, ?USER_A, ~"wamp.call", ?PROC]),
+    ?assertEqual(?WAMP_NOT_AUTHORIZED, E#error.error_uri),
+    Shown = iolist_to_binary(io_lib:format("~0tp", [Charlist])),
+    #{~"description" := D, ~"details" := Details} = E#error.kwargs,
+    ?assertNotEqual(nomatch, binary:match(D, Shown), D),
+    ?assertEqual(Shown, maps:get(~"requested_realm_uri", Details)),
+    ?assertEqual(?REALM_A, maps:get(~"realm_uri", Details)),
+    %% Another realm as a binary shows the binary form, not the session's.
+    E2 = call_error(?REALM_A, [?REALM_B, ?USER_A, ~"wamp.call", ?PROC]),
+    #{~"details" := Details2} = E2#error.kwargs,
+    ?assertEqual(
+        iolist_to_binary(io_lib:format("~0tp", [?REALM_B])),
+        maps:get(~"requested_realm_uri", Details2)
+    ),
+    %% A hostile argument is cut: a 5000-element charlist would print in full
+    %% under a depth limit (probed), `chars_limit` bounds it.
+    Long = lists:duplicate(5000, $a),
+    E3 = call_error(?REALM_A, [Long, ?USER_A, ~"wamp.call", ?PROC]),
+    #{~"details" := Details3} = E3#error.kwargs,
+    ?assert(byte_size(maps:get(~"requested_realm_uri", Details3)) =< 110).
 
 %% The master realm's tier: any realm, including a tenant's. A master session
 %% may ask about principals outside its own realm.
@@ -181,6 +210,16 @@ cert_manager_refuses_a_tenant_session(_) ->
         end,
         [?BONDY_CERT_RELOAD_CACERTS, ?BONDY_CERT_ROTATE_ALL]
     ).
+
+%% A master-only refusal has no target realm, so it names only the master rule
+%% and the session's realm, and carries no `requested_realm_uri`.
+cert_manager_refusal_names_only_the_master_rule(_) ->
+    E = call_error(?REALM_A, ?BONDY_CERT_RELOAD_CACERTS, []),
+    #{~"description" := D, ~"details" := Details} = E#error.kwargs,
+    ?assertEqual(nomatch, binary:match(D, ~"targets realm"), D),
+    ?assertNotEqual(nomatch, binary:match(D, ?MASTER_REALM_URI), D),
+    ?assertNotEqual(nomatch, binary:match(D, ?REALM_A), D),
+    ?assertNot(maps:is_key(~"requested_realm_uri", Details)).
 
 %% The falsifier: the guard must refuse the wrong realm, not the procedure.
 cert_manager_answers_a_master_session(_) ->

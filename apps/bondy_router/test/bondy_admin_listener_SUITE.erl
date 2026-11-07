@@ -35,6 +35,7 @@
 -export([registry_routes_read_the_named_realm/1]).
 -export([on_call/3]).
 -export([malformed_bearer_token_is_unauthorized/1]).
+-export([refused_bearer_credential_follows_rfc_6750/1]).
 -export([admin_api_cookie_is_subject_to_master_realm_sources/1]).
 -export([admin_api_cookie_without_admin_role_is_forbidden/1]).
 -export([admin_api_csrf_checks_the_authenticating_realms_pair/1]).
@@ -85,6 +86,7 @@ all() ->
         admin_api_accepts_the_master_realm_ticket_cookie,
         only_admin_api_routes_accept_the_ticket_cookie,
         malformed_bearer_token_is_unauthorized,
+        refused_bearer_credential_follows_rfc_6750,
         admin_api_cookie_is_subject_to_master_realm_sources,
         admin_api_cookie_without_admin_role_is_forbidden,
         admin_api_csrf_checks_the_authenticating_realms_pair,
@@ -752,6 +754,48 @@ malformed_bearer_token_is_unauthorized(_Config) ->
             []
         },
         {Results, [maps:get(msg, E) || E <- Errors]}
+    ).
+
+%% A missing or non-JWT bearer value is `bondy.error.token_invalid` in the body,
+%% which was an `internal_error` before. The challenge follows RFC 6750 §3.1: a
+%% request that presented no bearer token, including one using another scheme,
+%% gets the realm alone; a presented token that is refused, whether it fails
+%% to decode or fails authentication, gets `error="invalid_token"`.
+refused_bearer_credential_follows_rfc_6750(_Config) ->
+    Refusal = fun({ok, Status, Headers, Ref}) ->
+        {ok, Body} = hackney:body(Ref),
+        #{~"uri" := Uri} = json:decode(Body),
+        [Auth] = [
+            V
+         || {K, V} <- Headers, string:lowercase(K) =:= ~"www-authenticate"
+        ],
+        {Status, Uri, Auth}
+    end,
+    Bare = <<"Bearer realm=\"", ?MASTER_REALM_URI/binary, "\"">>,
+    Invalid = <<Bare/binary, ", error=\"invalid_token\"">>,
+    ?assertEqual(
+        {401, ~"bondy.error.token_invalid", Bare},
+        Refusal(get_path(?ADMIN, ?ADMIN_API_PATH))
+    ),
+    ?assertEqual(
+        {401, ~"bondy.error.token_invalid", Invalid},
+        Refusal(get_path(?ADMIN, ?ADMIN_API_PATH, ~"not-a-token"))
+    ),
+    ?assertMatch(
+        {401, _, Invalid},
+        Refusal(get_path(?ADMIN, ?ADMIN_API_PATH, issue_token(?FOREIGN_REALM)))
+    ),
+    ?assertMatch(
+        {401, _, Bare},
+        Refusal(
+            hackney:request(
+                get,
+                url(?ADMIN, ?ADMIN_API_PATH),
+                [{~"authorization", ~"Basic YWRtaW46YWRtaW4="}],
+                <<>>,
+                []
+            )
+        )
     ).
 
 %% An OIDC identity is held to the master realm's sources like any other

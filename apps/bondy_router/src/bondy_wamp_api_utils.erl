@@ -758,8 +758,10 @@ do_validate_call_args(
         ?MASTER_REALM_URI ->
             %% Users logged in root realm can operate on any realm
             to_list(args(Msg));
+        _ when AdminOnly ->
+            error(unauthorized(Msg, Ctxt));
         _ ->
-            error(unauthorized(Msg, Ctxt))
+            error(realm_mismatch(Msg, Ctxt, Uri))
     end;
 do_validate_call_args(Msg, Ctxt, Min, _, Len, AdminOnly) when Len + 1 >= Min ->
     %% We are missing the RealmUri argument, we default to the session's Realm
@@ -838,35 +840,59 @@ send_chunk(#call{request_id = ReqId}, Ctxt, Values, HasMore, Extras) ->
     ).
 
 %% @private
+%% The procedure is master-only and the session is on another realm.
 unauthorized(#call{request_id = ReqId}, Ctxt) ->
     Uri = bondy_context:realm_uri(Ctxt),
     Message = <<
         "You have no authorisation to perform this operation on this realm."
     >>,
     Description = <<
-        "The operation you've requested is targeting a realm ",
-        $\s,
-        $(,
-        $",
-        Uri/binary,
-        $",
-        $),
-        $,,
-        " that is not your session's realm or the operation is only "
-        "supported when performed by a session on the Bondy Master Realm.",
-        $\s,
-        $(,
-        $",
+        "The operation is only supported when performed by a session on the "
+        "Bondy Master Realm (\"",
         (?MASTER_REALM_URI)/binary,
-        $",
-        $),
-        $.
+        "\"). Your session is on realm \"",
+        Uri/binary,
+        "\"."
     >>,
     Error = bondy_connect_error:new(not_authorized, #{
         message => Message,
         description => Description,
         details => #{
             realm_uri => Uri,
+            master_realm_uri => ?MASTER_REALM_URI
+        }
+    }),
+    bondy_wamp_error:to_wamp(Error, ?CALL, ReqId, #{}).
+
+%% @private
+%% The realm argument is not the session's realm. `Requested` is the caller's
+%% term, shown as an Erlang term so its type is visible (a charlist prints as
+%% "...", a binary as <<"...">>) and cut by `chars_limit`, which a depth limit
+%% does not do for a charlist.
+realm_mismatch(#call{request_id = ReqId}, Ctxt, Requested) ->
+    Uri = bondy_context:realm_uri(Ctxt),
+    Shown = unicode:characters_to_binary(
+        io_lib:format("~0tp", [Requested], [{chars_limit, 100}])
+    ),
+    Message = <<
+        "You have no authorisation to perform this operation on this realm."
+    >>,
+    Description = <<
+        "The operation targets realm ",
+        Shown/binary,
+        ", which is not your session's realm \"",
+        Uri/binary,
+        "\". The realm argument must be the binary URI of your session's "
+        "realm, unless your session is on the Bondy Master Realm (\"",
+        (?MASTER_REALM_URI)/binary,
+        "\")."
+    >>,
+    Error = bondy_connect_error:new(not_authorized, #{
+        message => Message,
+        description => Description,
+        details => #{
+            realm_uri => Uri,
+            requested_realm_uri => Shown,
             master_realm_uri => ?MASTER_REALM_URI
         }
     }),

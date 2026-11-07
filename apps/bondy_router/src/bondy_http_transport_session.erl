@@ -675,6 +675,8 @@ handle_info(queue_ready, State) ->
 handle_info({?BONDY_REQ, _Pid, _RealmUri, M}, State) ->
     #state{protocol_state = ProtoState} = State,
     case bondy_wamp_protocol:handle_outbound(M, ProtoState) of
+        {ok, NewProtoState} ->
+            {noreply, State#state{protocol_state = NewProtoState}};
         {ok, Bin, NewProtoState} ->
             S1 = State#state{protocol_state = NewProtoState},
             S2 = enqueue_replies([Bin], S1),

@@ -500,6 +500,8 @@ timed_outbound(T, M, State) ->
 %% @private
 handle_outbound(T, M, State) ->
     case bondy_wamp_protocol:handle_outbound(M, State#state.protocol_state) of
+        {ok, PSt} ->
+            {[], State#state{protocol_state = PSt}};
         {ok, Bin, PSt} ->
             %% Bin is ONE message as iodata — do not pass it to
             %% data_frames/2, which maps over a list of messages.

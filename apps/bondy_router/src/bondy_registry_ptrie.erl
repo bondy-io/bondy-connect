@@ -55,6 +55,11 @@ under the same `{URI, Policy}`); see `bondy_registry_ptrie:update/4`.
 %% unambiguously marks a wildcard position during match-time traversal.
 %% Byte-indexed into a 256-tuple, so it lives at tuple index 1.
 -define(WILDCARD_BYTE, 0).
+%% SWAR zero-byte test over a 56-bit word, the widest that stays a small
+%% integer on the BEAM: non-zero iff some byte of `V' is zero.
+-define(ONES, 16#01010101010101).
+-define(HIGHS, 16#80808080808080).
+-define(HAS_ZERO(V), ((((V) - ?ONES) band (bnot (V))) band ?HIGHS)).
 -define(IS_POLICY(P), (P =:= exact orelse P =:= prefix orelse P =:= wildcard)).
 
 -record(pnode, {
@@ -1366,6 +1371,11 @@ descend_match(
     descend_wildcard(Tab, Node, TargetRest, PathHere, Acc1).
 
 %% @private
+%% The wildcard edge is followed only by `descend_wildcard/5', as a wildcard
+%% byte inside a node prefix is only ever a wildcard. A target that carries
+%% NUL would otherwise reach the same leaf both ways and collect it twice.
+descend_literal(_Tab, _Node, ?WILDCARD_BYTE, _RestAfter, _PathHere, Acc) ->
+    Acc;
 descend_literal(Tab, Node, TargetByte, RestAfter, PathHere, Acc) ->
     case child_get(TargetByte, Node#pnode.children) of
         undefined ->
@@ -1434,6 +1444,10 @@ has_descend_match(Tab, Node, <<TargetByte, RestAfter/binary>> = TargetRest) ->
         has_descend_wildcard(Tab, Node, TargetRest).
 
 %% @private
+%% Follows the wildcard edge only through `has_descend_wildcard/3', as
+%% `descend_literal/6' does.
+has_descend_literal(_Tab, _Node, ?WILDCARD_BYTE, _RestAfter) ->
+    false;
 has_descend_literal(Tab, Node, TargetByte, RestAfter) ->
     case child_get(TargetByte, Node#pnode.children) of
         undefined ->
@@ -1469,6 +1483,13 @@ has_descend_wildcard(Tab, Node, TargetRest) ->
 %%
 %% Binary-pattern-match walk: each step is a single-byte check + sub-binary
 %% reference update. No `binary:at/2` or indexing BIF in the hot path.
+walk_prefix_bytes(<<W:56, RestPrefix/binary>>, <<W:56, RestTarget/binary>>) when
+    ?HAS_ZERO(W) =:= 0
+->
+    %% Seven equal bytes in one comparison. A chunk holding the wildcard byte
+    %% takes the byte clauses below instead: a target that carries NUL there
+    %% would otherwise match it literally rather than skip its segment.
+    walk_prefix_bytes(RestPrefix, RestTarget);
 walk_prefix_bytes(<<>>, TargetRest) ->
     {match, TargetRest};
 walk_prefix_bytes(<<?WILDCARD_BYTE, RestPrefix/binary>>, TargetRest) ->

@@ -39,6 +39,7 @@ the API Gateway spec defaults read it here.
 -export([find_ticket_cookie/2]).
 -export([parse_cookies/1]).
 -export([safe_bearer_token/1]).
+-export([bearer_challenge/2]).
 -export([safe_parse_cookies/1]).
 -export([ticket_cookie_name/1]).
 -export([ticket_cookie_realm/1]).
@@ -402,6 +403,28 @@ safe_bearer_token(Req) ->
         exit:{request_error, {header, <<"authorization">>}, _} ->
             undefined
     end.
+
+-doc """
+Returns the `WWW-Authenticate` value of a 401 refusing a bearer credential, as
+RFC 6750 §3 shapes it.
+
+`no_credential` is a request that presented no bearer token, including one
+that used another scheme: the challenge names the realm and nothing else
+(§3.1, last paragraph). `invalid_token` is a presented token that was refused
+for any reason (§3.1).
+
+There is no `error_description`. The response body carries the detail, and
+§3 restricts the attribute to a character set a catalogue message is not held
+to.
+""".
+-spec bearer_challenge(
+    RealmUri :: binary(), Refusal :: no_credential | invalid_token
+) -> binary().
+
+bearer_challenge(RealmUri, no_credential) ->
+    <<"Bearer realm=\"", RealmUri/binary, "\"">>;
+bearer_challenge(RealmUri, invalid_token) ->
+    <<"Bearer realm=\"", RealmUri/binary, "\", error=\"invalid_token\"">>.
 
 -doc """
 Returns true if the argument is a valid public IP address.

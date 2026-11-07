@@ -67,7 +67,8 @@ all() ->
         match_encode_decode_round_trip,
         match_wildcard_must_consume_non_empty_segment,
         prop_match_agrees_with_reference,
-        prop_has_match_agrees_with_match
+        prop_has_match_agrees_with_match,
+        prop_wildcard_skips_a_segment_that_starts_with_nul
     ].
 
 init_per_suite(Config) ->
@@ -1042,7 +1043,11 @@ prop_match_agrees_with_reference(Config) ->
     run_prop(
         ?FORALL(
             {Registered, Target},
-            {list(registered_pattern()), uri_target()},
+            ?LET(
+                Registered,
+                list(registered_pattern()),
+                {Registered, target_for(Registered)}
+            ),
             begin
                 clear(H),
                 [
@@ -1081,7 +1086,11 @@ prop_has_match_agrees_with_match(Config) ->
     run_prop(
         ?FORALL(
             {Registered, Target},
-            {list(registered_pattern()), uri_target()},
+            ?LET(
+                Registered,
+                list(registered_pattern()),
+                {Registered, target_for(Registered)}
+            ),
             begin
                 clear(H),
                 [
@@ -1103,6 +1112,46 @@ prop_has_match_agrees_with_match(Config) ->
                                 Actual,
                                 Expected
                             ]
+                        ),
+                        false
+                end
+            end
+        )
+    ).
+
+prop_wildcard_skips_a_segment_that_starts_with_nul(Config) ->
+    %% The wildcard byte is NUL, and a node prefix can hold it. A target that
+    %% carries NUL at a wildcard position, followed by more bytes of the same
+    %% segment, still has the whole segment skipped. Each case stores one
+    %% generated wildcard pattern, so the wildcard bytes stay inside node
+    %% prefixes, at whatever offsets the generated components put them in the
+    %% 7-byte chunks the walk compares at once. The target fills every
+    %% wildcard with such a segment, and sometimes changes a literal byte, so
+    %% both outcomes occur. Such targets are not valid URIs; the walk must
+    %% still agree with the reference.
+    H = ?config(handle, Config),
+    run_prop(
+        ?FORALL(
+            {Key, Target},
+            nul_wildcard_case(),
+            begin
+                clear(H),
+                ok = bondy_registry_ptrie:insert(H, Key, wildcard, v),
+                Expected =
+                    case reference_match(Key, wildcard, Target) of
+                        true -> [{Key, wildcard, v}];
+                        false -> []
+                    end,
+                Matched = bondy_registry_ptrie:match(H, Target),
+                Has = bondy_registry_ptrie:has_match(H, Target),
+                case {Matched, Has} =:= {Expected, Expected =/= []} of
+                    true ->
+                        true;
+                    false ->
+                        ct:pal(
+                            "key=~p~ntarget=~p~nmatch=~p~nhas_match=~p~n"
+                            "expected=~p",
+                            [Key, Target, Matched, Has, Expected]
                         ),
                         false
                 end
@@ -1253,61 +1302,171 @@ wildcard_parts_match(_, _) ->
 %% A random pattern suitable for registration. Policy is weighted toward
 %% generating each kind.
 registered_pattern() ->
+    oneof([
+        {uri_pattern(), exact, v},
+        {prefix_key(), prefix, v},
+        ?LET(P, wildcard_pattern(), {
+            bondy_registry_ptrie:encode_pattern(P), wildcard, v
+        })
+    ]).
+
+%% @private
+%% A byte of the WAMP strict component class. A few letters are frequent so
+%% that keys share prefixes and the trie branches and compresses.
+strict_key_byte() ->
+    frequency([
+        {6, choose($a, $d)},
+        {2, choose($e, $z)},
+        {1, choose($0, $9)},
+        {1, $_}
+    ]).
+
+%% @private
+%% Up to 12 bytes, so node prefixes reach the 7-byte chunks the walk compares
+%% at once, as well as the byte-at-a-time tail.
+uri_component() ->
     ?LET(
-        {Policy, URI},
-        {oneof([exact, prefix, wildcard]), uri_pattern()},
-        case Policy of
-            wildcard ->
-                {
-                    bondy_registry_ptrie:encode_pattern(
-                        uri_pattern_with_wildcards(URI)
-                    ),
-                    wildcard,
-                    v
-                };
-            _ ->
-                {URI, Policy, v}
-        end
+        Bytes, vector_between(1, 12, strict_key_byte()), list_to_binary(Bytes)
     ).
 
 %% @private
 uri_pattern() ->
+    ?LET(Parts, vector_between(1, 6, uri_component()), join(Parts)).
+
+%% @private
+%% A prefix registration may end in the separator.
+prefix_key() ->
     ?LET(
-        Parts,
-        non_empty(list(uri_component())),
-        iolist_to_binary(lists:join(<<".">>, Parts))
+        {Uri, Dot},
+        {uri_pattern(), boolean()},
+        case Dot of
+            true -> <<Uri/binary, ".">>;
+            false -> Uri
+        end
     ).
 
 %% @private
-%% Turn some components into empty ones (wildcards) at random positions.
-uri_pattern_with_wildcards(URI) ->
-    Parts = binary:split(URI, <<".">>, [global]),
-    Rewritten = [maybe_wildcard(P) || P <- Parts],
-    iolist_to_binary(lists:join(<<".">>, Rewritten)).
-
-%% @private
-maybe_wildcard(P) ->
-    case rand:uniform(3) of
-        1 -> <<>>;
-        _ -> P
-    end.
-
-%% @private
-uri_component() ->
+%% A wildcard pattern in its URI form: components, some of them empty.
+wildcard_pattern() ->
     ?LET(
-        Bytes,
-        non_empty(vector_between(1, 5, choose($a, $f))),
-        list_to_binary(Bytes)
+        Parts,
+        vector_between(1, 6, frequency([{2, uri_component()}, {1, <<>>}])),
+        join(Parts)
+    ).
+
+%% @private
+%% A target independent of the registered keys, or one drawn from a key: the
+%% key itself, the key with one byte changed, or the key with one more
+%% segment. A drawn target shares long prefixes with the trie's nodes, so the
+%% walk reaches deep into node prefixes before it matches or diverges.
+target_for([]) ->
+    uri_target();
+target_for(Registered) ->
+    oneof([uri_target() | [near_target(K) || {K, _, _} <- Registered]]).
+
+%% @private
+%% `Q' is outside the key class, so a filled-in wildcard segment is non-empty
+%% and equals no literal segment, and the target is still a valid loose URI.
+near_target(Key) ->
+    Concrete = binary:replace(Key, <<0>>, <<"Q">>, [global]),
+    oneof([Concrete, replace_one_byte(Concrete), <<Concrete/binary, ".e">>]).
+
+%% @private
+%% `Bin' with one byte other than the separator replaced by a key byte, which
+%% may be the same byte.
+replace_one_byte(Bin) ->
+    ?LET(
+        {I, New},
+        {choose(0, byte_size(Bin) - 1), strict_key_byte()},
+        begin
+            <<H:I/binary, Old, T/binary>> = Bin,
+            case Old of
+                $. -> Bin;
+                _ -> <<H/binary, New, T/binary>>
+            end
+        end
     ).
 
 %% @private
 uri_target() ->
-    %% Valid target URI: non-empty components, byte alphabet a–f.
+    ?LET(Parts, vector_between(1, 6, uri_component()), join(Parts)).
+
+%% @private
+%% A stored wildcard key and a target that fills each wildcard with a segment
+%% starting with NUL and followed by 0 to 8 key bytes. The target sometimes
+%% has one byte of a literal component changed.
+nul_wildcard_case() ->
     ?LET(
         Parts,
-        non_empty(vector_between(1, 5, uri_component())),
-        iolist_to_binary(lists:join(<<".">>, Parts))
+        ?SUCHTHAT(
+            Ps,
+            vector_between(
+                1,
+                6,
+                frequency([
+                    {2, {literal, uri_component()}},
+                    {1, {wildcard, nul_segment()}}
+                ])
+            ),
+            lists:keymember(wildcard, 1, Ps)
+        ),
+        begin
+            Pattern = join([nul_case_pattern_part(P) || P <- Parts]),
+            Target = join([nul_case_target_part(P) || P <- Parts]),
+            {
+                bondy_registry_ptrie:encode_pattern(Pattern),
+                oneof([Target, replace_literal_byte(Parts)])
+            }
+        end
     ).
+
+%% @private
+nul_segment() ->
+    ?LET(
+        Tail,
+        vector_between(0, 8, strict_key_byte()),
+        list_to_binary([0 | Tail])
+    ).
+
+%% @private
+nul_case_pattern_part({literal, C}) -> C;
+nul_case_pattern_part({wildcard, _}) -> <<>>.
+
+%% @private
+nul_case_target_part({literal, C}) -> C;
+nul_case_target_part({wildcard, S}) -> S.
+
+%% @private
+%% The target with one byte of one literal component replaced, or the target
+%% unchanged when there is no literal component.
+replace_literal_byte(Parts) ->
+    Literals = [I || {I, {literal, _}} <- lists:enumerate(Parts)],
+    case Literals of
+        [] ->
+            join([nul_case_target_part(P) || P <- Parts]);
+        _ ->
+            ?LET(
+                {I, NewC},
+                ?LET(
+                    I,
+                    oneof(Literals),
+                    {I, replace_one_byte(element(2, lists:nth(I, Parts)))}
+                ),
+                join([
+                    nul_case_target_part(
+                        case J of
+                            I -> {literal, NewC};
+                            _ -> P
+                        end
+                    )
+                 || {J, P} <- lists:enumerate(Parts)
+                ])
+            )
+    end.
+
+%% @private
+join(Parts) ->
+    iolist_to_binary(lists:join(<<".">>, Parts)).
 
 %% @private
 vector_between(Min, Max, Gen) ->

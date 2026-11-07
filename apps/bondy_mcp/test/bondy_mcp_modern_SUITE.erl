@@ -898,7 +898,35 @@ garbage_bearer_token_is_unauthorized(Config) ->
     {S2, _} = post(
         Config, ?RBAC_REALM, req(18, <<"tools/list">>, #{}), #{auth => Long}
     ),
-    ?assertEqual(401, S2).
+    ?assertEqual(401, S2),
+    %% RFC 6750 §3.1: a refused token is `invalid_token`; a request that
+    %% presented none gets the realm alone.
+    Challenge = fun(Headers) ->
+        Body = req(19, <<"tools/list">>, #{}),
+        {ok, {{_, 401, _}, RespHeaders, _}} = httpc:request(
+            post,
+            {
+                lists:flatten(
+                    io_lib:format(
+                        "http://127.0.0.1:~b/mcp/realm/~s",
+                        [?config(port, Config), ?RBAC_REALM]
+                    )
+                ),
+                std_headers(Body, #{}) ++ Headers,
+                "application/json",
+                iolist_to_binary(json:encode(Body))
+            },
+            [],
+            [{body_format, binary}]
+        ),
+        proplists:get_value("www-authenticate", RespHeaders)
+    end,
+    Bare = "Bearer realm=\"" ++ binary_to_list(?RBAC_REALM) ++ "\"",
+    ?assertEqual(
+        Bare ++ ", error=\"invalid_token\"",
+        Challenge([{"authorization", "Bearer not-a-jwt"}])
+    ),
+    ?assertEqual(Bare, Challenge([])).
 
 unauthenticated_request_starts_nothing(Config) ->
     Sessions0 = stored_session_count(),

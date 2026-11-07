@@ -1,4 +1,22 @@
 # CHANGELOG
+## 1.2.0
+
+### Action required
+* A node that runs 1.2 cannot go back to an earlier release. 1.2 upgrades the storage engine (leveled), and from its first start a node writes stored data in a format that earlier releases cannot read. Before you upgrade, take a logical export (`bondy.export.create`). To go back, deploy a new cluster on the earlier release and import the export; it holds nothing written after you took it.
+
+### Fixes
+* A `bondy.*` call whose realm argument was not the session's realm got `wamp.error.not_authorized` with a description that showed the session's realm as the realm the call targeted, and never the realm the caller sent. A realm sent as an Erlang charlist (`"com.example"`) instead of a binary (`<<"com.example">>`) looked the same as a correct call. The description now shows the realm received, as an Erlang term so its type is visible, and the error's `details` carry it as `requested_realm_uri`. A call to a procedure that only the master realm may use now says only that, instead of describing both refusals in one sentence.
+* A request to the Admin API or to an API Gateway `oauth2` path with no `Authorization: Bearer` header, or with a bearer value that is not a JWT, got `401` with an `internal_error` body and a `trace_id` that matched no log entry. The body now names the refusal as `bondy.error.token_invalid`.
+* The `WWW-Authenticate: Bearer` challenge of a `401` follows RFC 6750 on the Admin API, API Gateway `oauth2` paths, the credential-verification endpoints and the MCP endpoint. A request that presented no bearer token gets `Bearer realm="<realm>"` with no error. A presented token that is refused gets `error="invalid_token"`. Before, the gateway sent Bondy's own error code (for example `error="invalid_credentials"`) together with non-standard `message` and `description` parameters, the verification endpoints sent `invalid_token` also when no credential was presented, and MCP sent a bare `Bearer` with no parameters. A gateway `401` caused by a token for a realm that does not exist now carries the challenge; before, it had none. The `Cookie`, `Basic` and `ApiKey` challenges do not change.
+* Bondy ignored the maximum message length a RawSocket client announces in its handshake (TCP, TLS and Unix socket listeners), and sent it messages of any size. The WAMP specification forbids this, and a client that enforces its limit closes the connection. Bondy now never sends such a client a message larger than its limit:
+  * An EVENT is dropped for that subscriber only, and counted in `bondy_wamp_dropped_total{reason="payload_size_exceeded", family="event"}`. Other subscribers still get it.
+  * A RESULT, or a callee's ERROR, gets to the caller as ERROR `wamp.error.payload_size_exceeded` instead.
+  * A progressive RESULT ends the call: the caller gets the results before it, then ERROR `wamp.error.payload_size_exceeded` and nothing more, and the callee is interrupted.
+  * An INVOCATION is not sent to the callee, and the caller gets ERROR `wamp.error.payload_size_exceeded`. For a progressive call whose callee already has earlier input, the callee is interrupted and gets none of the later input.
+
+  WebSocket and HTTP clients announce no limit, so nothing changes for them.
+* A URI that ended in a newline (`com.example.thing\n`) passed validation under every rule, `strict` included, so a topic, procedure, realm or grant could carry one and differ from the same URI without it. Such a URI is now refused, like one with any other control character, and a message that carries it gets the reply any invalid URI gets. URI validation is also several times faster.
+
 ## 1.1.0
 
 ### Action required

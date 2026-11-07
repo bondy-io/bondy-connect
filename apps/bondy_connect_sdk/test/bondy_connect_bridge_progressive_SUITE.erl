@@ -39,6 +39,8 @@ The bridge setup is `bondy_bridge_relay_rpc_SUITE`'s, called on the edge.
 -define(CORE1_PORT, 18303).
 -define(CORE2_PORT, 18304).
 -define(CLUSTER_EDGE_PORT, 18305).
+%% The LENGTH a small-limit client announces: 2^11 octets.
+-define(SMALL_LIMIT, 2048).
 
 all() ->
     [
@@ -56,9 +58,16 @@ groups() ->
         a_canceled_stream_interrupts_the_bridged_callee,
         a_caller_leaving_a_stream_interrupts_the_bridged_callee
     ],
+    Oversized = [
+        an_oversized_invocation_to_a_bridged_callee_errors_the_caller,
+        an_oversized_result_from_a_bridged_callee_errors_the_caller,
+        an_oversized_progressive_result_from_a_bridged_callee_ends_the_call,
+        an_oversized_input_chunk_to_a_bridged_callee_ends_the_call
+    ],
+    All = FirstChunk ++ Stream ++ Cancel ++ Oversized,
     [
-        {bridge_on_the_caller_node, [], FirstChunk ++ Stream ++ Cancel},
-        {bridge_on_another_core_node, [], FirstChunk ++ Stream ++ Cancel}
+        {bridge_on_the_caller_node, [], All},
+        {bridge_on_another_core_node, [], All}
     ].
 
 suite() ->
@@ -271,9 +280,211 @@ a_caller_leaving_a_stream_interrupts_the_bridged_callee(Config) ->
     ok = assert_no_call_promise(Config),
     ok = bondy_connect_client:disconnect(Callee).
 
+-doc """
+An INVOCATION larger than the LENGTH of a callee on the edge is not sent. The
+callee's session on the edge answers it with ERROR
+`wamp.error.payload_size_exceeded`, which crosses the bridge back to the caller
+on the core. The handler never runs, and the same callee then serves a small
+call.
+""".
+an_oversized_invocation_to_a_bridged_callee_errors_the_caller(Config) ->
+    Proc = ~"com.example.bridge.big_invocation",
+    Echo = ~"com.example.bridge.big_invocation.echo",
+    TestPid = self(),
+    Callee = connect(?config(callee_port, Config), #{
+        max_message_length => ?SMALL_LIMIT
+    }),
+    {ok, _} = bondy_connect_client:register(Callee, Proc, fun(_, _, _) ->
+        TestPid ! handler_ran,
+        {ok, #{args => []}}
+    end),
+    {ok, _} = bondy_connect_client:register(Callee, Echo, fun(Args, _, _) ->
+        {ok, #{args => Args}}
+    end),
+    ok = wait_proxy(Config, Proc),
+    ok = wait_proxy(Config, Echo),
+    Caller = connect(?config(caller_port, Config)),
+
+    ?assertMatch(
+        {error, #{kind := wamp, uri := ?WAMP_PAYLOAD_SIZE_EXCEEDED}},
+        bondy_connect_client:call(Caller, Proc, [oversized()])
+    ),
+    receive
+        handler_ran -> ct:fail(oversized_invocation_delivered)
+    after 0 -> ok
+    end,
+    ?assertMatch(
+        {ok, #{args := [~"hi"]}},
+        bondy_connect_client:call(Caller, Echo, [~"hi"])
+    ),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
+-doc """
+A final RESULT from a callee on the edge that is larger than the LENGTH of the
+caller on the core reaches the caller as ERROR
+`wamp.error.payload_size_exceeded`, and the caller's connection stays usable.
+""".
+an_oversized_result_from_a_bridged_callee_errors_the_caller(Config) ->
+    Proc = ~"com.example.bridge.big_result",
+    Echo = ~"com.example.bridge.big_result.echo",
+    Callee = connect(?config(callee_port, Config)),
+    {ok, _} = bondy_connect_client:register(Callee, Proc, fun(_, _, _) ->
+        {ok, #{args => [oversized()]}}
+    end),
+    {ok, _} = bondy_connect_client:register(Callee, Echo, fun(Args, _, _) ->
+        {ok, #{args => Args}}
+    end),
+    ok = wait_proxy(Config, Proc),
+    ok = wait_proxy(Config, Echo),
+    Caller = connect(?config(caller_port, Config), #{
+        max_message_length => ?SMALL_LIMIT
+    }),
+
+    ?assertMatch(
+        {error, #{kind := wamp, uri := ?WAMP_PAYLOAD_SIZE_EXCEEDED}},
+        bondy_connect_client:call(Caller, Proc, [])
+    ),
+    ?assertMatch(
+        {ok, #{args := [~"hi"]}},
+        bondy_connect_client:call(Caller, Echo, [~"hi"])
+    ),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
+-doc """
+A progressive RESULT from a callee on the edge that is larger than the LENGTH
+of the caller on the core ends the call: the caller gets the chunk before it,
+then ERROR `wamp.error.payload_size_exceeded` and nothing after it, the
+callee's handler is interrupted while it waits, and the bridge's node keeps no
+call promise.
+""".
+an_oversized_progressive_result_from_a_bridged_callee_ends_the_call(Config) ->
+    Proc = ~"com.example.bridge.big_progressive",
+    TestPid = self(),
+    Callee = connect(?config(callee_port, Config)),
+    {ok, _} = bondy_connect_client:register(Callee, Proc, fun(_, _, Details) ->
+        Progress = maps:get(progress, Details),
+        TestPid ! {worker, self()},
+        ok = Progress([~"first"], #{}),
+        ok = Progress([oversized()], #{}),
+        timer:sleep(2000),
+        TestPid ! callee_continued,
+        {ok, #{args => [~"final"]}}
+    end),
+    ok = wait_proxy(Config, Proc),
+    Caller = connect(?config(caller_port, Config), #{
+        max_message_length => ?SMALL_LIMIT
+    }),
+
+    {ok, Token} = bondy_connect_client:call_async(
+        Caller, Proc, [], #{}, #{receive_progress => true}
+    ),
+    Worker =
+        receive
+            {worker, W} -> W
+        after 5000 -> ct:fail(handler_not_running)
+        end,
+    MRef = monitor(process, Worker),
+    ?assertMatch({progress, #{args := [~"first"]}}, next_reply(Token)),
+    ?assertMatch(
+        {error, #{kind := wamp, uri := ?WAMP_PAYLOAD_SIZE_EXCEEDED}},
+        next_reply(Token)
+    ),
+    receive
+        {'DOWN', MRef, process, Worker, _} -> ok;
+        callee_continued -> ct:fail(call_not_ended)
+    after 5000 ->
+        ct:fail(callee_not_interrupted)
+    end,
+    receive
+        {bondy_connect_client, Token, Extra} -> ct:fail({extra_reply, Extra})
+    after 1000 -> ok
+    end,
+    ok = assert_no_call_promise(Config),
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
+-doc """
+An input chunk of a progressive call from the caller on the core that is larger
+than the LENGTH of the callee on the edge ends the call: the callee's session
+on the edge answers with ERROR `wamp.error.payload_size_exceeded`, which
+crosses the bridge to the caller, and interrupts the callee, whose handler sees
+no chunk after the oversized one.
+""".
+an_oversized_input_chunk_to_a_bridged_callee_ends_the_call(Config) ->
+    Proc = ~"com.example.bridge.big_input_chunk",
+    Callee = connect(?config(callee_port, Config), #{
+        max_message_length => ?SMALL_LIMIT
+    }),
+    TestPid = self(),
+    {ok, _} = bondy_connect_client:register(Callee, Proc, fun(
+        [First],
+        _,
+        #{
+            input := Input
+        }
+    ) ->
+        TestPid ! {worker, self()},
+        TestPid ! {chunk, First},
+        Pull = fun Pull() ->
+            case Input() of
+                {more, [N], _} ->
+                    TestPid ! {chunk, N},
+                    Pull();
+                {last, [N], _} ->
+                    TestPid ! {chunk, N},
+                    {ok, #{args => []}}
+            end
+        end,
+        Pull()
+    end),
+    ok = wait_proxy(Config, Proc),
+    Caller = connect(?config(caller_port, Config)),
+    {ok, Token} = bondy_connect_client:call_stream(Caller, Proc, [1], #{}, #{}),
+    Worker =
+        receive
+            {worker, W} -> W
+        after 5000 -> ct:fail(handler_not_running)
+        end,
+    MRef = monitor(process, Worker),
+    receive
+        {chunk, 1} -> ok
+    after 5000 -> ct:fail(no_first_chunk)
+    end,
+    ok = bondy_connect_client:send_input(Caller, Token, [oversized()], #{}),
+    _ = bondy_connect_client:send_input(Caller, Token, [3], #{}),
+    _ = bondy_connect_client:finish_input(Caller, Token, [4], #{}),
+
+    ?assertMatch(
+        {error, #{kind := wamp, uri := ?WAMP_PAYLOAD_SIZE_EXCEEDED}},
+        next_reply(Token)
+    ),
+    receive
+        {'DOWN', MRef, process, Worker, _} -> ok;
+        {chunk, N} -> ct:fail({chunk_after_oversized, N})
+    after 5000 ->
+        ct:fail(callee_not_interrupted)
+    end,
+    receive
+        {chunk, Late} -> ct:fail({chunk_after_oversized, Late});
+        {bondy_connect_client, Token, Extra} -> ct:fail({extra_reply, Extra})
+    after 1000 -> ok
+    end,
+
+    ok = bondy_connect_client:disconnect(Caller),
+    ok = bondy_connect_client:disconnect(Callee).
+
 %% =============================================================================
 %% HELPERS
 %% =============================================================================
+
+%% Larger than `?SMALL_LIMIT' once encoded, in any serializer.
+oversized() ->
+    binary:copy(~"x", 2 * ?SMALL_LIMIT).
 
 %% Opens a stream on `Proc` to a bridged callee whose handler runs until it is
 %% interrupted, and returns the handler's process.

@@ -589,9 +589,12 @@ init_wamp(Len0, Enc, State0) ->
     {FrameType, EncName} = validate_encoding(Enc),
     Proto = {raw, FrameType, EncName},
     Peer = State0#state.peername,
+    %% The client's LENGTH is the largest message it will RECEIVE, so it caps
+    %% outbound messages unclamped; `MaxLen' above caps inbound ones.
     Opts = #{
         source_ip => State0#state.source_ip,
-        listener => State0#state.listener
+        listener => State0#state.listener,
+        max_message_size => validate_max_len(Len0)
     },
 
     case bondy_wamp_protocol:init(Proto, Peer, Opts) of
