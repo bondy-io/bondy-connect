@@ -13,6 +13,17 @@ pattern using the exact, prefix and wildcard match strategies.
 """.
 -include("bondy_wamp.hrl").
 
+-define(STRICT_CHAR(C),
+    ((C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse C =:= $_)
+).
+%% Any byte above space except the separator, `#' and DEL: whitespace and the
+%% control characters (`\x00-\x1F') are all at or below space. NUL is
+%% excluded because `bondy_db' separates storage-key components with it (see
+%% its moduledoc), so a URI that carried NUL would cross a tenant boundary.
+-define(LOOSE_CHAR(C),
+    (C > $\s andalso C =/= $. andalso C =/= $# andalso C =/= 16#7F)
+).
+
 -type t() :: binary().
 -type rule() ::
     loose
@@ -55,7 +66,7 @@ is_valid(Uri, Strategy) when is_binary(Strategy) ->
 is_valid(<<>>, Rule) when is_atom(Rule) ->
     loose_prefix == Rule;
 is_valid(Uri, Rule) when is_binary(Uri), is_atom(Rule) ->
-    re:run(Uri, uri_regex(Rule)) =/= nomatch;
+    scan(Uri, Rule);
 is_valid(_, _) ->
     false.
 
@@ -107,10 +118,7 @@ match(Uri, Pattern, ?PREFIX_MATCH) when
 match(Uri, Pattern, ?WILDCARD_MATCH) when
     is_binary(Uri) andalso byte_size(Uri) > 0
 ->
-    subsumes(
-        binary:split(Pattern, [<<$.>>], [global]),
-        binary:split(Uri, [<<$.>>], [global])
-    );
+    wildcard_component(Pattern, Uri);
 match(Uri, _, _) when
     is_binary(Uri) andalso byte_size(Uri) > 0
 ->
@@ -142,82 +150,140 @@ components(Uri) ->
 %% =============================================================================
 
 %% @private
-uri_regex(Rule) ->
-    Regex = persistent_term:get({?MODULE, Rule}, undefined),
-    uri_regex(Rule, Regex).
+%% Each rule is a grammar over bytes; `prop_bondy_wamp_uri:prop_scan_is_the_grammar'
+%% checks the scanner against it, written as a regular expression. A rule
+%% names a component class and a shape: components (`exact'), components with
+%% one optional trailing `.' (`prefix'), or any run of class bytes and `.'
+%% (`allow_empty').
+scan(Uri, strict) ->
+    strict(Uri, exact);
+scan(Uri, strict_prefix) ->
+    strict(Uri, prefix);
+scan(Uri, strict_allow_empty) ->
+    strict_any(Uri);
+scan(Uri, loose) ->
+    loose(Uri, exact);
+scan(Uri, loose_prefix) ->
+    loose(Uri, prefix);
+scan(Uri, loose_allow_empty) ->
+    loose_any(Uri);
+scan(Uri, prefix) ->
+    case bondy_wamp_config:get(uri_strictness) of
+        loose -> loose(Uri, prefix);
+        strict -> strict(Uri, prefix)
+    end;
+scan(Uri, allow_empty) ->
+    case bondy_wamp_config:get(uri_strictness) of
+        loose -> loose_any(Uri);
+        strict -> strict_any(Uri)
+    end;
+scan(_, _) ->
+    error(badrule).
 
 %% @private
-%% The loose component class excludes whitespace, the URI separators and
-%% all control characters (`\x00-\x1F`, `\x7F`). PCRE `\s` does not cover
-%% NUL. `bondy_db` separates storage-key components with NUL (see its
-%% moduledoc), so a URI that carries NUL would cross a tenant boundary.
-uri_regex(loose = Rule, undefined) ->
-    {ok, Regex} = re:compile(
-        "^([^\s\\.#\\x00-\\x1F\\x7F]+\\.)*([^\s\\.#\\x00-\\x1F\\x7F]+)$"
-    ),
-    ok = persistent_term:put({?MODULE, Rule}, Regex),
-    Regex;
-uri_regex(loose_prefix = Rule, undefined) ->
-    {ok, Regex} = re:compile(
-        "^([^\s\\.#\\x00-\\x1F\\x7F]+\\.)*([^\s\\.#\\x00-\\x1F\\x7F]+)[.]?$"
-    ),
-    ok = persistent_term:put({?MODULE, Rule}, Regex),
-    Regex;
-uri_regex(loose_allow_empty = Rule, undefined) ->
-    {ok, Regex} = re:compile(
-        "^(([^\s\\.#\\x00-\\x1F\\x7F]+\\.)|\\.)*([^\s\\.#\\x00-\\x1F\\x7F]+)?$"
-    ),
-    ok = persistent_term:put({?MODULE, Rule}, Regex),
-    Regex;
-uri_regex(strict = Rule, undefined) ->
-    {ok, Regex} = re:compile("^([0-9a-z_]+\\.)*([0-9a-z_]+)$"),
-    ok = persistent_term:put({?MODULE, Rule}, Regex),
-    Regex;
-uri_regex(strict_prefix = Rule, undefined) ->
-    {ok, Regex} = re:compile("^([0-9a-z_]+\\.)*([0-9a-z_]+)[.]?$"),
-    ok = persistent_term:put({?MODULE, Rule}, Regex),
-    Regex;
-uri_regex(strict_allow_empty = Rule, undefined) ->
-    {ok, Regex} = re:compile("^(([0-9a-z_]+\\.)|\\.)*([0-9a-z_]+)?$"),
-    ok = persistent_term:put({?MODULE, Rule}, Regex),
-    Regex;
-uri_regex(prefix, undefined) ->
-    Rule =
-        case bondy_wamp_config:get(uri_strictness) of
-            loose -> loose_prefix;
-            strict -> strict_prefix
-        end,
-    uri_regex(Rule, undefined);
-uri_regex(allow_empty, undefined) ->
-    Rule =
-        case bondy_wamp_config:get(uri_strictness) of
-            loose -> loose_allow_empty;
-            strict -> strict_allow_empty
-        end,
-    uri_regex(Rule, undefined);
-uri_regex(_, undefined) ->
-    error(badrule);
-uri_regex(_, Regex) ->
-    Regex.
-
-%% @private
--spec subsumes(
-    Pattern :: binary() | [binary()],
-    Uri :: binary() | [binary()]
-) -> boolean().
-
-subsumes(Term, Term) ->
-    true;
-subsumes(Term1, Term2) when length(Term1) =/= length(Term2) ->
-    false;
-subsumes([H | T1], [H | T2]) ->
-    subsumes(T1, T2);
-subsumes([<<>> | T1], [_ | T2]) ->
-    subsumes(T1, T2);
-subsumes([], []) ->
-    true;
-subsumes(_, _) ->
+%% A component starts with a class byte, so an empty component fails.
+strict(<<C, Rest/binary>>, Shape) when ?STRICT_CHAR(C) ->
+    strict_component(Rest, Shape);
+strict(_, _) ->
     false.
+
+%% @private
+strict_component(<<C, Rest/binary>>, Shape) when ?STRICT_CHAR(C) ->
+    strict_component(Rest, Shape);
+strict_component(<<$.>>, prefix) ->
+    true;
+strict_component(<<$., Rest/binary>>, Shape) ->
+    strict(Rest, Shape);
+strict_component(<<>>, _) ->
+    true;
+strict_component(_, _) ->
+    false.
+
+%% @private
+strict_any(<<C, Rest/binary>>) when ?STRICT_CHAR(C) orelse C =:= $. ->
+    strict_any(Rest);
+strict_any(<<>>) ->
+    true;
+strict_any(_) ->
+    false.
+
+%% @private
+loose(<<C, Rest/binary>>, Shape) when ?LOOSE_CHAR(C) ->
+    loose_component(Rest, Shape);
+loose(_, _) ->
+    false.
+
+%% @private
+loose_component(<<C, Rest/binary>>, Shape) when ?LOOSE_CHAR(C) ->
+    loose_component(Rest, Shape);
+loose_component(<<$.>>, prefix) ->
+    true;
+loose_component(<<$., Rest/binary>>, Shape) ->
+    loose(Rest, Shape);
+loose_component(<<>>, _) ->
+    true;
+loose_component(_, _) ->
+    false.
+
+%% @private
+loose_any(<<C, Rest/binary>>) when ?LOOSE_CHAR(C) orelse C =:= $. ->
+    loose_any(Rest);
+loose_any(<<>>) ->
+    true;
+loose_any(_) ->
+    false.
+
+%% @private
+%% The pattern's components are compared with the URI's in order, and an empty
+%% pattern component matches any one URI component, the empty one included.
+%% A literal component is compared in one step: its length comes from
+%% scanning the pattern alone, then the URI must start with the same bytes
+%% and the same separator, one memory compare. Walking both binaries byte by
+%% byte would build a sub-binary at every byte, since the compiler reuses the
+%% match context of only one binary argument.
+wildcard_component(<<$., Pattern/binary>>, Uri) ->
+    wildcard_skip(Pattern, Uri);
+wildcard_component(<<>>, Uri) ->
+    wildcard_last(Uri);
+wildcard_component(Pattern, Uri) ->
+    Len = component_length(Pattern, 0),
+    case Pattern of
+        <<Component:Len/binary>> ->
+            Uri =:= Component;
+        <<Component:Len/binary, $., PatternRest/binary>> ->
+            case Uri of
+                <<Component:Len/binary, $., UriRest/binary>> ->
+                    wildcard_component(PatternRest, UriRest);
+                _ ->
+                    false
+            end
+    end.
+
+%% @private
+component_length(<<$., _/binary>>, N) ->
+    N;
+component_length(<<_, Rest/binary>>, N) ->
+    component_length(Rest, N + 1);
+component_length(<<>>, N) ->
+    N.
+
+%% @private
+%% An empty pattern component with more after it: skip one URI component.
+wildcard_skip(Pattern, <<$., Uri/binary>>) ->
+    wildcard_component(Pattern, Uri);
+wildcard_skip(Pattern, <<_, Uri/binary>>) ->
+    wildcard_skip(Pattern, Uri);
+wildcard_skip(_, <<>>) ->
+    false.
+
+%% @private
+%% An empty last pattern component: the rest of the URI is one component.
+wildcard_last(<<$., _/binary>>) ->
+    false;
+wildcard_last(<<_, Uri/binary>>) ->
+    wildcard_last(Uri);
+wildcard_last(<<>>) ->
+    true.
 
 %% @private
 maybe_error(true, Uri) ->

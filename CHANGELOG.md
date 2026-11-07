@@ -12,6 +12,7 @@
   * An INVOCATION is not sent to the callee, and the caller gets ERROR `wamp.error.payload_size_exceeded`. For a progressive call whose callee already has earlier input, the callee is interrupted and gets none of the later input.
 
   WebSocket and HTTP clients announce no limit, so nothing changes for them.
+* A URI that ended in a newline (`com.example.thing\n`) passed validation under every rule, `strict` included, so a topic, procedure, realm or grant could carry one and differ from the same URI without it. Such a URI is now refused, like one with any other control character, and a message that carries it gets the reply any invalid URI gets. URI validation is also several times faster.
 
 ## 1.1.0
 
