@@ -42,6 +42,14 @@ API specifications to every node.
 > the *Action required* section of the [CHANGELOG](CHANGELOG.md) before you
 > start.
 
+> **Upgrading to 1.2.** A node that runs 1.2 cannot go back to an earlier
+> release. 1.2 upgrades the storage engine (leveled), and from its first start
+> a node writes stored data in a format that earlier releases cannot read.
+> Before you upgrade, take a logical export (`bondy.export.create`). To go
+> back, deploy a new cluster on the earlier release and import the export; it
+> holds nothing written after you took it. See the *Action required* section
+> of the [CHANGELOG](CHANGELOG.md).
+
 <br>
 <p align="center">
      <img src="https://github.com/bondy-io/bondy-connect/blob/develop/doc/assets/bondy_cluster.png?raw=true" alt="A Bondy Connect cluster connecting clients and services" width="600"/>
