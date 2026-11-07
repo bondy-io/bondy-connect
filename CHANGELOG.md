@@ -1,6 +1,9 @@
 # CHANGELOG
 ## 1.2.0
 
+### Action required
+* A node that runs 1.2 cannot go back to an earlier release. 1.2 upgrades the storage engine (leveled), and from its first start a node writes stored data in a format that earlier releases cannot read. Before you upgrade, take a logical export (`bondy.export.create`). To go back, deploy a new cluster on the earlier release and import the export; it holds nothing written after you took it.
+
 ### Fixes
 * A `bondy.*` call whose realm argument was not the session's realm got `wamp.error.not_authorized` with a description that showed the session's realm as the realm the call targeted, and never the realm the caller sent. A realm sent as an Erlang charlist (`"com.example"`) instead of a binary (`<<"com.example">>`) looked the same as a correct call. The description now shows the realm received, as an Erlang term so its type is visible, and the error's `details` carry it as `requested_realm_uri`. A call to a procedure that only the master realm may use now says only that, instead of describing both refusals in one sentence.
 * A request to the Admin API or to an API Gateway `oauth2` path with no `Authorization: Bearer` header, or with a bearer value that is not a JWT, got `401` with an `internal_error` body and a `trace_id` that matched no log entry. The body now names the refusal as `bondy.error.token_invalid`.
