@@ -296,7 +296,11 @@
         %% runs sharing one path would collide, because the listener driver
         %% unlinks a stale socket file before binding. The socket filename is a
         %% constant, so the directory is the only thing separating runs.
-        {platform_runtime_dir, "./run/" ++ os:getpid()},
+        %% Under `/tmp`, not the working directory: a socket file outlives the
+        %% VM that bound it, and a Unix socket left in the repository tree
+        %% aborts `container build` (Apple container 1.6.1) with
+        %% "failed to create entry", `.dockerignore` notwithstanding.
+        {platform_runtime_dir, "/tmp/bondy_ct_" ++ os:getpid() ++ "_main"},
         {platform_data_dir, "./data"},
         {platform_lib_dir, "./lib"},
         {platform_bin_dir, "./bin"},

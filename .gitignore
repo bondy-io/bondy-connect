@@ -23,6 +23,7 @@ _*
 !jepsen/bondy_mst_jepsen/_checkouts/
 _build
 _rel
+/run/
 app-deps.dot
 app-deps.png
 data
