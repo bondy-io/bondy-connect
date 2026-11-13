@@ -1380,7 +1380,8 @@ collect_sync_scheduler(CB) ->
         {bondy_oplog_sync_scheduler_interval_milliseconds,
             "Sync scheduler tick interval.", interval_ms},
         {bondy_oplog_sync_scheduler_load,
-            "Sync scheduler run-queue load sample.", current_load},
+            "Smoothed run-queue length per online scheduler, sampled on "
+            "every sync scheduler tick.", current_load},
         {bondy_oplog_sync_scheduler_yielding,
             "1 when the sync scheduler is load-yielding.", load_yielding}
     ],

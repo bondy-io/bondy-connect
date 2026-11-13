@@ -131,7 +131,7 @@ returns one series for each scheduler that reported it. Aggregate with
 | `bondy_oplog_sync_scheduler_events_total` | counter | `event` | Sync scheduler activity. |
 | `bondy_oplog_sync_scheduler_enabled` | gauge | — | `1` when the sync scheduler is enabled. |
 | `bondy_oplog_sync_scheduler_interval_milliseconds` | gauge | — | Sync scheduler tick interval. |
-| `bondy_oplog_sync_scheduler_load` | gauge | — | Run-queue load sample. |
+| `bondy_oplog_sync_scheduler_load` | gauge | — | Smoothed run-queue length per online scheduler. The scheduler samples it on every tick, whether or not `db.oplog.aae.load_adaptive` is on. |
 | `bondy_oplog_sync_scheduler_yielding` | gauge | — | `1` while the scheduler yields to load. |
 | `bondy_oplog_sync_scheduler_inflight` | gauge | `kind` | In-flight sync sessions: `total`, `bootstrap`. |
 | `bondy_oplog_peer_last_sync_age_seconds` | gauge | `instance_id`, `peer` | Seconds since the last completed sync with a peer. |
@@ -278,7 +278,7 @@ whole seconds: the emitters compute the duration with
 | `bondy_wamp_invocation_latency_milliseconds` | histogram | `node`, `procedure_uri` | Time from INVOCATION to YIELD or ERROR: callee execution plus transport. |
 | `bondy_rpc_promises_inflight` | gauge | — | Calls and invocations awaiting a response. |
 | `bondy_rpc_inflight_invocations` | gauge | `procedure_uri` | Calls awaiting a response, per procedure. |
-| `bondy_rpc_promise_timeouts_total` | counter | `type` | Promises evicted on expiry; the caller received a WAMP timeout error. |
+| `bondy_rpc_promise_timeouts_total` | counter | `type` | Calls that failed with a WAMP timeout error when their promise expired. An expiry that Bondy answers with a retry is not counted. |
 | `bondy_rpc_rib_retries_total` | counter | `outcome` | Retries of a cluster CALL after an owner-side completion miss: `node`, `local`, `exhausted`. |
 | `bondy_rpc_rib_completions_total` | counter | `outcome` | Owner-side completions of node-addressed cluster CALLs: `ok`, `miss`. |
 

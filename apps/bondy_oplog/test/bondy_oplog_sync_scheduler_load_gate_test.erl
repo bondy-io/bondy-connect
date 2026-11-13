@@ -72,7 +72,10 @@ wiring_test_() ->
             {"a fence-backer is exempt from the load yield",
                 fun load_yield_exempts_fence_backer/0}},
         {timeout, 15,
-            {"gate off dispatches normally", fun gate_off_dispatches/0}}
+            {"gate off dispatches normally", fun gate_off_dispatches/0}},
+        {timeout, 15,
+            {"gate off still publishes the load",
+                fun gate_off_publishes_load/0}}
     ]}.
 
 setup() ->
@@ -138,6 +141,27 @@ gate_off_dispatches() ->
     ?assertEqual(true, Started),
     bondy_oplog:stop_instance(Inst),
     wait_until_total_inflight(0, 3000).
+
+%% Gate off ⇒ the tick still samples the run queue and publishes the smoothed
+%% value. Processes that never yield the CPU, several per scheduler, hold the
+%% run queue above the value published before them, so one tick must raise it.
+%% A tick that feeds `0.0` in place of the sample can only lower it.
+gate_off_publishes_load() ->
+    force_gate(off, 0.0),
+    Before = published_load(),
+    N = (ceil(Before) + 8) * erlang:system_info(schedulers_online),
+    Spinners = [spawn(fun spin/0) || _ <- lists:seq(1, N)],
+    try
+        %% `trigger/0` is a cast and `info/0` a call to the same process, so
+        %% the tick has run when the next `info/0` returns.
+        ok = bondy_oplog_sync_scheduler:trigger(),
+        ?assert(published_load() > Before),
+        ?assertEqual(
+            false, maps:get(load_yielding, bondy_oplog_sync_scheduler:info())
+        )
+    after
+        [exit(P, kill) || P <- Spinners]
+    end.
 
 %% =============================================================================
 %% Helpers
@@ -227,6 +251,12 @@ one_tick(Inst, DeferEvent) ->
         telemetry:detach(HStarted),
         telemetry:detach(HDeferred)
     end.
+
+spin() ->
+    spin().
+
+published_load() ->
+    maps:get(current_load, bondy_oplog_sync_scheduler:info()).
 
 collect_flag(Ref, Tag, Timeout) ->
     receive

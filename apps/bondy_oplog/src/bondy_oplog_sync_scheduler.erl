@@ -124,11 +124,14 @@ few, so the bounded over-budget is an acceptable trade for auth availability.
 
 The concurrency cap bounds AAE *in aggregate*; the load-reactive yield adds the
 *temporal* dimension. Even three concurrent syncs add scheduler pressure, and
-during a routing burst that pressure competes with the node's real job. When on
-(opt-in via `aae_load_adaptive`; off by default), the scheduler samples a
-node-load signal once per tick and, while the node is backlogged, **yields** —
-skipping its throttleable dispatches for that tick — so background reconciliation
-steps aside for routing.
+during a routing burst that pressure competes with the node's real job. The
+scheduler samples a node-load signal once per tick. When the yield is on (opt-in
+via `aae_load_adaptive`; off by default) and the node is backlogged, the
+scheduler **yields** — skipping its throttleable dispatches for that tick — so
+background reconciliation steps aside for routing. With the yield off the
+scheduler still samples and publishes the signal (`current_load` in `info/0`),
+so an operator can read a node's load against the threshold before turning the
+yield on.
 
 The signal is a BEAM primitive, read directly (no dependency on `bondy_router`
 or any higher layer): `erlang:statistics(run_queue) ÷ schedulers_online`, the
@@ -676,11 +679,7 @@ rotate(L, N) ->
 %% @private
 update_load(Prev) ->
     Enabled = bondy_oplog_config:aae_load_adaptive(),
-    Sample =
-        case Enabled of
-            true -> node_run_queue_ratio();
-            false -> 0.0
-        end,
+    Sample = node_run_queue_ratio(),
     Threshold = bondy_oplog_config:aae_load_run_queue_threshold(),
     {Ewma, Yield} = load_decide(Enabled, Sample, Prev, Threshold),
     publish_load(Ewma, Yield),

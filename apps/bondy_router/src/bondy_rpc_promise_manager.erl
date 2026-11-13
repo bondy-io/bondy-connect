@@ -75,21 +75,6 @@ handle_info(evict, State) ->
         Timeout = bondy_rpc_promise:timeout(Promise),
         ProcUri = bondy_rpc_promise:procedure_uri(Promise),
 
-        %% Eviction must never depend on the metrics subsystem being up.
-        %% `inc/3` raises `unknown_metric` before `bondy_prometheus` declares
-        %% the counter, and `badarg` without the prometheus tables.
-        _ =
-            try
-                prometheus_counter:inc(
-                    bondy_rpc_promise_timeouts_total,
-                    [bondy_rpc_promise:type(Promise)],
-                    1
-                )
-            catch
-                error:{unknown_metric, _, _} -> ok;
-                error:badarg -> ok
-            end,
-
         ?LOG_DEBUG(#{
             description => "RPC Promise evicted from queue",
             realm_uri => RealmUri,
@@ -104,6 +89,22 @@ handle_info(evict, State) ->
             true ->
                 ok;
             false ->
+                %% Eviction must never depend on the metrics subsystem being
+                %% up. `inc/3` raises `unknown_metric` before
+                %% `bondy_prometheus` declares the counter, and `badarg`
+                %% without the prometheus tables.
+                _ =
+                    try
+                        prometheus_counter:inc(
+                            bondy_rpc_promise_timeouts_total,
+                            [bondy_rpc_promise:type(Promise)],
+                            1
+                        )
+                    catch
+                        error:{unknown_metric, _, _} -> ok;
+                        error:badarg -> ok
+                    end,
+
                 Mssg = iolist_to_binary(
                     io_lib:format(
                         "The operation could not be completed in time"

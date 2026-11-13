@@ -239,7 +239,7 @@ declare_wamp_metrics() ->
     _ = prometheus_counter:declare([
         {name, bondy_rpc_promise_timeouts_total},
         {help,
-            <<"The total number of RPC promises evicted on expiry (the caller received a WAMP timeout error), by promise type.">>},
+            <<"The total number of calls that failed with a WAMP timeout error when their promise expired, by promise type. An expiry that Bondy answers with a retry is not counted.">>},
         {labels, [type]}
     ]),
     _ = prometheus_counter:declare([

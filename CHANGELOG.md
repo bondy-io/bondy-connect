@@ -1,4 +1,10 @@
 # CHANGELOG
+## 1.2.1
+
+### Fixes
+* `bondy_rpc_promise_timeouts_total` counted every expiry of a pending call, including an expiry that Bondy answers with a new attempt for a call that set `_retries`, and each wait of such a call that found no callee. On a workload that uses `_retries` the counter was higher than the number of timeouts callers received. It now counts only the calls that Bondy ends with `wamp.error.timeout`.
+* `bondy_oplog_sync_scheduler_load` read `0` while `db.oplog.aae.load_adaptive` was off, which is the default, so the gauge could not show how close a node runs to `db.oplog.aae.load_run_queue_threshold` before the setting is turned on. The anti-entropy scheduler now samples the load on every tick. The setting still decides alone whether the scheduler yields to load.
+
 ## 1.2.0
 
 ### Action required

@@ -34,6 +34,7 @@ second late, and the deadlines leave room for that.
 -export([end_per_suite/1]).
 -export([init_per_testcase/2]).
 -export([end_per_testcase/2]).
+-export([only_a_timeout_the_caller_receives_is_counted/1]).
 -export([call_leaves_unrelated_messages_alone/1]).
 -export([timeout_retries_an_idempotent_call/1]).
 -export([retries_without_a_deadline_use_the_call_timeouts/1]).
@@ -69,6 +70,7 @@ second late, and the deadlines leave room for that.
 
 all() ->
     [
+        only_a_timeout_the_caller_receives_is_counted,
         call_leaves_unrelated_messages_alone,
         timeout_retries_an_idempotent_call,
         retries_without_a_deadline_use_the_call_timeouts,
@@ -136,6 +138,36 @@ end_per_testcase(_, Config) ->
 %% =============================================================================
 %% CASES
 %% =============================================================================
+
+%% `bondy_rpc_promise_timeouts_total` counts the calls that fail with a
+%% timeout. The expiry of an attempt that the dealer retries, and each wait of
+%% a call that found no registration, leave it alone. Runs first: the counter
+%% has no realm label, so a promise another case left behind would move it.
+only_a_timeout_the_caller_receives_is_counted(Config) ->
+    Before = promise_timeouts(),
+
+    Retried = ~"com.example.test.rpc_retry.counted_retried",
+    ok = register(Config, Retried, [sleep, reply], ?IDEMPOTENT),
+    ?assertMatch(
+        {ok, #{args := [2]}},
+        call(Retried, #{timeout => 1000, '_retries' => 1, '_deadline' => 8000})
+    ),
+    ?assertEqual(Before, promise_timeouts()),
+
+    Waited = ~"com.example.test.rpc_retry.counted_waited",
+    ?assertMatch(
+        {error, #{error_uri := ?WAMP_NO_SUCH_PROCEDURE}},
+        call(Waited, #{timeout => 1000, '_retries' => 2, '_deadline' => 30000})
+    ),
+    ?assertEqual(Before, promise_timeouts()),
+
+    Failed = ~"com.example.test.rpc_retry.counted_failed",
+    ok = register(Config, Failed, [sleep], #{}),
+    assert_timeout(call(Failed, #{timeout => 1000})),
+    %% The caller stops waiting at its own timeout, up to a second before the
+    %% promise manager evicts the promise and counts it.
+    timer:sleep(2500),
+    ?assertEqual(Before + 1, promise_timeouts()).
 
 %% The caller's mailbox holds messages that are not the reply. Waiting for the
 %% reply must neither consume them nor return one as the call's outcome.
@@ -647,6 +679,14 @@ reports(Proc, Quiet) ->
     after Quiet ->
         []
     end.
+
+promise_timeouts() ->
+    lists:sum([
+        N
+     || {_, N} <- prometheus_counter:values(
+            default, bondy_rpc_promise_timeouts_total
+        )
+    ]).
 
 assert_timeout({error, #{error_uri := Uri}}) ->
     ?assert(lists:member(Uri, ?TIMEOUT_URIS)).
